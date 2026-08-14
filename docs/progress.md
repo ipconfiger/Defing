@@ -142,7 +142,7 @@
 
 ---
 
-## ✅ 项目完成总览（M0–M4 全部达成）
+## ✅ 项目完成总览（M0–M8 全部达成 · 终态快照）
 
 | 里程碑 | 交付 | 验证 |
 |--------|------|------|
@@ -152,11 +152,18 @@
 | M2.5 集群 watch+可观测+会话+UI | raft apply 事件广播 SSE/metrics/readyz/审计/单管理员会话/内嵌 /admin | M2.5 e2e |
 | M3 三语言 SDK | TS/Go/Python（get/getItem/watch/failover）+ 契约测试 | 三语言对拍全过 |
 | M4 混沌+加固+发布 | leader 击杀/重启追赶混沌、安全头、Docker/compose/README、基准 | 全部脚本 + 49 tests |
+| M5 会话/审计/快照/集群watch | 会话落 Raft（I7 集群级单会话+leader 转发）、审计落库、快照持久化、集群 watch 自动化、Raft 错误传播 | 59 tests + 跨节点 409 e2e |
+| M6 模块化+gRPC | 4 crate 归位（cli 仅组装）、tonic ConfigService（GetConfig/GetItem/Watch/ListMembers :8383）+ 鉴权 | 65 tests + gRPC 集成测试 |
+| M7 组级引用+密钥轮换 | 整组绑定共享组（物化/级联/解绑）、KeyRing 轮换（rotate API/CLI/重包任务/CRY-002） | 74 tests + 轮换 HTTP e2e |
+| M8 CI/基准/SBOM | 8 jobs 全绿流水线、bench.sh 基准、SPDX SBOM、release 产物 | CI 全绿 + 实测达标 |
 
-**最终工程指标**
-- cargo test --workspace：49 passed / 0 failed；clippy -D warnings 零警告；fmt 干净
-- 端到端脚本 6 个全部通过：dev-single-demo、cluster-demo、chaos-test、sdk-contract-test、check-contracts、M2/M2.5 e2e
-- 读路径基准：6279 QPS（200 并发）
+**最终工程指标（M8 终态）**
+- cargo test --workspace：74 passed / 0 failed；clippy -D warnings 零警告；fmt 干净
+- GitHub Actions 8 jobs 全绿：lint / unit / contract / raft / sdk / e2e / bench / release
+- 基准实测：读 35016 QPS（本机）/ 9419（CI）；写 1620 QPS（本机，单写者串行）；watch 12ms；内存 41MB ≤128MB；release 二进制 8.68MB ≤50MB
+- SBOM：Defing-release.spdx.json（SPDX，44KB）
+- 端到端脚本全部通过：dev-single-demo、cluster-demo、chaos-test、sdk-contract-test、check-contracts
+- 仓库：https://github.com/ipconfiger/Defing（main，含完整设计文档 docs/design-* 与 progress/remaining-work 进度）
 
 ## M5 —— 会话落 Raft + 审计持久化 + 快照持久化 + 集群 watch 自动化 ✅ 完成（全部验证通过）
 

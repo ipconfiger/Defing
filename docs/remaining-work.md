@@ -1,8 +1,8 @@
 # 未完成工作清单与下一轮优化计划
 
-> 生成时间：M4 完成后核查 ｜ 目的：记录与 design 规格的差异项，作为下一轮优化输入
-> 依据：docs/progress.md（M0–M4 验收记录）+ 工作区核查
-> 状态：当前无进行中任务；下列为明确记录的未完成/降级项
+> 生成时间：M8 终态落档 ｜ 目的：记录与 design 规格的差异项，作为下一轮优化输入
+> 依据：docs/progress.md（M0–M8 验收记录）+ 工作区核查
+> 状态：M0–M8 全部闭环（P0–P3 清零）；下列为剩余/新识别项
 
 ---
 
@@ -21,12 +21,15 @@
 | M7 组级引用 + 密钥轮换 | ✅（B3+B6） | 74 tests + 轮换 HTTP e2e + 5 e2e 脚本 |
 | M8 CI 全量 + 基准 + SBOM | ✅（A2+A3+A4） | 8 jobs 全绿 + 基准实测 + SPDX SBOM |
 
-- cargo test --workspace：59 passed / 0 failed；clippy -D warnings 零警告；fmt 干净
-- 读路径基准冒烟：6279 QPS（200 并发，4 万请求全成功）
+- cargo test --workspace：74 passed / 0 failed；clippy -D warnings 零警告；fmt 干净
+- GitHub Actions 8 jobs 全绿（lint/unit/contract/raft/sdk/e2e/bench/release）
+- 基准实测：读 35016 QPS（本机）/ 9419（CI）；写 1620 QPS（本机，单写者串行）；watch 12ms；内存 41MB；release 二进制 8.68MB
+- SBOM：Defing-release.spdx.json 已随 release 产物归档
+- M5 已闭环：B2 会话落 Raft、B4 审计持久化、B5 快照持久化、B7 集群 watch 自动化
+- M6 已闭环：B1 模块化归位、A1 gRPC 数据面
+- M7 已闭环：B3 组级引用、B6 密钥轮换
+- M8 已闭环：A2 CI 全量流水线、A3 正式基准、A4 SBOM
 - 无运行中后台任务、无残留 dsh 进程
-- M5 已闭环：B2 会话落 Raft（集群级单会话+leader 转发）、B4 审计持久化、B5 快照持久化、B7 集群 watch 自动化测试（见 docs/progress.md M5）
-- M6 已闭环：B1 模块化归位（dsh-api/publish/observability/watch 全填充，cli 仅组装）、A1 gRPC 数据面（tonic ConfigService 挂 :8383，见 docs/progress.md M6）
-- M7 已闭环：B3 组级引用（整组绑定共享组 + 物化/级联/索引）、B6 密钥轮换（KeyRing + rotate API + RewrapDeks 任务 + CRY-002，见 docs/progress.md M7）
 
 ## 2. 未完成/降级项清单（下一轮候选）
 
