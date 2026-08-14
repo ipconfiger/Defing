@@ -51,23 +51,38 @@ impl WatchHub {
     }
 }
 
-/// SSE 流：过滤 (project, branch) 的发布事件。
+/// SSE 流：先重放 after_version 之后的历史事件（replay，由调用方按版本链合成），
+/// 再订阅实时发布事件（版本号 > replay 末尾去重）。慢消费者（广播缓冲溢出）→ 流结束，
+/// 客户端应带 after_version 重连续传（design §6.2/§6.3）。
 pub fn watch_sse(
     rx: tokio::sync::broadcast::Receiver<PublishEvent>,
     project: &str,
     branch: &str,
+    replay: Vec<PublishEvent>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let (p, b) = (project.to_string(), branch.to_string());
-    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(move |item| {
-        let e: PublishEvent = item.ok()?;
-        if e.project.as_str() == p.as_str() && e.branch.as_str() == b.as_str() {
-            Some(Ok(
-                SseEvent::default().data(serde_json::to_string(&e).unwrap_or_default())
-            ))
-        } else {
-            None
-        }
-    });
+    let last = replay.iter().map(|e| e.version).max().unwrap_or(0);
+    let stream = futures::stream::iter(
+        replay
+            .into_iter()
+            .map(|e| Ok(SseEvent::default().data(serde_json::to_string(&e).unwrap_or_default()))),
+    )
+    .chain(
+        tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(move |item| {
+            // 广播缓冲溢出（慢消费者）→ 结束流（客户端带 after_version 重连续传）
+            let e: PublishEvent = item.ok()?;
+            if e.project.as_str() == p.as_str()
+                && e.branch.as_str() == b.as_str()
+                && e.version > last
+            {
+                Some(Ok(
+                    SseEvent::default().data(serde_json::to_string(&e).unwrap_or_default())
+                ))
+            } else {
+                None
+            }
+        }),
+    );
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 

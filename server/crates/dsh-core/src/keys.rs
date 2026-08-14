@@ -12,6 +12,8 @@ pub const K_REF: &str = "/refs/";
 pub const K_SHARED: &str = "sh/";
 pub const K_SHARED_DRAFT: &str = "sh-draft/";
 pub const K_SESSION: &str = "sess/admin";
+/// 管理员密码哈希（set-password 落状态机，集群一致；登录时优先于节点配置校验）。
+pub const K_ADMIN_PW: &str = "sess/admin-pw";
 pub const K_AUDIT: &str = "audit/";
 /// 审计 seq 计数键（位于 audit/ 前缀内；get_prefix 扫描时按 20 位数字后缀区分条目）。
 pub const K_AUDIT_SEQ: &str = "audit/seq";

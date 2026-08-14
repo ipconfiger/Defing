@@ -99,6 +99,10 @@ pub enum Command {
     SessionHeartbeat {
         expires_at: Option<i64>,
     },
+    /// 修改管理员密码（哈希落状态机，集群一致；登录优先用它校验，回退节点配置）。
+    AdminSetPassword {
+        password_hash: String,
+    },
     /// 审计落库（seq 由状态机单调分配并覆写；经 Raft 复制，集群一致）。
     AuditAppend {
         entry: crate::model::AuditEntry,

@@ -226,7 +226,7 @@ impl config_service_server::ConfigService for ConfigGrpcService {
             }
         }
 
-        // 2) 实时事件（与重放版本去重）
+        // 2) 实时事件（与重放版本去重）；慢消费者（广播缓冲溢出）→ 发 snapshot_required 并关流
         let mut rx = self.state.hub.subscribe();
         let stream = async_stream::stream! {
             let mut last = after;
@@ -234,20 +234,38 @@ impl config_service_server::ConfigService for ConfigGrpcService {
                 last = e.version;
                 yield Ok(e);
             }
-            while let Ok(e) = rx.recv().await {
-                if e.project.as_str() == project && e.branch.as_str() == branch
-                    && (e.version as i64) > last
-                {
-                    last = e.version as i64;
-                    yield Ok(WatchEvent {
-                        version: e.version as i64,
-                        r#type: event_type_to_proto(e.ty),
-                        structure_version: e.structure_version as i64,
-                        comment: e.comment,
-                        request_id: e.request_id,
-                        changes: diff_to_changes(e.changes),
-                        snapshot_required: false,
-                    });
+            loop {
+                match rx.recv().await {
+                    Ok(e) => {
+                        if e.project.as_str() == project && e.branch.as_str() == branch
+                            && (e.version as i64) > last
+                        {
+                            last = e.version as i64;
+                            yield Ok(WatchEvent {
+                                version: e.version as i64,
+                                r#type: event_type_to_proto(e.ty),
+                                structure_version: e.structure_version as i64,
+                                comment: e.comment,
+                                request_id: e.request_id,
+                                changes: diff_to_changes(e.changes),
+                                snapshot_required: false,
+                            });
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // 消费不及：客户端缓存已失效，提示重拉全量并关流（design §6.3）
+                        yield Ok(WatchEvent {
+                            version: last,
+                            r#type: EventType::ValuePublish.into(),
+                            structure_version: 0,
+                            comment: "slow consumer: snapshot required".into(),
+                            request_id: String::new(),
+                            changes: vec![],
+                            snapshot_required: true,
+                        });
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         };

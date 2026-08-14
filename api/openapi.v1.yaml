@@ -521,6 +521,45 @@ paths:
         '200':
           description: 已轮换（返回 generation 与环条目数）
         '422': { $ref: '#/components/responses/ValidationFailed' }
+  /api/v1/admin/force-logout:
+    post:
+      summary: 强制下线管理员会话（CLI `dsh admin force-logout` 兜底，I7）
+      security:
+        - AdminSession: []
+      responses:
+        '200': { description: 已下线 }
+  /api/v1/admin/set-password:
+    post:
+      summary: 修改管理员密码（哈希落状态机，集群一致；旧会话失效）
+      security:
+        - AdminSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string, minLength: 6 }
+      responses:
+        '200': { description: 已修改 }
+  /api/v1/admin/snapshot:
+    get:
+      summary: 备份快照（状态机 KV dump；`dsh admin snapshot --out` 存盘）
+      security:
+        - AdminSession: []
+      responses:
+        '200':
+          description: 状态机 dump（{version, kind, entries:[{key,value}]}）
+  /api/v1/admin/retention-status:
+    get:
+      summary: 保留策略状态（--version-retention / --audit-retention 配置 + 计数）
+      security:
+        - AdminSession: []
+      responses:
+        '200':
+          description: 保留策略与当前计数
   /healthz:
     get:
       summary: 存活检查
@@ -584,6 +623,7 @@ paths:
       parameters:
         - { $ref: '#/components/parameters/ProjectPath' }
         - { $ref: '#/components/parameters/BranchPath' }
+        - { name: after_version, in: query, schema: { type: integer, format: int64 }, description: 断线续传起点（重放该版本之后的历史事件再转实时） }
       responses:
         '200':
           description: text/event-stream

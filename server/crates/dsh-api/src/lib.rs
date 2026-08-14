@@ -49,6 +49,10 @@ pub struct ApiState {
     pub audit: AuditLog,
     /// 主密钥环文件路径（{master-key-file}.ring.json；轮换后持久化，重启可加载）
     pub ring_path: Option<std::path::PathBuf>,
+    /// 版本保留数（0=全量保留；admin/retention-status 展示）
+    pub version_retention: u64,
+    /// 审计保留条数（0=不裁剪）
+    pub audit_retention: u64,
 }
 
 impl ApiState {
@@ -62,6 +66,33 @@ impl ApiState {
         session_ttl: std::time::Duration,
         admin_password: Arc<str>,
         ring_path: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self::with_retention(
+            sm,
+            hub,
+            raft,
+            node_id,
+            cipher,
+            session_ttl,
+            admin_password,
+            ring_path,
+            0,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_retention(
+        sm: Arc<Mutex<StateMachine>>,
+        hub: WatchHub,
+        raft: Option<RaftHandle>,
+        node_id: Option<u64>,
+        cipher: Option<Arc<Cipher>>,
+        session_ttl: std::time::Duration,
+        admin_password: Arc<str>,
+        ring_path: Option<std::path::PathBuf>,
+        version_retention: u64,
+        audit_retention: u64,
     ) -> Self {
         let publish = PublishService::new(
             sm.clone(),
@@ -81,6 +112,8 @@ impl ApiState {
             publish,
             audit,
             ring_path,
+            version_retention,
+            audit_retention,
         }
     }
 
@@ -1395,7 +1428,15 @@ async fn login(
     State(app): State<ApiState>,
     Json(req): Json<LoginReq>,
 ) -> Result<Json<LoginResp>, (StatusCode, Json<ApiErrorBody>)> {
-    if req.password != app.admin_password.as_ref() {
+    // 密码校验：set-password 落状态机后优先；未设置时回退节点配置（--admin-password）。
+    let sm_pw_ok = {
+        let sm = app.sm.lock().expect("sm lock");
+        match sm.get_admin_password_hash().ok().flatten() {
+            Some(hash) => dsh_core::token_hash(&req.password) == hash,
+            None => req.password == app.admin_password.as_ref(),
+        }
+    };
+    if !sm_pw_ok {
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(ApiErrorBody {
@@ -1737,13 +1778,176 @@ async fn rotate_master_key(
     ))
 }
 
+// ---------------- 管理员运维（P2：force-logout / set-password / snapshot / retention-status） ----------------
+
+/// 强制下线当前管理员会话（CLI `dsh admin force-logout` 兜底，design §9.3/I7）。
+async fn admin_force_logout(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
+    app.write(&Command::SessionLogout, now_ms()).await?;
+    app.audit
+        .append(
+            "force_logout",
+            None,
+            None,
+            None,
+            None,
+            serde_json::json!({}),
+        )
+        .await;
+    Ok(Json(serde_json::json!({ "logged_out": true })))
+}
+
+#[derive(Deserialize)]
+struct SetPasswordReq {
+    password: String,
+}
+
+/// 修改管理员密码（哈希落状态机，集群一致；旧会话失效需重新登录）。
+async fn admin_set_password(
+    State(app): State<ApiState>,
+    Json(req): Json<SetPasswordReq>,
+) -> ApiResult<serde_json::Value> {
+    if req.password.len() < 6 {
+        return Err(ApiError(dsh_core::Error::validation("密码至少 6 位")).into());
+    }
+    let hash = dsh_core::token_hash(&req.password);
+    app.write(
+        &Command::AdminSetPassword {
+            password_hash: hash,
+        },
+        now_ms(),
+    )
+    .await?;
+    // 改密后强制下线当前会话（旧 token 失效）
+    app.write(&Command::SessionLogout, now_ms()).await?;
+    app.audit
+        .append(
+            "set_password",
+            None,
+            None,
+            None,
+            None,
+            serde_json::json!({}),
+        )
+        .await;
+    Ok(Json(serde_json::json!({ "changed": true })))
+}
+
+/// 触发备份快照：返回状态机全量 KV dump（`dsh admin snapshot` 备份用；恢复走 dump/restore）。
+async fn admin_snapshot(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
+    let pairs = {
+        let sm = app.sm.lock().expect("sm lock");
+        sm.dump_all().map_err(ApiError::from)?
+    };
+    let entries: Vec<serde_json::Value> = pairs
+        .iter()
+        .map(|(k, v)| {
+            serde_json::json!({
+                "key": String::from_utf8_lossy(k),
+                "value": String::from_utf8_lossy(v),
+            })
+        })
+        .collect();
+    app.audit
+        .append(
+            "snapshot",
+            None,
+            None,
+            None,
+            None,
+            serde_json::json!({ "entries": entries.len() }),
+        )
+        .await;
+    Ok(Json(serde_json::json!({
+        "version": 1,
+        "kind": "dsh-state-dump",
+        "entries": entries,
+    })))
+}
+
+/// 保留策略状态（`dsh admin version-retention-status`）：配置值 + 当前版本/审计计数。
+async fn admin_retention_status(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
+    let (projects, versions, audits) = {
+        let sm = app.sm.lock().expect("sm lock");
+        let projects = sm.list_projects().map(|p| p.len()).unwrap_or(0);
+        let mut versions = 0u64;
+        if let Ok(plist) = sm.list_projects() {
+            for p in plist {
+                if let Ok(bs) = sm.list_branches(&p.id) {
+                    for b in bs {
+                        if let Ok(Some(st)) = sm.get_branch_state(&p.id, &b) {
+                            versions += st.active_version;
+                        }
+                    }
+                }
+            }
+        }
+        let audits = sm
+            .get_audit(None, None, 1)
+            .map(|v| v.first().map(|e| e.seq).unwrap_or(0))
+            .unwrap_or(0);
+        (projects, versions, audits)
+    };
+    Ok(Json(serde_json::json!({
+        "version_retention": app.version_retention,
+        "audit_retention": app.audit_retention,
+        "projects": projects,
+        "active_versions": versions,
+        "audit_entries": audits,
+        "hint": "version_retention=0 表示全量保留；audit_retention=0 表示不裁剪",
+    })))
+}
+
 // ---------------- watch（模块 06） ----------------
+
+#[derive(Deserialize)]
+struct WatchQuery {
+    /// 断线续传起点：重放该版本之后的历史事件再转实时（0=仅实时）
+    #[serde(default)]
+    after_version: u64,
+}
 
 async fn watch_branch(
     State(app): State<ApiState>,
     AxumPath((pid, branch)): AxumPath<(String, String)>,
+    axum::extract::Query(q): axum::extract::Query<WatchQuery>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
-    watch_sse(app.hub.subscribe(), &pid, &branch)
+    // after_version > 0：按版本链合成历史事件（相邻快照 diff；与 gRPC Watch 重放一致）
+    let replay = {
+        let mut out: Vec<dsh_core::model::PublishEvent> = Vec::new();
+        if q.after_version > 0 {
+            let sm = app.sm.lock().expect("sm lock");
+            let pid = ProjectId(pid.clone());
+            let bname = BranchName(branch.clone());
+            if let Ok(hist) = sm.version_history(&pid, &bname) {
+                let mut prev: dsh_core::model::SnapshotMap = Default::default();
+                for rec in hist {
+                    if rec.no <= q.after_version {
+                        continue;
+                    }
+                    if let Ok(cur) = sm.snapshot_of(&pid, &bname, rec.no) {
+                        let diff = dsh_core::diff::compute_diff(&prev, &cur);
+                        prev = cur;
+                        out.push(dsh_core::model::PublishEvent {
+                            project: pid.clone(),
+                            branch: bname.clone(),
+                            version: rec.no,
+                            ty: if rec.rollback_of.is_some() {
+                                dsh_core::model::EventType::Rollback
+                            } else {
+                                dsh_core::model::EventType::ValuePublish
+                            },
+                            structure_version: rec.structure_version,
+                            comment: rec.comment,
+                            request_id: String::new(),
+                            changes: diff,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    };
+    watch_sse(app.hub.subscribe(), &pid, &branch, replay)
 }
 
 // ---------------- 工具 ----------------
@@ -1785,6 +1989,13 @@ pub fn build_router(app: ApiState) -> Router {
         .route("/api/v1/heartbeat", post(heartbeat))
         .route("/api/v1/audit", get(audit_list))
         .route("/api/v1/admin/rotate-master-key", post(rotate_master_key))
+        .route("/api/v1/admin/force-logout", post(admin_force_logout))
+        .route("/api/v1/admin/set-password", post(admin_set_password))
+        .route("/api/v1/admin/snapshot", get(admin_snapshot))
+        .route(
+            "/api/v1/admin/retention-status",
+            get(admin_retention_status),
+        )
         .route("/api/v1/projects", get(list_projects).post(create_project))
         .route(
             "/api/v1/projects/{p}",

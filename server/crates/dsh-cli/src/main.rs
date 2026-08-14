@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use dsh_api::ApiState;
 use dsh_core::{InMemoryStore, StateMachine};
 use dsh_crypto::{load_master_key, Cipher};
@@ -15,6 +15,53 @@ use dsh_storage::{OpenOptions as StorageOptions, RocksStore};
 use dsh_watch::WatchHub;
 
 // ---------------- 配置 ----------------
+
+/// `dsh admin <子命令>`：管理员运维客户端（design-v2 §13.2 / design-v3 §6）。
+#[derive(Subcommand, Debug)]
+enum AdminCmd {
+    /// 生成新主密钥（base64 32B）并打印指引
+    GenMasterKey,
+    /// 轮换主密钥（调管理面 API；DEK 重包由后台任务执行）
+    RotateMasterKey {
+        /// base64 32B 新 KEK
+        new_key: String,
+    },
+    /// 强制下线当前管理员会话（I7 兜底）
+    ForceLogout,
+    /// 修改管理员密码（旧会话失效）
+    SetPassword {
+        /// 新密码（≥6 位）
+        password: String,
+    },
+    /// learner → voter
+    Promote {
+        #[arg(long)]
+        node: u64,
+    },
+    /// 移除节点
+    RemoveNode {
+        #[arg(long)]
+        node: u64,
+    },
+    /// 触发备份快照（状态机 KV dump；可 --out 存盘）
+    Snapshot {
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// 查看保留策略状态（--version-retention / --audit-retention 配置）
+    RetentionStatus,
+}
+
+/// 顶层子命令命名空间（当前仅 admin 运维）。
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// 管理员运维（design-v2 §13.2）：gen-master-key / rotate-master-key /
+    /// force-logout / set-password / promote / remove-node / snapshot / retention-status
+    Admin {
+        #[command(subcommand)]
+        cmd: AdminCmd,
+    },
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "dsh", version, about = "Defing 分布式配置文档服务")]
@@ -52,8 +99,8 @@ struct Cli {
     /// 审计保留条数（0=不裁剪；默认 100k 条，design-v2）
     #[arg(long, default_value_t = 100000)]
     audit_retention: u64,
-    /// 管理员密码（缺省首启随机生成并打印）
-    #[arg(long)]
+    /// 管理员密码（缺省首启随机生成并打印；admin 客户端模式用于登录）
+    #[arg(long, global = true)]
     admin_password: Option<String>,
     /// 会话 TTL 秒数（0 = 不自动过期；默认 24h）
     #[arg(long, default_value_t = 86400)]
@@ -67,12 +114,15 @@ struct Cli {
     /// 轮换主密钥（客户端模式）：向 --admin-endpoint 发起轮换后退出（需 --admin-password）
     #[arg(long)]
     rotate_master_key: Option<String>,
-    /// 管理面端点（--rotate-master-key 客户端模式用）
-    #[arg(long, default_value = "http://127.0.0.1:8384")]
+    /// 管理面端点（客户端模式：rotate-master-key / admin <cmd> 用）
+    #[arg(long, global = true, default_value = "http://127.0.0.1:8384")]
     admin_endpoint: String,
     /// 管理面会话令牌（客户端模式；缺省时用 --admin-password 登录；单会话下建议直接传 token）
-    #[arg(long)]
+    #[arg(long, global = true)]
     admin_token: Option<String>,
+    /// 顶层子命令（dsh admin <cmd>；客户端模式，不启动服务）
+    #[command(subcommand)]
+    cmd: Option<Command>,
 }
 
 // ---------------- 工具 ----------------
@@ -80,6 +130,159 @@ struct Cli {
 fn new_token() -> String {
     let b: [u8; 16] = rand::random();
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// 管理员客户端 token：优先 --admin-token（单会话下 login 会 409）；缺省登录获取。
+async fn admin_token(cli: &Cli) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(t) = &cli.admin_token {
+        return Ok(t.clone());
+    }
+    let pw = cli
+        .admin_password
+        .clone()
+        .ok_or("需要 --admin-token 或 --admin-password")?;
+    let client = reqwest::Client::new();
+    let login: serde_json::Value = client
+        .post(format!("{}/api/v1/login", cli.admin_endpoint))
+        .json(&serde_json::json!({ "password": pw }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let token = login["token"]
+        .as_str()
+        .ok_or_else(|| "login failed (bad password?)".to_string())?;
+    Ok(token.to_string())
+}
+
+/// `dsh admin <cmd>` 分派（客户端模式，调管理面 HTTP）。
+async fn run_admin_cmd(
+    cli: &Cli,
+    cmd: &AdminCmd,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match cmd {
+        AdminCmd::GenMasterKey => {
+            println!("{}", dsh_crypto::Cipher::generate_master_key());
+            return Ok(());
+        }
+        AdminCmd::RotateMasterKey { new_key } => {
+            let token = admin_token(cli).await?;
+            let resp = reqwest::Client::new()
+                .post(format!(
+                    "{}/api/v1/admin/rotate-master-key",
+                    cli.admin_endpoint
+                ))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({ "new_key": new_key }))
+                .send()
+                .await?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            println!("{body}");
+            if !status.is_success() {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    let token = admin_token(cli).await?;
+    let client = reqwest::Client::new();
+    let base = cli.admin_endpoint.trim_end_matches('/');
+    match cmd {
+        AdminCmd::ForceLogout => {
+            let resp = client
+                .post(format!("{base}/api/v1/admin/force-logout"))
+                .bearer_auth(&token)
+                .send()
+                .await?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            println!("{body}");
+            if !status.is_success() {
+                std::process::exit(1);
+            }
+        }
+        AdminCmd::SetPassword { password } => {
+            let resp = client
+                .post(format!("{base}/api/v1/admin/set-password"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({ "password": password }))
+                .send()
+                .await?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            println!("{body}");
+            if !status.is_success() {
+                std::process::exit(1);
+            }
+            eprintln!("密码已修改，旧会话已下线，请用新密码重新登录");
+        }
+        AdminCmd::Promote { node } => {
+            let resp = client
+                .post(format!("{base}/api/v1/cluster/promote"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({ "node_id": node }))
+                .send()
+                .await?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            println!("{body}");
+            if !status.is_success() {
+                std::process::exit(1);
+            }
+        }
+        AdminCmd::RemoveNode { node } => {
+            let resp = client
+                .post(format!("{base}/api/v1/cluster/remove"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({ "node_id": node }))
+                .send()
+                .await?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            println!("{body}");
+            if !status.is_success() {
+                std::process::exit(1);
+            }
+        }
+        AdminCmd::Snapshot { out } => {
+            let resp = client
+                .get(format!("{base}/api/v1/admin/snapshot"))
+                .bearer_auth(&token)
+                .send()
+                .await?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                eprintln!("snapshot failed: {text}");
+                std::process::exit(1);
+            }
+            match out {
+                Some(path) => {
+                    std::fs::write(path, &text)?;
+                    eprintln!("快照已写入 {path}");
+                }
+                None => println!("{text}"),
+            }
+        }
+        AdminCmd::RetentionStatus => {
+            let resp = client
+                .get(format!("{base}/api/v1/admin/retention-status"))
+                .bearer_auth(&token)
+                .send()
+                .await?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            println!("{body}");
+            if !status.is_success() {
+                std::process::exit(1);
+            }
+        }
+        AdminCmd::GenMasterKey | AdminCmd::RotateMasterKey { .. } => unreachable!(),
+    }
+    Ok(())
 }
 
 /// 加入集群：向目标端点发起 join（需命中 leader；带重试与超时）。
@@ -132,6 +335,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_max_level(tracing::Level::INFO)
         .init();
     let cli = Cli::parse();
+    // `dsh admin <cmd>` 客户端模式（不启动服务；需 --admin-endpoint）
+    if let Some(Command::Admin { cmd }) = &cli.cmd {
+        return run_admin_cmd(&cli, cmd).await;
+    }
     let hub = WatchHub::new();
     // 主密钥（secret 项加密/解密；I8）
     let master_key = load_master_key(
@@ -213,7 +420,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
         let sm = StateMachine::new(store);
         let admin_password = resolve_admin_password(&cli, "首次启动");
-        let app = ApiState::new(
+        let app = ApiState::with_retention(
             Arc::new(Mutex::new(sm)),
             hub,
             None,
@@ -224,6 +431,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cli.master_key_file
                 .as_deref()
                 .map(dsh_crypto::ring_file_path),
+            cli.version_retention,
+            cli.audit_retention,
         );
         spawn_grpc(&cli, app.clone());
         let router = dsh_api::build_router(app);
@@ -326,7 +535,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
 
     let admin_password = resolve_admin_password(&cli, &format!("节点 {node_id}"));
-    let app = ApiState::new(
+    let app = ApiState::with_retention(
         sm.clone(),
         hub,
         Some(raft.clone()),
@@ -337,6 +546,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cli.master_key_file
             .as_deref()
             .map(dsh_crypto::ring_file_path),
+        cli.version_retention,
+        cli.audit_retention,
     );
     spawn_grpc(&cli, app.clone());
     let router = dsh_api::build_router(app);

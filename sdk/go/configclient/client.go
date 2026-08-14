@@ -110,6 +110,7 @@ func (c *Client) GetItem(project, branch, group, key string) (any, error) {
 func (c *Client) Watch(project, branch string, listener func(WatchEvent), stop <-chan struct{}) error {
 	path := fmt.Sprintf("/v1/projects/%s/branches/%s/watch", project, branch)
 	attempt := 0
+	var lastVersion int64
 	for {
 		if attempt > 0 {
 			select {
@@ -119,7 +120,11 @@ func (c *Client) Watch(project, branch string, listener func(WatchEvent), stop <
 			}
 		}
 		attempt++
-		resp, err := c.http.Get(c.endpoints[0] + path)
+		resume := ""
+		if lastVersion > 0 {
+			resume = fmt.Sprintf("?after_version=%d", lastVersion)
+		}
+		resp, err := c.http.Get(c.endpoints[0] + path + resume)
 		if err != nil {
 			continue
 		}
@@ -129,6 +134,9 @@ func (c *Client) Watch(project, branch string, listener func(WatchEvent), stop <
 			if strings.HasPrefix(line, "data:") {
 				var e WatchEvent
 				if err := json.Unmarshal([]byte(strings.TrimSpace(line[5:])), &e); err == nil {
+					if e.Version > lastVersion {
+						lastVersion = e.Version
+					}
 					listener(e)
 				}
 			}

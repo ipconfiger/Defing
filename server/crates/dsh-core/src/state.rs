@@ -470,6 +470,9 @@ impl StateMachine {
             } => self.apply_session_login(token_hash, *issued_at, *expires_at),
             Command::SessionLogout => self.apply_session_logout(),
             Command::SessionHeartbeat { expires_at } => self.apply_session_heartbeat(*expires_at),
+            Command::AdminSetPassword { password_hash } => {
+                self.apply_admin_set_password(password_hash)
+            }
             Command::AuditAppend { entry } => self.apply_audit_append(entry),
         }
     }
@@ -1355,6 +1358,17 @@ impl StateMachine {
         session.expires_at = expires_at;
         save(&*self.store, session_key(), &session)?;
         Ok(vec![])
+    }
+
+    /// 设置管理员密码哈希（set-password；集群一致，登录时优先于节点配置）。
+    fn apply_admin_set_password(&mut self, password_hash: &str) -> ApplyOutcome {
+        save(&*self.store, K_ADMIN_PW, &password_hash.to_string())?;
+        Ok(vec![])
+    }
+
+    /// 状态机内管理员密码哈希（set-password 后登录用它校验；未设置时回退节点配置）。
+    pub fn get_admin_password_hash(&self) -> Result<Option<String>, Error> {
+        load(&*self.store, K_ADMIN_PW)
     }
 
     /// 审计追加：seq 单调分配（audit/seq 计数），条目落 audit/{seq:020}。

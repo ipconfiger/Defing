@@ -159,12 +159,15 @@ export class ConfigClient {
       return;
     }
     const path = '/v1/projects/' + project + '/branches/' + branch + '/watch';
+    let lastVersion = 0;
     const connect = (attempt: number) => {
       if (signal?.aborted) return;
       const ctrl = new AbortController();
       const onAbort = () => ctrl.abort();
       signal?.addEventListener('abort', onAbort);
-      fetch(this.httpEndpoint(this.endpoints[0]) + path, { signal: ctrl.signal })
+      // 断线重连带 after_version 续传（design §6.2）
+      const resume = lastVersion > 0 ? '?after_version=' + lastVersion : '';
+      fetch(this.httpEndpoint(this.endpoints[0]) + path + resume, { signal: ctrl.signal })
         .then(async (r) => {
           if (!r.ok || !r.body) throw new ConfigError('HTTP_' + r.status, 'watch failed');
           const reader = r.body.getReader();
@@ -180,7 +183,9 @@ export class ConfigClient {
               buf = buf.slice(nl + 1);
               if (line.startsWith('data:')) {
                 try {
-                  listener(JSON.parse(line.slice(5).trim()) as WatchEvent);
+                  const ev = JSON.parse(line.slice(5).trim()) as WatchEvent;
+                  if (ev.version > lastVersion) lastVersion = ev.version;
+                  listener(ev);
                 } catch {
                   /* 忽略坏帧 */
                 }

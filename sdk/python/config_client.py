@@ -186,18 +186,23 @@ class ConfigClient:
     def _watch_http(self, project, branch, listener, stop):
         path = "/v1/projects/%s/branches/%s/watch" % (project, branch)
         attempt = 0
+        last_version = 0
         while not (stop and stop.is_set()):
             if attempt > 0:
                 time.sleep(min(BACKOFF_BASE_MS * (2 ** attempt), 15000) / 1000)
             attempt += 1
             try:
+                resume = ("?after_version=%d" % last_version) if last_version > 0 else ""
                 url = self.endpoints[0] if isinstance(self.endpoints[0], str) else self.endpoints[0].get("http")
-                with urllib.request.urlopen(url + path, timeout=None) as r:
+                with urllib.request.urlopen(url + path + resume, timeout=None) as r:
                     for raw in r:
                         line = raw.decode().strip()
                         if line.startswith("data:"):
                             try:
-                                listener(json.loads(line[5:].strip()))
+                                ev = json.loads(line[5:].strip())
+                                if ev.get("version", 0) > last_version:
+                                    last_version = ev["version"]
+                                listener(ev)
                             except ValueError:
                                 pass
             except (urllib.error.URLError, OSError):
