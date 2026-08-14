@@ -36,3 +36,7 @@ __pycache__/
 .py-venv/
 .npm-cache/
 sdk/ts/node_modules/
+
+.ab-evidence/
+.ab-home/
+.agent-browser/
