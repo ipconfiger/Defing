@@ -9,52 +9,18 @@ use dsh_api::grpc::{
 };
 use dsh_api::ApiState;
 use dsh_core::command::Command;
-use dsh_core::model::{BranchName, GroupDef, ItemDef, ProjectId, Value, ValueType};
+use dsh_core::model::{BranchName, ProjectId, Value};
 use dsh_core::InMemoryStore;
 use dsh_core::StateMachine;
 use dsh_crypto::Cipher;
+use dsh_testkit::seed_demo_project;
 use dsh_watch::WatchHub;
 
 fn seed_sm(sm: &Mutex<StateMachine>) {
+    // testkit 播种：项目 + 结构(host/port/pass secret) + dev 草稿(host/port) + 发布(v2)
+    seed_demo_project(sm, "p").unwrap();
+    // 追加 secret 项值（明文不落库，测试直接写密文）
     let mut g = sm.lock().unwrap();
-    g.apply(&Command::ProjectCreate { name: "p".into() }, 1)
-        .unwrap();
-    g.apply(
-        &Command::StructureDraftSet {
-            project: "p".into(),
-            base_version: 1,
-            groups: vec![GroupDef {
-                name: "redis".into(),
-                items: vec![
-                    ItemDef {
-                        key: "host".into(),
-                        ty: ValueType::String,
-                        required: true,
-                        secret: false,
-                        validate: None,
-                    },
-                    ItemDef {
-                        key: "pass".into(),
-                        ty: ValueType::Secret,
-                        required: false,
-                        secret: true,
-                        validate: None,
-                    },
-                ],
-            }],
-        },
-        2,
-    )
-    .unwrap();
-    g.apply(
-        &Command::PublishStructure {
-            project: "p".into(),
-            comment: "s".into(),
-            request_id: "s1".into(),
-        },
-        3,
-    )
-    .unwrap();
     g.apply(
         &Command::DraftUpdate {
             project: "p".into(),
@@ -73,17 +39,17 @@ fn seed_sm(sm: &Mutex<StateMachine>) {
             ],
             deletes: vec![],
         },
-        4,
+        6,
     )
     .unwrap();
     g.apply(
         &Command::Publish {
             project: "p".into(),
             branch: BranchName("dev".into()),
-            comment: "v2".into(),
-            request_id: "r1".into(),
+            comment: "v3".into(),
+            request_id: "r2".into(),
         },
-        5,
+        7,
     )
     .unwrap();
 }
@@ -140,7 +106,7 @@ async fn get_config_and_get_item() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(snap.version, 2);
+    assert_eq!(snap.version, 3); // testkit v2 + secret v3
     assert_eq!(snap.structure_version, 2); // 结构发布后版本=2（base_version=1 → published 2）
     let host = snap.groups.get("redis").unwrap().items.get("host").unwrap();
     assert!(!host.masked);
@@ -276,7 +242,7 @@ async fn auth_interceptor_enforces_token() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(snap.version, 2);
+    assert_eq!(snap.version, 3); // testkit v2 + secret v3
     let _ = &mut plain;
 }
 

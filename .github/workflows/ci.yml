@@ -28,7 +28,7 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: deny
         working-directory: server
-        run: cargo install cargo-deny --locked && cargo deny check 2>/dev/null || echo "cargo-deny not configured yet"
+        run: cargo install cargo-deny --locked && cargo deny check -c deny.toml
 
   unit:
     runs-on: ubuntu-latest

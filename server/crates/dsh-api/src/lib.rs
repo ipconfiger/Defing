@@ -1571,7 +1571,19 @@ async fn heartbeat(
 // ---------------- 可观测性（模块 10） ----------------
 
 async fn metrics(State(app): State<ApiState>) -> String {
-    metrics_text(&app.sm)
+    let session_active = {
+        let sm = app.sm.lock().expect("sm lock");
+        match sm.get_session().ok().flatten() {
+            Some(s) => s.expires_at.map(|e| now_ms() < e).unwrap_or(true),
+            None => false,
+        }
+    };
+    metrics_text(
+        &app.sm,
+        app.raft.as_ref(),
+        session_active,
+        app.cipher.is_some(),
+    )
 }
 
 async fn readyz(State(app): State<ApiState>) -> Result<Json<serde_json::Value>, StatusCode> {

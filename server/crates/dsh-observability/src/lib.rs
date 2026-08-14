@@ -71,21 +71,27 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Prometheus 文本指标（基础指标；完整指标见模块 10 §3）。
-pub fn metrics_text(sm: &Mutex<StateMachine>) -> String {
+/// Prometheus 文本指标（模块 10 §3 子集：项目/分支/版本/共享/审计/会话/主密钥/raft）。
+pub fn metrics_text(
+    sm: &Mutex<StateMachine>,
+    raft: Option<&RaftHandle>,
+    session_active: bool,
+    master_key_ok: bool,
+) -> String {
     let guard = sm.lock().expect("sm lock");
     let projects = guard.list_projects().map(|p| p.len()).unwrap_or(0);
     let mut out = String::new();
     out.push_str("# HELP dsh_projects 项目数\n");
     out.push_str("# TYPE dsh_projects gauge\n");
     out.push_str(&format!("dsh_projects {projects}\n"));
-    out.push_str("# HELP dsh_versions 分支活动版本总和\n");
-    out.push_str("# TYPE dsh_versions gauge\n");
+
+    let mut branches = 0u64;
     let mut versions = 0u64;
     if let Ok(projects_list) = guard.list_projects() {
         for p in projects_list {
-            if let Ok(branches) = guard.list_branches(&p.id) {
-                for b in branches {
+            if let Ok(bs) = guard.list_branches(&p.id) {
+                branches += bs.len() as u64;
+                for b in bs {
                     if let Ok(Some(st)) = guard.get_branch_state(&p.id, &b) {
                         versions += st.active_version;
                     }
@@ -93,7 +99,68 @@ pub fn metrics_text(sm: &Mutex<StateMachine>) -> String {
             }
         }
     }
+    out.push_str("# HELP dsh_branches 分支总数\n");
+    out.push_str("# TYPE dsh_branches gauge\n");
+    out.push_str(&format!("dsh_branches {branches}\n"));
+    out.push_str("# HELP dsh_versions 分支活动版本总和\n");
+    out.push_str("# TYPE dsh_versions gauge\n");
     out.push_str(&format!("dsh_versions {versions}\n"));
+
+    let shared = guard.list_shared_published().map(|v| v.len()).unwrap_or(0);
+    let drafts = guard.list_shared_drafts().map(|v| v.len()).unwrap_or(0);
+    out.push_str("# HELP dsh_shared_items 已发布共享项数\n");
+    out.push_str("# TYPE dsh_shared_items gauge\n");
+    out.push_str(&format!("dsh_shared_items {shared}\n"));
+    out.push_str("# HELP dsh_shared_drafts 共享草稿数\n");
+    out.push_str("# TYPE dsh_shared_drafts gauge\n");
+    out.push_str(&format!("dsh_shared_drafts {drafts}\n"));
+
+    let audits = guard
+        .get_audit(None, None, 1)
+        .map(|v| v.first().map(|e| e.seq).unwrap_or(0))
+        .unwrap_or(0);
+    out.push_str("# HELP dsh_audit_entries 审计条目数\n");
+    out.push_str("# TYPE dsh_audit_entries gauge\n");
+    out.push_str(&format!("dsh_audit_entries {audits}\n"));
+
+    out.push_str("# HELP dsh_session_active 管理员会话是否活动（0/1）\n");
+    out.push_str("# TYPE dsh_session_active gauge\n");
+    out.push_str(&format!("dsh_session_active {}\n", session_active as u8));
+    out.push_str("# HELP dsh_master_key_ok 主密钥是否就绪（0/1）\n");
+    out.push_str("# TYPE dsh_master_key_ok gauge\n");
+    out.push_str(&format!("dsh_master_key_ok {}\n", master_key_ok as u8));
+
+    match raft {
+        Some(raft) => {
+            let m = raft.metrics().borrow().clone();
+            // openraft ServerState: Leader=2 / Follower=1 / Learner=0 / Candidate=3
+            let role = match &m.state {
+                dsh_raft::openraft::ServerState::Leader => 2,
+                dsh_raft::openraft::ServerState::Follower => 1,
+                dsh_raft::openraft::ServerState::Learner => 0,
+                dsh_raft::openraft::ServerState::Candidate => 3,
+                _ => 0,
+            };
+            let term = m.current_term;
+            let committed = m.last_log_index.unwrap_or(0);
+            out.push_str(
+                "# HELP dsh_raft_role 节点角色（0=learner 1=follower 2=leader 3=candidate）\n",
+            );
+            out.push_str("# TYPE dsh_raft_role gauge\n");
+            out.push_str(&format!("dsh_raft_role {role}\n"));
+            out.push_str("# HELP dsh_raft_term 当前任期\n");
+            out.push_str("# TYPE dsh_raft_term gauge\n");
+            out.push_str(&format!("dsh_raft_term {term}\n"));
+            out.push_str("# HELP dsh_raft_committed_index 已提交日志索引\n");
+            out.push_str("# TYPE dsh_raft_committed_index gauge\n");
+            out.push_str(&format!("dsh_raft_committed_index {committed}\n"));
+        }
+        None => {
+            out.push_str("# HELP dsh_raft_role 节点角色（0=dev-single）\n");
+            out.push_str("# TYPE dsh_raft_role gauge\n");
+            out.push_str("dsh_raft_role 0\n");
+        }
+    }
     out
 }
 
@@ -154,8 +221,10 @@ mod tests {
     #[test]
     fn metrics_contains_gauges() {
         let sm = Mutex::new(StateMachine::new(Box::new(InMemoryStore::new())));
-        let text = metrics_text(&sm);
+        let text = metrics_text(&sm, None, false, true);
         assert!(text.contains("dsh_projects 0"));
+        assert!(text.contains("dsh_session_active 0"));
+        assert!(text.contains("dsh_master_key_ok 1"));
         assert!(text.contains("dsh_versions 0"));
     }
 

@@ -1147,3 +1147,45 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
         .unwrap();
     assert_eq!(count2, 0);
 }
+
+// ---------------- P3：限额（LIM-001） + 管理员改密 ----------------
+
+#[test]
+fn shared_item_over_limit_rejected() {
+    let mut s = sm();
+    let big = "x".repeat(dsh_core::limits::MAX_VALUE_BYTES + 1);
+    let item = dsh_core::model::SharedItem {
+        group: "g".into(),
+        key: "k".into(),
+        ty: dsh_core::model::ValueType::String,
+        secret: false,
+        required: false,
+        value: dsh_core::model::Value::String(big),
+        version: 0,
+    };
+    let err = s
+        .apply(&dsh_core::command::Command::SharedDraftUpdate { item }, 1)
+        .unwrap_err();
+    assert_eq!(
+        err.kind,
+        dsh_core::ErrorKind::LimitExceeded,
+        "超限额应 ERR_LIMIT_EXCEEDED"
+    );
+}
+
+#[test]
+fn admin_set_password_persists_and_reads() {
+    let mut s = sm();
+    let hash = "sha256-hex-of-password";
+    s.apply(
+        &dsh_core::command::Command::AdminSetPassword {
+            password_hash: hash.into(),
+        },
+        1,
+    )
+    .unwrap();
+    assert_eq!(s.get_admin_password_hash().unwrap().as_deref(), Some(hash));
+    // 未设置时返回 None（回退节点配置）
+    let s2 = sm();
+    assert_eq!(s2.get_admin_password_hash().unwrap(), None);
+}

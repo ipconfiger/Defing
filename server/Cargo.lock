@@ -613,6 +613,7 @@ dependencies = [
  "dsh-publish",
  "dsh-raft",
  "dsh-render",
+ "dsh-testkit",
  "dsh-watch",
  "futures",
  "prost",
@@ -744,6 +745,9 @@ dependencies = [
 [[package]]
 name = "dsh-testkit"
 version = "0.1.0"
+dependencies = [
+ "dsh-core",
+]
 
 [[package]]
 name = "dsh-watch"
