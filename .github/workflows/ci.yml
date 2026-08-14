@@ -1,6 +1,6 @@
 name: ci
 # 依据 docs/design-modules/13-testing-ci.md 的 9 阶段流水线。
-# M0 阶段：lint + unit + contract 已落地；后续阶段逐步补齐 stage 4~9。
+# stage 1 lint / 2 unit / 3 contract 已落地；4 integ(并入 unit) / 5 raft / 6 sdk / 7 e2e / 8 bench / 9 release+SBOM。
 on:
   push:
     branches: [main]
@@ -17,6 +17,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
       - name: fmt
         working-directory: server
         run: cargo fmt --all -- --check
@@ -32,6 +35,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ hashFiles('server/Cargo.lock') }}
       - name: test
         working-directory: server
         run: cargo test --workspace
@@ -51,4 +64,141 @@ jobs:
       - name: check contracts
         run: ./scripts/check-contracts.sh
 
-  # stage 4+（集成/raft/sdk/e2e/bench/release）在对应里程碑接入
+  # stage 5: Raft 集群 + 快照持久化 + 转发契约（进程内集群测试）
+  raft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ hashFiles('server/Cargo.lock') }}
+      - name: raft cluster tests
+        working-directory: server
+        run: cargo test -p dsh-raft --test cluster --test snapshot_persist --test forward_hint
+
+  # stage 6: 三语言 SDK 契约对拍（同一 dev-single 服务）
+  sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ hashFiles('server/Cargo.lock') }}
+      - name: build dsh
+        working-directory: server
+        run: cargo build -p dsh-cli
+      - name: sdk contract test
+        env:
+          BIN: ${{ github.workspace }}/server/target/debug/dsh
+        run: ./scripts/sdk-contract-test.sh
+
+  # stage 7: 多进程 e2e（dev-single / 3 节点集群 / 混沌）
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ hashFiles('server/Cargo.lock') }}
+      - name: build dsh
+        working-directory: server
+        run: cargo build -p dsh-cli
+      - name: dev-single demo
+        env:
+          BIN: ${{ github.workspace }}/server/target/debug/dsh
+        run: ./scripts/dev-single-demo.sh
+      - name: cluster demo
+        env:
+          BIN: ${{ github.workspace }}/server/target/debug/dsh
+        run: ./scripts/cluster-demo.sh
+      - name: chaos test
+        env:
+          BIN: ${{ github.workspace }}/server/target/debug/dsh
+        run: ./scripts/chaos-test.sh
+
+  # stage 8: 基准冒烟（结果归档，不 gate 合并）
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ hashFiles('server/Cargo.lock') }}
+      - name: build dsh
+        working-directory: server
+        run: cargo build -p dsh-cli
+      - name: benchmark smoke
+        env:
+          BIN: ${{ github.workspace }}/server/target/debug/dsh
+        run: ./scripts/bench.sh 2>&1 | tee /tmp/dsh-bench.out
+
+  # stage 9: release 构建 + SBOM（A4）
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ hashFiles('server/Cargo.lock') }}
+      - name: release build
+        working-directory: server
+        run: cargo build --release -p dsh-cli
+      - name: sbom
+        uses: anchore/sbom-action@v0
+        with:
+          path: ./server
+          format: spdx-json
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binary
+          path: server/target/release/dsh
