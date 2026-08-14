@@ -1,0 +1,151 @@
+// 分布式配置文档服务 —— 数据面契约 v1
+// 依据：docs/design-v2.md（详细设计方案 v2.0）§5
+// 语言：proto3 ｜ 包：config.v1
+// 错误：RPC 失败返回 gRPC status；detail 中携带错误码（见 design-v2 §5.4）
+
+syntax = "proto3";
+
+package config.v1;
+
+option go_package = "config/v1;configv1";
+option java_package = "com.dsh.config.v1";
+
+// ============ 数据面服务（SDK 使用） ============
+
+service ConfigService {
+  // 获取 (项目, 分支) 的配置快照；version=0 表示活动版本
+  rpc GetConfig(GetConfigRequest) returns (ConfigSnapshot);
+
+  // 获取单个 item 值
+  rpc GetItem(GetItemRequest) returns (ItemValue);
+
+  // 订阅 (项目, 分支)：服务端流，仅在发布时推送事件
+  // after_version>0 时服务端先重放该版本之后的所有已发布事件
+  rpc Watch(WatchRequest) returns (stream WatchEvent);
+
+  // 获取集群成员（用于 SDK 端点池动态更新）
+  rpc ListMembers(ListMembersRequest) returns (ListMembersResponse);
+}
+
+// ============ 值类型 ============
+
+enum ValueType {
+  VALUE_TYPE_UNSPECIFIED = 0;
+  STRING  = 1;
+  INT     = 2;
+  FLOAT   = 3;
+  BOOL    = 4;
+  JSON    = 5;   // 存规范化 JSON 文本
+  ARRAY   = 6;   // 字符串数组（元素类型约束见文档）
+  SECRET  = 7;   // 敏感项：传输时按需解密，展示/导出脱敏
+}
+
+message Value {
+  ValueType type = 1;
+  oneof data {
+    string str_value = 2;
+    int64  int_value = 3;
+    double float_value = 4;
+    bool   bool_value = 5;
+    string json_value = 6;
+    StringList list_value = 7;
+  }
+  // 管理面/导出场景：true 表示本值已脱敏（掩码），不应作为真实值使用
+  bool masked = 8;
+}
+
+message StringList {
+  repeated string values = 1;
+}
+
+// ============ 数据面消息 ============
+
+message GetConfigRequest {
+  string project = 1;
+  string branch = 2;
+  int64 version = 3;          // 0 = 活动版本
+}
+
+message GroupData {
+  map<string, Value> items = 1;
+}
+
+message ConfigSnapshot {
+  string project = 1;
+  string branch = 2;
+  int64 version = 3;              // 活动版本号（或请求的版本）
+  int64 structure_version = 4;    // 结构版本号
+  map<string, GroupData> groups = 5;
+}
+
+message GetItemRequest {
+  string project = 1;
+  string branch = 2;
+  string group = 3;
+  string key = 4;
+  int64 version = 5;              // 0 = 活动版本
+}
+
+message ItemValue {
+  string group = 1;
+  string key = 2;
+  Value value = 3;
+}
+
+message WatchRequest {
+  string project = 1;
+  string branch = 2;
+  int64 after_version = 3;        // 断线续传起点（0 = 从当前活动版本开始）
+}
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  VALUE_PUBLISH    = 1;   // 分支值发布
+  STRUCTURE_PUBLISH = 2;  // 结构发布（全分支同时生效）
+  SHARED_CASCADE   = 3;   // 共享库发布导致的级联
+  ROLLBACK         = 4;   // 回滚（内容=旧版本，版本号=新）
+}
+
+enum ChangeKind {
+  CHANGE_KIND_UNSPECIFIED = 0;
+  UPSERT = 1;   // 写入/更新
+  DELETE = 2;   // 删除（结构发布中 item 被移除时）
+}
+
+message Change {
+  string group = 1;
+  string key = 2;
+  ChangeKind kind = 3;
+  Value new_value = 4;    // DELETE 时为空
+}
+
+message WatchEvent {
+  int64 version = 1;            // 发布产生的新版本号（(项目,分支) 内单调递增）
+  EventType type = 2;
+  int64 structure_version = 3;  // 本次事件时的结构版本
+  string comment = 4;           // 发布备注
+  string request_id = 5;        // 幂等键（与发布请求一致，便于对账）
+  repeated Change changes = 6;
+  // 服务端认为客户端缓存可能已失效（慢消费者/起点被裁剪前），客户端应重拉全量
+  bool snapshot_required = 7;
+}
+
+message ListMembersRequest {}
+
+message Member {
+  string node_id = 1;
+  string grpc_addr = 2;
+  string http_addr = 3;
+  bool is_leader = 4;
+  bool is_voter = 5;
+  int64 committed_index = 6;    // 用于选择最新节点
+}
+
+message ListMembersResponse {
+  repeated Member members = 1;
+}
+
+// ============ 错误码（gRPC status detail 中携带） ============
+// 见 docs/design-v2.md §5.4：ERR_LEADER_REDIRECT / ERR_NOT_FOUND / ERR_VALIDATION /
+// ERR_PUBLISH_BLOCKED / ERR_VERSION_PRUNED / ERR_SESSION_IN_USE /
+// ERR_SESSION_EXPIRED / ERR_FORBIDDEN / ERR_CYCLE_REF / ERR_CONFLICT / ERR_NO_DRAFT

@@ -1,0 +1,11 @@
+[package]
+name = "dsh-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Defing config service - RocksDB storage (Store trait impl, module 02)"
+
+[dependencies]
+dsh-core = { path = "../dsh-core" }
+# rust-rocksdb 0.23 的 lib 名为 rust_rocksdb；重命名以便代码用 rocksdb::
+rocksdb = { package = "rust-rocksdb", version = "0.23" }

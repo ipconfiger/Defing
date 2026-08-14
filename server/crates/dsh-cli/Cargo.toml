@@ -1,0 +1,29 @@
+[package]
+name = "dsh-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Defing config service - binary: dsh (assembler: storage/raft/state -> dsh-api router)"
+
+[[bin]]
+name = "dsh"
+path = "src/main.rs"
+
+[dependencies]
+dsh-api = { path = "../dsh-api" }
+dsh-core = { path = "../dsh-core" }
+dsh-storage = { path = "../dsh-storage" }
+dsh-raft = { path = "../dsh-raft" }
+dsh-crypto = { path = "../dsh-crypto" }
+dsh-jobs = { path = "../dsh-jobs" }
+dsh-watch = { path = "../dsh-watch" }
+clap = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+reqwest = { workspace = true }
+rand = "0.8"
+tonic = "0.14"

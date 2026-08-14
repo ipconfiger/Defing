@@ -1,0 +1,12 @@
+[package]
+name = "dsh-publish"
+version = "0.1.0"
+edition = "2021"
+description = "Defing config service - publish orchestration: secret encryption + publish/rollback/structure (module 04)"
+
+[dependencies]
+dsh-core = { path = "../dsh-core" }
+dsh-crypto = { path = "../dsh-crypto" }
+dsh-raft = { path = "../dsh-raft" }
+tokio = { workspace = true }
+serde_json = { workspace = true }

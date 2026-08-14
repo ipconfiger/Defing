@@ -1,0 +1,24 @@
+# Defing 3 节点集群示例
+version: "3.9"
+services:
+  node1:
+    build: .
+    command: dsh --node-id 1 --bootstrap --http-addr 0.0.0.0:8384 --raft-addr 0.0.0.0:8385 --data-dir /data --admin-password changeme
+    volumes: [n1:/data]
+    ports: ["18384:8384"]
+  node2:
+    build: .
+    command: dsh --node-id 2 --join http://node1:8384 --http-addr 0.0.0.0:8384 --raft-addr 0.0.0.0:8385 --data-dir /data --admin-password changeme
+    depends_on: [node1]
+    volumes: [n2:/data]
+    ports: ["28384:8384"]
+  node3:
+    build: .
+    command: dsh --node-id 3 --join http://node1:8384 --http-addr 0.0.0.0:8384 --raft-addr 0.0.0.0:8385 --data-dir /data --admin-password changeme
+    depends_on: [node1]
+    volumes: [n3:/data]
+    ports: ["38384:8384"]
+volumes:
+  n1: {}
+  n2: {}
+  n3: {}

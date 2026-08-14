@@ -1,0 +1,12 @@
+[package]
+name = "dsh-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Defing config service - multi-format rendering (module 08)"
+
+[dependencies]
+dsh-core = { path = "../dsh-core" }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+toml = "0.8"

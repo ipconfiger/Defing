@@ -1,0 +1,210 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://defing.dev/schema/storage.v1.schema.json",
+  "title": "分布式配置文档服务 存储工件 Schema v1",
+  "description": "Raft 状态机内持久化工件的 JSON Schema（docs/design-v2.md §3）。根无校验对象，仅作为 $defs 定义库，供各工件引用。",
+  "$defs": {
+    "ItemDef": {
+      "type": "object",
+      "required": ["key", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "key": { "type": "string", "maxLength": 128 },
+        "type": { "enum": ["string", "int", "float", "bool", "json", "array", "secret"] },
+        "required": { "type": "boolean", "default": false },
+        "secret": { "type": "boolean", "default": false },
+        "validate": { "type": "string", "description": "校验规则 JSON（正则/范围）" }
+      }
+    },
+    "GroupDef": {
+      "type": "object",
+      "required": ["name", "items"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "maxLength": 128 },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/ItemDef" } }
+      }
+    },
+    "Structure": {
+      "type": "object",
+      "required": ["version", "groups"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "type": "integer", "minimum": 1 },
+        "groups": { "type": "array", "items": { "$ref": "#/$defs/GroupDef" } }
+      }
+    },
+    "StructureDraft": {
+      "type": "object",
+      "required": ["base_version", "groups"],
+      "additionalProperties": false,
+      "properties": {
+        "base_version": { "type": "integer", "minimum": 1 },
+        "groups": { "type": "array", "items": { "$ref": "#/$defs/GroupDef" } }
+      }
+    },
+    "Value": {
+      "description": "与 proto config.v1.Value 对应的 JSON 表示；secret 值为密文",
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["string", "int", "float", "bool", "json", "array", "secret"] },
+        "str_value": { "type": "string" },
+        "int_value": { "type": "integer", "format": "int64" },
+        "float_value": { "type": "number" },
+        "bool_value": { "type": "boolean" },
+        "json_value": { "type": "string" },
+        "list_value": { "type": "array", "items": { "type": "string", "maxLength": 8192 } },
+        "masked": { "type": "boolean", "default": false }
+      }
+    },
+    "Ciphertext": {
+      "description": "secret 值密文 wire 格式（docs/design-v2.md §7.3）",
+      "type": "object",
+      "required": ["enc", "v", "dek_v", "nonce", "ct", "edek", "edek_nonce"],
+      "additionalProperties": false,
+      "properties": {
+        "enc": { "enum": ["aes-256-gcm", "chacha20-poly1305"] },
+        "v": { "const": 1 },
+        "dek_v": { "type": "integer", "minimum": 1 },
+        "nonce": { "type": "string", "description": "base64，12B" },
+        "ct": { "type": "string", "description": "base64 密文" },
+        "edek": { "type": "string", "description": "base64，KEK 加密的 DEK" },
+        "edek_nonce": { "type": "string", "description": "base64，12B" }
+      }
+    },
+    "DraftValue": {
+      "description": "值草稿中单个 item 的草稿值",
+      "type": "object",
+      "required": ["value", "updated_at"],
+      "additionalProperties": false,
+      "properties": {
+        "value": { "$ref": "#/$defs/Value" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "BranchState": {
+      "type": "object",
+      "required": ["active_version", "structure_version"],
+      "additionalProperties": false,
+      "properties": {
+        "active_version": { "type": "integer", "minimum": 1 },
+        "structure_version": { "type": "integer", "minimum": 1 },
+        "last_request_id": { "type": "string", "description": "最近一次发布/回滚的幂等键（I10）" },
+        "value_draft": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": { "$ref": "#/$defs/DraftValue" },
+            "description": "group → { key → DraftValue }"
+          }
+        }
+      }
+    },
+    "DiffEntry": {
+      "type": "object",
+      "required": ["group", "key", "kind"],
+      "additionalProperties": false,
+      "properties": {
+        "group": { "type": "string" },
+        "key": { "type": "string" },
+        "kind": { "enum": ["upsert", "delete"] },
+        "new_value": { "$ref": "#/$defs/Value" }
+      }
+    },
+    "VersionRecord": {
+      "type": "object",
+      "required": ["no", "structure_version", "created_at", "kind"],
+      "additionalProperties": false,
+      "properties": {
+        "no": { "type": "integer", "minimum": 1 },
+        "structure_version": { "type": "integer", "minimum": 1 },
+        "created_at": { "type": "string", "format": "date-time" },
+        "operator": { "type": "string" },
+        "comment": { "type": "string", "maxLength": 500 },
+        "rollback_of": { "type": ["integer", "null"] },
+        "kind": { "enum": ["full", "diff"] },
+        "snapshot_ref": { "type": "string", "description": "kind=full 时的快照存储引用" },
+        "diff_ref": { "type": "string", "description": "kind=diff 时的 diff 存储引用" }
+      }
+    },
+    "SharedItem": {
+      "type": "object",
+      "required": ["group", "key", "type", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "group": { "type": "string", "maxLength": 128 },
+        "key": { "type": "string", "maxLength": 128 },
+        "type": { "enum": ["string", "int", "float", "bool", "json", "array", "secret"] },
+        "secret": { "type": "boolean", "default": false },
+        "required": { "type": "boolean", "default": false },
+        "value": { "$ref": "#/$defs/Value" },
+        "version": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "SharedDraft": {
+      "type": "object",
+      "required": ["group", "key", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "group": { "type": "string" },
+        "key": { "type": "string" },
+        "type": { "enum": ["string", "int", "float", "bool", "json", "array", "secret"] },
+        "secret": { "type": "boolean", "default": false },
+        "required": { "type": "boolean", "default": false },
+        "value": { "$ref": "#/$defs/Value" }
+      }
+    },
+    "SharedVersion": {
+      "type": "object",
+      "required": ["no", "created_at"],
+      "additionalProperties": false,
+      "properties": {
+        "no": { "type": "integer", "minimum": 1 },
+        "created_at": { "type": "string", "format": "date-time" },
+        "operator": { "type": "string" },
+        "comment": { "type": "string", "maxLength": 500 }
+      }
+    },
+    "RefBinding": {
+      "type": "object",
+      "required": ["group", "shared_group", "shared_key"],
+      "additionalProperties": false,
+      "properties": {
+        "group": { "type": "string", "description": "项目分组" },
+        "item_key": { "type": ["string", "null"], "description": "null=整组引用" },
+        "shared_group": { "type": "string" },
+        "shared_key": { "type": "string" }
+      }
+    },
+    "AdminSession": {
+      "type": "object",
+      "required": ["token_hash", "issued_at", "expires_at"],
+      "additionalProperties": false,
+      "properties": {
+        "token_hash": { "type": "string", "description": "会话令牌 SHA-256（不存明文）" },
+        "issued_at": { "type": "string", "format": "date-time" },
+        "expires_at": { "type": "string", "format": "date-time" },
+        "device_id": { "type": "string" },
+        "must_change_password": { "type": "boolean", "default": false }
+      }
+    },
+    "AuditEntry": {
+      "type": "object",
+      "required": ["seq", "ts", "operator", "action"],
+      "additionalProperties": false,
+      "properties": {
+        "seq": { "type": "integer", "minimum": 1 },
+        "ts": { "type": "string", "format": "date-time" },
+        "operator": { "type": "string" },
+        "action": { "enum": ["login", "logout", "force_logout", "set_password", "project_create", "project_delete", "branch_create", "branch_delete", "draft_update", "publish", "structure_publish", "shared_publish", "rollback", "promote", "decrypt", "export", "cluster_join", "cluster_promote", "cluster_remove", "rotate_master_key"] },
+        "project": { "type": "string" },
+        "branch": { "type": "string" },
+        "version": { "type": "integer", "format": "int64" },
+        "request_id": { "type": "string" },
+        "detail": { "type": "object", "additionalProperties": true }
+      }
+    }
+  }
+}

@@ -1,0 +1,782 @@
+openapi: 3.0.3
+info:
+  title: 分布式配置文档服务 管理面 API v1
+  version: 1.0.0
+  description: |
+    管理面 REST 契约，与 docs/design-v2.md §5.3 一致。
+    数据面为 gRPC，正式契约见 proto/config.v1.proto。
+    所有管理写操作应携带 Idempotency-Key 请求头（幂等，见 design-v2 §4.2）。
+  contact:
+    name: Defing Config Service
+servers:
+  - url: http://localhost:8384
+security:
+  - AdminSession: []
+paths:
+  /api/v1/login:
+    post:
+      summary: 登录（单一管理员会话 I7；第二个登录返回 409）
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/SessionInUse' }
+  /api/v1/logout:
+    post:
+      summary: 登出（使当前会话失效）
+      responses:
+        '204': { description: 成功 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/v1/heartbeat:
+    post:
+      summary: 会话心跳续期（默认每 5min）
+      responses:
+        '200':
+          description: 续期成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  expires_at: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/v1/projects:
+    get:
+      summary: 项目列表
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Project' }
+    post:
+      summary: 创建项目（name 全局唯一）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, maxLength: 128 }
+      responses:
+        '201':
+          description: 已创建（默认创建 dev/test/prod 分支）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/projects/{p}:
+    get:
+      summary: 项目详情
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      summary: 删除项目（需确认 force=true 参数）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { name: force, in: query, schema: { type: boolean, default: false } }
+      responses:
+        '204': { description: 成功 }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/projects/{p}/branches:
+    get:
+      summary: 分支列表（含活动版本号）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Branch' }
+    post:
+      summary: 新建分支（继承当前已发布结构与活动版本值）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, pattern: '^[a-z0-9][a-z0-9-]{0,63}$' }
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Branch' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/projects/{p}/branches/{b}:
+    get:
+      summary: 分支详情
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { $ref: '#/components/parameters/BranchPath' }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Branch' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      summary: 删除分支（活动版本为 1 且无草稿时可删）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { $ref: '#/components/parameters/BranchPath' }
+      responses:
+        '204': { description: 成功 }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/projects/{p}/structure-draft:
+    get:
+      summary: 读取结构草稿（含基础版本）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StructureDraft' }
+    put:
+      summary: 整体替换结构草稿（base_version 必须匹配当前基础版本，否则 409）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StructureDraft' }
+      responses:
+        '200':
+          description: 已保存
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StructureDraft' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /api/v1/projects/{p}/structure-draft/publish:
+    post:
+      summary: 发布结构（对全部分支同时生效，所有分支版本号推进）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PublishRequest' }
+      responses:
+        '200':
+          description: 已发布
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [structure_version, affected_branches]
+                properties:
+                  structure_version: { type: integer, format: int64 }
+                  affected_branches:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        branch: { type: string }
+                        version: { type: integer, format: int64 }
+        '422': { $ref: '#/components/responses/PublishBlocked' }
+  /api/v1/projects/{p}/branches/{b}/draft:
+    get:
+      summary: 读取分支值草稿（待发布变更）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { $ref: '#/components/parameters/BranchPath' }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DraftBody' }
+    put:
+      summary: 更新值草稿（updates 覆盖写入；deletes 按 "group/key" 移除）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { $ref: '#/components/parameters/BranchPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DraftBody' }
+      responses:
+        '200':
+          description: 已保存
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DraftBody' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /api/v1/projects/{p}/branches/{b}/publish:
+    post:
+      summary: 发布分支版本（原子；幂等键防重复）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { $ref: '#/components/parameters/BranchPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PublishRequest' }
+      responses:
+        '200':
+          description: 已发布
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublishResult' }
+        '409': { $ref: '#/components/responses/NoDraft' }
+        '422': { $ref: '#/components/responses/PublishBlocked' }
+  /api/v1/projects/{p}/branches/{b}/versions:
+    get:
+      summary: 版本历史
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { $ref: '#/components/parameters/BranchPath' }
+        - { name: limit, in: query, schema: { type: integer, maximum: 200, default: 50 } }
+        - { name: before, in: query, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  versions:
+                    type: array
+                    items: { $ref: '#/components/schemas/Version' }
+  /api/v1/projects/{p}/branches/{b}/rollback:
+    post:
+      summary: 回滚到指定版本（以旧内容创建新版本）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { $ref: '#/components/parameters/BranchPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RollbackRequest' }
+      responses:
+        '200':
+          description: 已回滚
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [new_version]
+                properties:
+                  new_version: { type: integer, format: int64 }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/projects/{p}/diff:
+    get:
+      summary: 分支间值对比（同结构按 key）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { name: branch_a, in: query, required: true, schema: { type: string } }
+        - { name: branch_b, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DiffResult' }
+  /api/v1/projects/{p}/promote:
+    post:
+      summary: 值提升（写入目标分支值草稿；默认不覆盖目标已改项）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PromoteRequest' }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PromoteResult' }
+  /api/v1/shared:
+    get:
+      summary: 共享项列表
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SharedItem' }
+    post:
+      summary: 新建共享项（写共享草稿）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SharedItem' }
+      responses:
+        '201': { $ref: '#/components/responses/Created' }
+  /api/v1/shared-draft:
+    put:
+      summary: 更新共享草稿
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SharedItem' }
+      responses:
+        '200': { description: 已保存 }
+  /api/v1/shared/publish:
+    post:
+      summary: 发布共享项（auto 模式自动级联受影响项目；返回受影响列表）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PublishRequest' }
+      responses:
+        '200':
+          description: 已发布
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SharedPublishResult' }
+        '422': { $ref: '#/components/responses/PublishBlocked' }
+  /api/v1/audit:
+    get:
+      summary: 审计查询
+      parameters:
+        - { name: action, in: query, schema: { type: string } }
+        - { name: since, in: query, schema: { type: string, format: date-time } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 1000 } }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AuditEntry' }
+  /api/v1/cluster/join:
+    post:
+      summary: 新节点加入（加为 learner；经 leader）
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/JoinRequest' }
+      responses:
+        '200':
+          description: 已受理，返回成员表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MemberList' }
+  /api/v1/cluster/promote:
+    post:
+      summary: 将 learner 提升为 voter
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [node_id]
+              properties:
+                node_id: { type: string }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MemberList' }
+  /api/v1/cluster/remove:
+    post:
+      summary: 移除节点（先降 learner 再移除）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [node_id]
+              properties:
+                node_id: { type: string }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MemberList' }
+  /healthz:
+    get:
+      summary: 存活检查
+      security: []
+      responses:
+        '200':
+          description: 存活
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok] }
+  /readyz:
+    get:
+      summary: 就绪检查（已加入集群且可服务）
+      security: []
+      responses:
+        '200':
+          description: 就绪
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok] }
+        '503':
+          description: 未就绪
+  /v1/projects/{p}/branches/{b}/config:
+    get:
+      summary: 渲染输出配置文档（YAML/TOML/JSON；secret 默认掩码）
+      security: []
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { $ref: '#/components/parameters/BranchPath' }
+        - { name: format, in: query, schema: { type: string, enum: [yaml, toml, json], default: yaml } }
+        - { name: version, in: query, schema: { type: integer, format: int64 } }
+        - { name: reveal, in: query, schema: { type: boolean, default: false }, description: 需权限+审计 }
+      responses:
+        '200':
+          description: 渲染文档（Content-Type 按 format）
+          content:
+            application/octet-stream: {}
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    AdminSession:
+      type: http
+      scheme: bearer
+      description: 管理面会话令牌（/api/v1/login 获取；单会话强制）
+  parameters:
+    ProjectPath:
+      name: p
+      in: path
+      required: true
+      schema: { type: string }
+      description: 项目名
+    BranchPath:
+      name: b
+      in: path
+      required: true
+      schema: { type: string }
+      description: 分支名（dev/test/prod 或自定义）
+  responses:
+    Unauthorized:
+      description: 未认证或会话过期（ERR_SESSION_EXPIRED）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    SessionInUse:
+      description: 已有管理员在线（ERR_SESSION_IN_USE）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    NotFound:
+      description: 不存在（ERR_NOT_FOUND）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    Conflict:
+      description: 冲突（ERR_CONFLICT / 命名冲突 / base_version 不匹配）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    ValidationFailed:
+      description: 校验失败（ERR_VALIDATION，detail 携带明细）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    PublishBlocked:
+      description: 完整性校验阻断发布（ERR_PUBLISH_BLOCKED，detail 携带明细）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    NoDraft:
+      description: 无待发布草稿（ERR_NO_DRAFT）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    Created:
+      description: 已创建
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SharedItem' }
+  schemas:
+    ErrorBody:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        detail: { type: object, additionalProperties: true }
+        request_id: { type: string }
+    LoginRequest:
+      type: object
+      required: [password]
+      properties:
+        password: { type: string }
+        device_id: { type: string }
+    LoginResponse:
+      type: object
+      required: [token, expires_at]
+      properties:
+        token: { type: string }
+        expires_at: { type: string, format: date-time }
+        must_change_password: { type: boolean, default: false }
+    Project:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+    Branch:
+      type: object
+      required: [name, active_version]
+      properties:
+        name: { type: string }
+        active_version: { type: integer, format: int64 }
+        structure_version: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+    ItemDef:
+      type: object
+      required: [key, type]
+      properties:
+        key: { type: string }
+        type: { type: string, enum: [string, int, float, bool, json, array, secret] }
+        required: { type: boolean, default: false }
+        secret: { type: boolean, default: false }
+        validate: { type: string, description: 校验规则（正则/范围，JSON 字符串） }
+    GroupDef:
+      type: object
+      required: [name, items]
+      properties:
+        name: { type: string }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ItemDef' }
+    StructureDraft:
+      type: object
+      required: [base_version, groups]
+      properties:
+        base_version: { type: integer, format: int64, description: 发布时必须等于当前已发布结构版本 }
+        groups:
+          type: array
+          items: { $ref: '#/components/schemas/GroupDef' }
+        changed_items:
+          type: array
+          items: { type: string }
+          description: 服务端回填的影响 item（group/key），用于预览
+    Value:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, enum: [string, int, float, bool, json, array, secret] }
+        str_value: { type: string }
+        int_value: { type: integer, format: int64 }
+        float_value: { type: number }
+        bool_value: { type: boolean }
+        json_value: { type: string }
+        list_value:
+          type: array
+          items: { type: string }
+        masked: { type: boolean, default: false }
+    DraftUpdate:
+      type: object
+      required: [group, key, value]
+      properties:
+        group: { type: string }
+        key: { type: string }
+        value: { $ref: '#/components/schemas/Value' }
+    DraftBody:
+      type: object
+      properties:
+        updates:
+          type: array
+          items: { $ref: '#/components/schemas/DraftUpdate' }
+        deletes:
+          type: array
+          items: { type: string }
+          description: '待删除 item，格式 "group/key"'
+    PublishRequest:
+      type: object
+      required: [comment]
+      properties:
+        comment: { type: string, maxLength: 500 }
+        request_id: { type: string, description: 幂等键；缺省服务端生成并回显 }
+    Change:
+      type: object
+      required: [group, key, kind]
+      properties:
+        group: { type: string }
+        key: { type: string }
+        kind: { type: string, enum: [upsert, delete] }
+        new_value: { $ref: '#/components/schemas/Value' }
+    PublishResult:
+      type: object
+      required: [version]
+      properties:
+        version: { type: integer, format: int64 }
+        structure_version: { type: integer, format: int64 }
+        changes:
+          type: array
+          items: { $ref: '#/components/schemas/Change' }
+        request_id: { type: string }
+    Version:
+      type: object
+      required: [no, structure_version, created_at, kind]
+      properties:
+        no: { type: integer, format: int64 }
+        structure_version: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+        operator: { type: string }
+        comment: { type: string }
+        rollback_of: { type: integer, format: int64, nullable: true }
+        kind: { type: string, enum: [full, diff] }
+    RollbackRequest:
+      type: object
+      required: [to_version, comment]
+      properties:
+        to_version: { type: integer, format: int64 }
+        comment: { type: string, maxLength: 500 }
+        request_id: { type: string }
+    DiffResult:
+      type: object
+      properties:
+        diffs:
+          type: array
+          items:
+            type: object
+            properties:
+              group: { type: string }
+              key: { type: string }
+              branch_a: { $ref: '#/components/schemas/Value' }
+              branch_b: { $ref: '#/components/schemas/Value' }
+        missing:
+          type: array
+          items: { type: string }
+          description: 仅在一侧有值的 item（group/key）
+    PromoteRequest:
+      type: object
+      required: [from, to]
+      properties:
+        from: { type: string, description: 源分支 }
+        to: { type: string, description: 目标分支（写其值草稿） }
+        items:
+          type: array
+          items: { type: string }
+          description: 限定 item（group/key）；缺省=全部
+        force: { type: boolean, default: false, description: 覆盖目标草稿已修改项 }
+    PromoteResult:
+      type: object
+      properties:
+        applied:
+          type: array
+          items: { type: string }
+        skipped:
+          type: array
+          items: { type: string }
+        missing_from:
+          type: array
+          items: { type: string }
+    SharedItem:
+      type: object
+      required: [group, key, type]
+      properties:
+        group: { type: string }
+        key: { type: string }
+        type: { type: string, enum: [string, int, float, bool, json, array, secret] }
+        secret: { type: boolean, default: false }
+        required: { type: boolean, default: false }
+        value: { $ref: '#/components/schemas/Value' }
+        version: { type: integer, format: int64 }
+    SharedPublishResult:
+      type: object
+      properties:
+        version: { type: integer, format: int64 }
+        affected:
+          type: array
+          items:
+            type: object
+            properties:
+              project: { type: string }
+              branch: { type: string }
+              new_version: { type: integer, format: int64 }
+    AuditEntry:
+      type: object
+      properties:
+        seq: { type: integer, format: int64 }
+        ts: { type: string, format: date-time }
+        operator: { type: string }
+        action: { type: string }
+        project: { type: string }
+        branch: { type: string }
+        version: { type: integer, format: int64 }
+        request_id: { type: string }
+        detail: { type: object, additionalProperties: true }
+    Member:
+      type: object
+      required: [node_id, grpc_addr, http_addr]
+      properties:
+        node_id: { type: string }
+        grpc_addr: { type: string }
+        http_addr: { type: string }
+        raft_addr: { type: string }
+        is_leader: { type: boolean }
+        is_voter: { type: boolean }
+        committed_index: { type: integer, format: int64 }
+    MemberList:
+      type: object
+      properties:
+        members:
+          type: array
+          items: { $ref: '#/components/schemas/Member' }
+    JoinRequest:
+      type: object
+      required: [node_id, grpc_addr, raft_addr]
+      properties:
+        node_id: { type: string }
+        grpc_addr: { type: string }
+        http_addr: { type: string }
+        raft_addr: { type: string }

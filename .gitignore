@@ -1,0 +1,31 @@
+# Rust 构建产物
+server/target/
+target/
+**/*.rs.bk
+
+# 工作区本地 Cargo 缓存（/home 只读挂载下的 CARGO_HOME）
+.cargo/
+
+# 密钥材料（含轮换环文件）
+*.ring.json
+*.key
+*.pem
+
+# 本地数据目录
+/data/
+*.db
+*.log
+
+# Go 构建缓存/产物
+sdk/go/**/*.test
+*.out
+
+# Python
+__pycache__/
+*.pyc
+
+# 系统/编辑器
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,215 @@
+//! Raft 装配助手（模块 03 §3/§4）。
+
+use std::sync::Arc;
+
+use openraft::Config;
+use openraft::Raft;
+
+use crate::network::RaftHandle;
+use crate::store::{LogStore, StateMachineStore};
+use crate::types::{NodeId, NodeInfo, TypeConfig};
+
+pub type RaftConfig = Config;
+
+/// 默认测试/联调配置（心跳 100ms、选举 300~600ms）。
+pub fn dev_config() -> RaftConfig {
+    Config {
+        heartbeat_interval: 100,
+        election_timeout_min: 300,
+        election_timeout_max: 600,
+        max_payload_entries: 64,
+        enable_tick: true,
+        ..Default::default()
+    }
+}
+
+/// 创建 Raft 节点并注册到网络。
+pub async fn new_raft_node<N>(
+    id: NodeId,
+    _node: NodeInfo,
+    log_store: LogStore,
+    sm_store: Arc<StateMachineStore>,
+    network: &N,
+    config: RaftConfig,
+) -> Result<RaftHandle, Box<dyn std::error::Error + Send + Sync>>
+where
+    N: openraft::network::RaftNetworkFactory<TypeConfig> + Clone + Send + Sync + 'static,
+{
+    let raft = Raft::new(
+        id,
+        Arc::new(config),
+        network.clone(),
+        log_store,
+        sm_store.as_ref().clone(),
+    )
+    .await?;
+    Ok(raft)
+}
+
+/// 单节点初始化集群（bootstrap）。
+pub async fn initialize_single(
+    raft: &RaftHandle,
+    node_id: NodeId,
+    node: NodeInfo,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    raft.initialize(std::collections::BTreeMap::from([(node_id, node)]))
+        .await?;
+    Ok(())
+}
+
+/// 等待成为 leader。
+pub async fn wait_for_leader(raft: &RaftHandle, timeout: std::time::Duration) -> Option<NodeId> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(leader) = raft.current_leader().await {
+            return Some(leader);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// 等待某节点成为 leader。
+pub async fn wait_until<F: Fn() -> bool>(cond: F, timeout: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if cond() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// 客户端写（重试直至成功/超时）。
+/// 返回 `Ok(Ok(version))` = 已生效；`Ok(Err(e))` = 状态机 apply 拒绝（带 ErrorKind，可映射 HTTP/gRPC 错误码）；
+/// `Err(e)` = Raft 层失败（未提交/超时，可重试）。
+pub async fn client_write(
+    raft: &RaftHandle,
+    cmd: dsh_core::command::Command,
+    timeout: std::time::Duration,
+) -> Result<Result<u64, dsh_core::Error>, Box<dyn std::error::Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match raft.client_write(cmd.clone()).await {
+            Ok(resp) => return Ok(resp.data),
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("client_write timeout: {e}").into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// 客户端写失败（单次尝试）的归类。
+#[derive(Debug)]
+pub enum WriteError {
+    /// 非 leader：携带 leader 的 HTTP 管理面地址（客户端应跟随转发）。
+    ForwardToLeader {
+        leader_id: Option<NodeId>,
+        http_addr: Option<String>,
+    },
+    /// 其他 Raft 层错误（瞬时，可重试）。
+    Other(String),
+}
+
+/// 单次客户端写（不重试）：`Ok(Ok(version))` 已生效；`Ok(Err(e))` 状态机拒绝；
+/// `Err(WriteError)` 为 Raft 层失败（含 leader 转发提示）。
+pub async fn try_client_write(
+    raft: &RaftHandle,
+    cmd: dsh_core::command::Command,
+) -> Result<Result<u64, dsh_core::Error>, WriteError> {
+    match raft.client_write(cmd).await {
+        Ok(resp) => Ok(resp.data),
+        Err(openraft::error::RaftError::APIError(
+            openraft::error::ClientWriteError::ForwardToLeader(f),
+        )) => Err(WriteError::ForwardToLeader {
+            leader_id: f.leader_id,
+            http_addr: f.leader_node.map(|n| n.http_addr),
+        }),
+        Err(e) => Err(WriteError::Other(e.to_string())),
+    }
+}
+
+/// 从本节点 raft metrics 解析当前 leader 的 HTTP 管理面地址
+/// （ForwardToLeader 缺 node 信息时兜底：learner 常不知道 leader 的 NodeInfo）。
+pub fn leader_http_addr(raft: &RaftHandle) -> Option<String> {
+    let m = raft.metrics().borrow().clone();
+    let leader_id = m.current_leader?;
+    m.membership_config
+        .membership()
+        .get_node(&leader_id)
+        .map(|n| n.http_addr.clone())
+}
+
+/// 写操作结果。
+#[derive(Debug, Default)]
+pub struct WriteOutcome {
+    pub version: u64,
+    pub events: Vec<dsh_core::model::PublishEvent>,
+}
+
+/// 通用写路径（模块 05 写面）：dev-single 直接 apply 状态机；集群模式经 Raft client_write。
+/// - `events_tx`：dev-single 直发 watch 广播（集群模式由 raft apply 经 sm_store 转发，传 None）。
+/// - 非 leader → `ErrorKind::LeaderRedirect`（携带 leader_hint，调用方跟随转发）。
+pub async fn write_command(
+    sm: &std::sync::Mutex<dsh_core::StateMachine>,
+    raft: Option<&RaftHandle>,
+    cmd: &dsh_core::command::Command,
+    now_ms: i64,
+    events_tx: Option<&tokio::sync::broadcast::Sender<dsh_core::model::PublishEvent>>,
+) -> Result<WriteOutcome, dsh_core::Error> {
+    match raft {
+        None => {
+            let mut guard = sm
+                .lock()
+                .map_err(|e| dsh_core::Error::internal(e.to_string()))?;
+            let events = guard.apply(cmd, now_ms)?;
+            for e in &events {
+                if let Some(tx) = events_tx {
+                    let _ = tx.send(e.clone());
+                }
+            }
+            let version = events.first().map(|e| e.version).unwrap_or(0);
+            Ok(WriteOutcome { version, events })
+        }
+        Some(raft) => {
+            // 单次尝试；非 leader → 立即返回 ERR_LEADER_REDIRECT（携带 leader_hint），
+            // 由调用方（login 转发 / SDK failover）跟随；瞬时错误重试至超时。
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match try_client_write(raft, cmd.clone()).await {
+                    Ok(r) => {
+                        return Ok(WriteOutcome {
+                            version: r?,
+                            events: vec![],
+                        })
+                    }
+                    Err(WriteError::ForwardToLeader { http_addr, .. }) => {
+                        // leader_node 可能为空（learner 不知 leader NodeInfo）→ 从本节点 metrics 兜底解析
+                        let hint = http_addr
+                            .or_else(|| leader_http_addr(raft))
+                            .unwrap_or_default();
+                        return Err(dsh_core::Error::new(
+                            dsh_core::ErrorKind::LeaderRedirect,
+                            "not leader, follow leader_hint",
+                        )
+                        .with_leader_hint(hint));
+                    }
+                    Err(WriteError::Other(_)) => {
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(dsh_core::Error::internal("client_write timeout"));
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+    }
+}

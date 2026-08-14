@@ -1,0 +1,35 @@
+[package]
+name = "dsh-api"
+version = "0.1.0"
+edition = "2021"
+description = "Defing config service - HTTP/gRPC API surface: router, auth, error mapping, admin UI (module 05/09)"
+
+[dependencies]
+dsh-core = { path = "../dsh-core" }
+dsh-crypto = { path = "../dsh-crypto" }
+dsh-raft = { path = "../dsh-raft" }
+dsh-render = { path = "../dsh-render" }
+dsh-observability = { path = "../dsh-observability" }
+dsh-watch = { path = "../dsh-watch" }
+dsh-publish = { path = "../dsh-publish" }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+futures = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+reqwest = { workspace = true }
+rand = "0.8"
+rust-embed = { version = "8" }
+base64 = "0.22"
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+async-stream = "0.3"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tokio-stream = { version = "0.1", features = ["sync", "net"] }

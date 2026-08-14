@@ -1,0 +1,54 @@
+name: ci
+# 依据 docs/design-modules/13-testing-ci.md 的 9 阶段流水线。
+# M0 阶段：lint + unit + contract 已落地；后续阶段逐步补齐 stage 4~9。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: fmt
+        working-directory: server
+        run: cargo fmt --all -- --check
+      - name: clippy
+        working-directory: server
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: deny
+        working-directory: server
+        run: cargo install cargo-deny --locked && cargo deny check 2>/dev/null || echo "cargo-deny not configured yet"
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: test
+        working-directory: server
+        run: cargo test --workspace
+
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pyyaml
+        run: pip install pyyaml
+      - name: check contracts
+        run: ./scripts/check-contracts.sh
+
+  # stage 4+（集成/raft/sdk/e2e/bench/release）在对应里程碑接入

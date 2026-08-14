@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/dsh-core",
+  "crates/dsh-storage",
+  "crates/dsh-raft",
+  "crates/dsh-publish",
+  "crates/dsh-crypto",
+  "crates/dsh-render",
+  "crates/dsh-watch",
+  "crates/dsh-api",
+  "crates/dsh-observability",
+  "crates/dsh-jobs",
+  "crates/dsh-cli",
+  "crates/dsh-testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/defing/config"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+clap = { version = "4", features = ["derive"] }
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }

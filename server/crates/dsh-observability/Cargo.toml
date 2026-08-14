@@ -1,0 +1,12 @@
+[package]
+name = "dsh-observability"
+version = "0.1.0"
+edition = "2021"
+description = "Defing config service - observability: audit sink, metrics, readiness (module 10)"
+
+[dependencies]
+dsh-core = { path = "../dsh-core" }
+dsh-raft = { path = "../dsh-raft" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }

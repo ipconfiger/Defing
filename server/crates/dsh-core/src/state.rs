@@ -1,0 +1,1363 @@
+//! 确定性状态机（模块 01/04）：命令 apply + 读取。
+//! 约定：apply 不读墙钟/不 IO/不日志（D16）；时间戳由调用方注入 now_ms。
+//! M1 范围：项目/分支 CRUD、结构草稿与结构发布、值草稿、值发布、GetConfig（版本快照全量存储）。
+
+use std::collections::BTreeMap;
+
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+use crate::command::Command;
+use crate::diff::compute_diff;
+use crate::error::{Error, ErrorKind};
+use crate::keys::*;
+use crate::limits::*;
+use crate::model::*;
+use crate::store::Store;
+use crate::validator;
+
+/// GetConfig 返回的配置快照。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigSnapshot {
+    pub project: String,
+    pub branch: String,
+    pub version: u64,
+    pub structure_version: u64,
+    pub groups: BTreeMap<String, BTreeMap<String, Value>>,
+}
+
+/// apply 结果：成功产出的事件列表（确定性副作用，供 watch 扇出）。
+pub type ApplyOutcome = Result<Vec<PublishEvent>, Error>;
+
+fn load<T: DeserializeOwned>(store: &dyn Store, key: &str) -> Result<Option<T>, Error> {
+    match store.get(key.as_bytes())? {
+        Some(raw) => serde_json::from_slice(&raw)
+            .map(Some)
+            .map_err(|e| Error::internal(format!("corrupt value at {key}: {e}"))),
+        None => Ok(None),
+    }
+}
+
+fn save<T: Serialize>(store: &dyn Store, key: &str, value: &T) -> Result<(), Error> {
+    let raw = serde_json::to_vec(value).map_err(|e| Error::internal(format!("serialize: {e}")))?;
+    store.put(key.as_bytes(), &raw)
+}
+
+/// 项目名合法性（[a-z0-9][a-z0-9-]{0,127}）。
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_PROJECT_NAME_BYTES
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && name.as_bytes()[0] != b'-'
+        && name.as_bytes()[name.len() - 1] != b'-'
+}
+
+/// 分支名合法性（[a-z0-9][a-z0-9-]{0,63}）。
+fn valid_branch(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && name.as_bytes()[0] != b'-'
+        && name.as_bytes()[name.len() - 1] != b'-'
+}
+
+/// 确定性状态机。
+pub struct StateMachine {
+    store: Box<dyn Store>,
+}
+
+impl StateMachine {
+    pub fn new(store: Box<dyn Store>) -> Self {
+        Self { store }
+    }
+
+    // ---------------- 读取 ----------------
+
+    pub fn get_project(&self, id: &ProjectId) -> Result<Option<Project>, Error> {
+        load(&*self.store, &project_key(id))
+    }
+
+    pub fn list_projects(&self) -> Result<Vec<Project>, Error> {
+        let rows = self.store.get_prefix(b"p/")?;
+        let mut out = Vec::new();
+        for (k, v) in rows {
+            let ks = String::from_utf8_lossy(&k);
+            let rest = &ks[K_PROJECT.len()..];
+            if rest.contains('/') {
+                continue; // 子键（struct/branch/...）跳过
+            }
+            if let Ok(p) = serde_json::from_slice::<Project>(&v) {
+                out.push(p);
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    pub fn get_structure(&self, id: &ProjectId) -> Result<Option<Structure>, Error> {
+        load(&*self.store, &struct_key(id))
+    }
+
+    pub fn get_structure_draft(&self, id: &ProjectId) -> Result<Option<StructureDraft>, Error> {
+        load(&*self.store, &struct_draft_key(id))
+    }
+
+    pub fn get_branch_state(
+        &self,
+        id: &ProjectId,
+        branch: &BranchName,
+    ) -> Result<Option<BranchState>, Error> {
+        load(&*self.store, &branch_state_key(id, branch))
+    }
+
+    /// 读取当前活动会话（I7；无会话返回 None）。
+    pub fn get_session(&self) -> Result<Option<AdminSession>, Error> {
+        load(&*self.store, session_key())
+    }
+
+    /// 审计查询：按 action 过滤、since（ts ≥ since，墙钟 ms）过滤、按 seq 倒序、limit 截断。
+    pub fn get_audit(
+        &self,
+        action: Option<&str>,
+        since: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<AuditEntry>, Error> {
+        let rows = self.store.get_prefix(K_AUDIT.as_bytes())?;
+        let mut out = Vec::new();
+        for (k, v) in rows {
+            let ks = String::from_utf8_lossy(&k);
+            let Some(rest) = ks.strip_prefix(K_AUDIT) else {
+                continue;
+            };
+            // 跳过计数键 "seq"（非 20 位数字后缀）
+            if rest.parse::<u64>().is_err() {
+                continue;
+            }
+            if let Ok(e) = serde_json::from_slice::<AuditEntry>(&v) {
+                if let Some(a) = action {
+                    if e.action != a {
+                        continue;
+                    }
+                }
+                if let Some(s) = since {
+                    if e.ts < s {
+                        continue;
+                    }
+                }
+                out.push(e);
+            }
+        }
+        out.sort_by_key(|b| std::cmp::Reverse(b.seq)); // 新 → 旧
+        if out.len() > limit {
+            out.truncate(limit);
+        }
+        Ok(out)
+    }
+
+    /// 审计保留：仅保留最近 keep 条（后台任务用；keep=0 清空全部）。
+    pub fn prune_audit(&self, keep: usize) -> Result<usize, Error> {
+        let rows = self.store.get_prefix(K_AUDIT.as_bytes())?;
+        let mut seqs: Vec<u64> = Vec::new();
+        for (k, _) in rows {
+            let ks = String::from_utf8_lossy(&k);
+            if let Some(rest) = ks.strip_prefix(K_AUDIT) {
+                if let Ok(seq) = rest.parse::<u64>() {
+                    seqs.push(seq);
+                }
+            }
+        }
+        seqs.sort_unstable();
+        let total = seqs.len();
+        if total <= keep {
+            return Ok(0);
+        }
+        let mut removed = 0;
+        for seq in seqs.into_iter().take(total - keep) {
+            self.store.delete(audit_key(seq).as_bytes())?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// DEK 重包（B6）：扫描全部存储中的 secret 密文，用 `f` 逐个重写（轮换后台任务用）。
+    /// `f` 返回 None = 跳过（如代际已最新）；返回 Some(新密文) = 写回。
+    /// 覆盖：版本快照（…/snap）、共享项（sh/、sh-draft/）、分支草稿（…/b/{branch}/state）。
+    pub fn rewrap_deks(
+        &self,
+        f: &dyn Fn(&Ciphertext) -> Option<Result<Ciphertext, Error>>,
+    ) -> Result<usize, Error> {
+        let rows = self.store.get_prefix(b"")?;
+        let mut rewrapped = 0usize;
+        for (k, v) in rows {
+            let ks = String::from_utf8_lossy(&k);
+            let key = ks.as_ref();
+            if key.ends_with("/snap") {
+                let mut snap: SnapshotMap = match serde_json::from_slice(&v) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                if Self::rewrap_snapshot(&mut snap, f)? {
+                    save(&*self.store, key, &snap)?;
+                    rewrapped += 1;
+                }
+            } else if key.starts_with(K_SHARED) || key.starts_with(K_SHARED_DRAFT) {
+                let mut item: SharedItem = match serde_json::from_slice(&v) {
+                    Ok(i) => i,
+                    Err(_) => continue,
+                };
+                if Self::rewrap_value(&mut item.value, f)? {
+                    save(&*self.store, key, &item)?;
+                    rewrapped += 1;
+                }
+            } else if let Some(rest) = key.strip_prefix(K_PROJECT) {
+                // p/{pid}/b/{branch}/state —— 草稿值
+                if rest.contains(K_BRANCH) && key.ends_with(K_STATE) {
+                    let mut st: BranchState = match serde_json::from_slice(&v) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let mut changed = false;
+                    for items in st.value_draft.values_mut() {
+                        for dv in items.values_mut() {
+                            if Self::rewrap_value(&mut dv.value, f)? {
+                                changed = true;
+                            }
+                        }
+                    }
+                    if changed {
+                        save(&*self.store, key, &st)?;
+                        rewrapped += 1;
+                    }
+                }
+            }
+        }
+        Ok(rewrapped)
+    }
+
+    fn rewrap_snapshot(
+        snap: &mut SnapshotMap,
+        f: &dyn Fn(&Ciphertext) -> Option<Result<Ciphertext, Error>>,
+    ) -> Result<bool, Error> {
+        let mut changed = false;
+        for items in snap.values_mut() {
+            for v in items.values_mut() {
+                if Self::rewrap_value(v, f)? {
+                    changed = true;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    fn rewrap_value(
+        v: &mut Value,
+        f: &dyn Fn(&Ciphertext) -> Option<Result<Ciphertext, Error>>,
+    ) -> Result<bool, Error> {
+        if let Value::Secret(ct) = v {
+            if let Some(res) = f(ct) {
+                *v = Value::Secret(res?);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    pub fn list_branches(&self, id: &ProjectId) -> Result<Vec<BranchName>, Error> {
+        let prefix = format!("{K_PROJECT}{}{K_BRANCH}", id.as_str());
+        let rows = self.store.get_prefix(prefix.as_bytes())?;
+        let mut out = Vec::new();
+        for (k, _) in rows {
+            let ks = String::from_utf8_lossy(&k);
+            let rest = &ks[prefix.len()..];
+            if let Some(pos) = rest.find('/') {
+                let name = &rest[..pos];
+                if !name.is_empty() {
+                    out.push(BranchName(name.to_string()));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// 读取某版本的值快照（M1：每个版本存全量快照）。
+    pub fn snapshot_of(
+        &self,
+        id: &ProjectId,
+        branch: &BranchName,
+        version: u64,
+    ) -> Result<SnapshotMap, Error> {
+        let key = snapshot_key(id, branch, version);
+        match self.store.get(key.as_bytes())? {
+            Some(raw) => serde_json::from_slice(&raw)
+                .map_err(|e| Error::internal(format!("corrupt snapshot {key}: {e}"))),
+            None => Err(Error::not_found(format!("version {version} of {branch}"))),
+        }
+    }
+
+    pub fn get_version_record(
+        &self,
+        id: &ProjectId,
+        branch: &BranchName,
+        no: u64,
+    ) -> Result<Option<VersionRecord>, Error> {
+        load(&*self.store, &version_key(id, branch, no))
+    }
+
+    pub fn version_history(
+        &self,
+        id: &ProjectId,
+        branch: &BranchName,
+    ) -> Result<Vec<VersionRecord>, Error> {
+        let prefix = format!(
+            "{K_PROJECT}{}{K_BRANCH}{}{K_VERSION}",
+            id.as_str(),
+            branch.as_str()
+        );
+        let rows = self.store.get_prefix(prefix.as_bytes())?;
+        let mut out = Vec::new();
+        for (k, v) in rows {
+            let ks = String::from_utf8_lossy(&k);
+            if ks.ends_with("/snap") {
+                continue;
+            }
+            if let Ok(r) = serde_json::from_slice::<VersionRecord>(&v) {
+                out.push(r);
+            }
+        }
+        out.sort_by_key(|r| r.no);
+        Ok(out)
+    }
+
+    /// 导出全部状态（快照构建用）。
+    pub fn dump_all(&self) -> Result<crate::store::KeyValuePairs, Error> {
+        self.store.get_prefix(b"")
+    }
+
+    /// 清空并恢复全部状态（快照安装用）。
+    pub fn restore_all(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), Error> {
+        for (k, _) in self.store.get_prefix(b"")? {
+            self.store.delete(&k)?;
+        }
+        for (k, v) in pairs {
+            self.store.put(k, v)?;
+        }
+        Ok(())
+    }
+
+    /// 版本裁剪：保留活动版本 + 最近 keep 个版本，删除更早的历史（后台任务用）。
+    pub fn prune_versions(
+        &self,
+        project: &ProjectId,
+        branch: &BranchName,
+        keep: usize,
+    ) -> Result<usize, Error> {
+        let st = self
+            .get_branch_state(project, branch)?
+            .ok_or_else(|| Error::not_found(format!("branch {branch}")))?;
+        let hist = self.version_history(project, branch)?; // 升序
+        let total = hist.len();
+        if total <= keep {
+            return Ok(0);
+        }
+        let cutoff = total - keep;
+        let mut removed = 0;
+        for rec in hist.into_iter().take(cutoff) {
+            if rec.no == st.active_version {
+                continue; // 保活动版本
+            }
+            self.store
+                .delete(version_key(project, branch, rec.no).as_bytes())?;
+            self.store
+                .delete(snapshot_key(project, branch, rec.no).as_bytes())?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// GetConfig：version=0 取活动版本。
+    pub fn get_config(
+        &self,
+        id: &ProjectId,
+        branch: &BranchName,
+        version: u64,
+    ) -> Result<ConfigSnapshot, Error> {
+        let st = self
+            .get_branch_state(id, branch)?
+            .ok_or_else(|| Error::not_found(format!("branch {branch} of {id}")))?;
+        let vno = if version == 0 {
+            st.active_version
+        } else {
+            version
+        };
+        if vno == 0 {
+            return Err(Error::not_found("no published version yet"));
+        }
+        let snap = self.snapshot_of(id, branch, vno)?;
+        let structure = self.get_structure(id)?.unwrap_or(Structure {
+            version: 0,
+            groups: vec![],
+        });
+        Ok(ConfigSnapshot {
+            project: id.to_string(),
+            branch: branch.to_string(),
+            version: vno,
+            structure_version: structure.version,
+            groups: snap,
+        })
+    }
+
+    // ---------------- apply ----------------
+
+    pub fn apply(&mut self, cmd: &Command, now_ms: i64) -> ApplyOutcome {
+        match cmd {
+            Command::ProjectCreate { name } => self.apply_project_create(name, now_ms),
+            Command::ProjectDelete { id } => self.apply_project_delete(id),
+            Command::BranchCreate {
+                project,
+                name,
+                source,
+            } => self.apply_branch_create(project, name, source.as_ref(), now_ms),
+            Command::BranchDelete { project, name } => self.apply_branch_delete(project, name),
+            Command::StructureDraftSet {
+                project,
+                base_version,
+                groups,
+            } => self.apply_structure_draft_set(project, *base_version, groups),
+            Command::PublishStructure {
+                project,
+                comment,
+                request_id,
+            } => self.apply_publish_structure(project, comment, request_id, now_ms),
+            Command::DraftUpdate {
+                project,
+                branch,
+                updates,
+                deletes,
+            } => self.apply_draft_update(project, branch, updates, deletes, now_ms),
+            Command::Publish {
+                project,
+                branch,
+                comment,
+                request_id,
+            } => self.apply_publish(project, branch, comment, request_id, now_ms),
+            Command::Rollback {
+                project,
+                branch,
+                to_version,
+                comment,
+                request_id,
+            } => self.apply_rollback(project, branch, *to_version, comment, request_id, now_ms),
+            Command::SharedDraftUpdate { item } => self.apply_shared_draft_update(item),
+            Command::SharedPublish {
+                comment,
+                request_id,
+            } => self.apply_shared_publish(comment, request_id, now_ms),
+            Command::RefBind { project, binding } => self.apply_ref_bind(project, binding),
+            Command::RefUnbind {
+                project,
+                group,
+                item_key,
+            } => self.apply_ref_unbind(project, group, item_key.as_deref()),
+            Command::SessionLogin {
+                token_hash,
+                issued_at,
+                expires_at,
+            } => self.apply_session_login(token_hash, *issued_at, *expires_at),
+            Command::SessionLogout => self.apply_session_logout(),
+            Command::SessionHeartbeat { expires_at } => self.apply_session_heartbeat(*expires_at),
+            Command::AuditAppend { entry } => self.apply_audit_append(entry),
+        }
+    }
+
+    fn apply_project_create(&mut self, name: &str, now_ms: i64) -> ApplyOutcome {
+        if !valid_name(name) {
+            return Err(Error::validation(format!("invalid project name: {name:?}")));
+        }
+        let id = ProjectId(name.to_string());
+        if self.get_project(&id)?.is_some() {
+            return Err(Error::conflict(format!("project {name} already exists")));
+        }
+        let project = Project {
+            id: id.clone(),
+            name: name.to_string(),
+            created_at: now_ms,
+        };
+        let structure = Structure {
+            version: 1,
+            groups: vec![],
+        };
+        save(&*self.store, &project_key(&id), &project)?;
+        save(&*self.store, &idx_pname(name), &"1")?;
+        save(&*self.store, &struct_key(&id), &structure)?;
+        for default_branch in [BranchName::DEV, BranchName::TEST, BranchName::PROD] {
+            save(
+                &*self.store,
+                &branch_state_key(&id, &BranchName(default_branch.to_string())),
+                &BranchState::new(1),
+            )?;
+        }
+        Ok(vec![])
+    }
+
+    fn apply_project_delete(&mut self, id: &ProjectId) -> ApplyOutcome {
+        let project = self
+            .get_project(id)?
+            .ok_or_else(|| Error::not_found(format!("project {id}")))?;
+        let prefix = project_key(id);
+        for (k, _) in self.store.get_prefix(prefix.as_bytes())? {
+            self.store.delete(&k)?;
+        }
+        self.store.delete(idx_pname(&project.name).as_bytes())?;
+        Ok(vec![])
+    }
+
+    fn apply_branch_create(
+        &mut self,
+        id: &ProjectId,
+        name: &BranchName,
+        source: Option<&BranchName>,
+        now_ms: i64,
+    ) -> ApplyOutcome {
+        if !valid_branch(name.as_str()) {
+            return Err(Error::validation(format!("invalid branch name: {name:?}")));
+        }
+        self.get_project(id)?
+            .ok_or_else(|| Error::not_found(format!("project {id}")))?;
+        if self.get_branch_state(id, name)?.is_some() {
+            return Err(Error::conflict(format!("branch {name} exists")));
+        }
+        let branches = self.list_branches(id)?;
+        if branches.len() >= MAX_BRANCHES_PER_PROJECT {
+            return Err(Error::limit_exceeded("too many branches"));
+        }
+        let structure = self.get_structure(id)?.unwrap_or(Structure {
+            version: 1,
+            groups: vec![],
+        });
+        let mut state = BranchState::new(structure.version);
+        if let Some(src) = source {
+            let src_state = self
+                .get_branch_state(id, src)?
+                .ok_or_else(|| Error::validation(format!("source branch {src} not found")))?;
+            if src_state.active_version == 0 {
+                return Err(Error::validation(format!(
+                    "source branch {src} has no published version"
+                )));
+            }
+            let snap = self.snapshot_of(id, src, src_state.active_version)?;
+            state.value_draft = snap
+                .into_iter()
+                .map(|(g, items)| {
+                    let m = items
+                        .into_iter()
+                        .map(|(k, v)| {
+                            (
+                                k,
+                                DraftValue {
+                                    value: v,
+                                    updated_at: now_ms,
+                                },
+                            )
+                        })
+                        .collect();
+                    (g, m)
+                })
+                .collect();
+        }
+        save(&*self.store, &branch_state_key(id, name), &state)?;
+        Ok(vec![])
+    }
+
+    fn apply_branch_delete(&mut self, id: &ProjectId, name: &BranchName) -> ApplyOutcome {
+        let st = self
+            .get_branch_state(id, name)?
+            .ok_or_else(|| Error::not_found(format!("branch {name} of {id}")))?;
+        if st.active_version > 0 || !st.value_draft.is_empty() {
+            return Err(Error::conflict(
+                "branch has published versions or pending draft",
+            ));
+        }
+        let prefix = branch_prefix(id, name);
+        for (k, _) in self.store.get_prefix(prefix.as_bytes())? {
+            self.store.delete(&k)?;
+        }
+        Ok(vec![])
+    }
+
+    fn apply_structure_draft_set(
+        &mut self,
+        id: &ProjectId,
+        base_version: u64,
+        groups: &[GroupDef],
+    ) -> ApplyOutcome {
+        let structure = self
+            .get_structure(id)?
+            .ok_or_else(|| Error::not_found(format!("project {id}")))?;
+        if base_version != structure.version {
+            return Err(Error::conflict(format!(
+                "base_version {base_version} != current structure version {}",
+                structure.version
+            )));
+        }
+        let draft_structure = Structure {
+            version: base_version,
+            groups: groups.to_vec(),
+        };
+        let errs = validator::validate_structure(&draft_structure);
+        if !errs.is_empty() {
+            return Err(Error::publish_blocked(
+                serde_json::json!({ "errors": errs }),
+            ));
+        }
+        let draft = StructureDraft {
+            base_version,
+            groups: groups.to_vec(),
+        };
+        save(&*self.store, &struct_draft_key(id), &draft)?;
+        Ok(vec![])
+    }
+
+    fn apply_publish_structure(
+        &mut self,
+        id: &ProjectId,
+        comment: &str,
+        request_id: &str,
+        now_ms: i64,
+    ) -> ApplyOutcome {
+        let structure = self
+            .get_structure(id)?
+            .ok_or_else(|| Error::not_found(format!("project {id}")))?;
+        let draft = self
+            .get_structure_draft(id)?
+            .ok_or_else(|| Error::new(ErrorKind::NoDraft, "no structure draft"))?;
+        if draft.base_version != structure.version {
+            return Err(Error::conflict("structure draft base_version mismatch"));
+        }
+        let draft_structure = Structure {
+            version: structure.version,
+            groups: draft.groups.clone(),
+        };
+        let errs = validator::validate_structure(&draft_structure);
+        if !errs.is_empty() {
+            return Err(Error::publish_blocked(
+                serde_json::json!({ "errors": errs }),
+            ));
+        }
+        let new_structure = Structure {
+            version: structure.version + 1,
+            groups: draft.groups.clone(),
+        };
+        let mut events = Vec::new();
+        let branches = self.list_branches(id)?;
+        for branch in &branches {
+            let mut st = self
+                .get_branch_state(id, branch)?
+                .ok_or_else(|| Error::internal("branch state missing"))?;
+            let vno = st.active_version + 1;
+            // 结构发布：值不变（D14 只清理被删 item 的草稿值）
+            let values = if st.active_version == 0 {
+                SnapshotMap::new()
+            } else {
+                self.snapshot_of(id, branch, st.active_version)?
+            };
+            let record = VersionRecord {
+                no: vno,
+                structure_version: new_structure.version,
+                created_at: now_ms,
+                operator: "admin".into(),
+                comment: comment.to_string(),
+                rollback_of: None,
+                kind: VersionKind::Full,
+                snapshot_ref: None,
+                diff_ref: None,
+            };
+            save(&*self.store, &version_key(id, branch, vno), &record)?;
+            save(&*self.store, &snapshot_key(id, branch, vno), &values)?;
+            st.active_version = vno;
+            st.structure_version = new_structure.version;
+            // D14：清理结构发布后不存在的 item 草稿值
+            let mut known: BTreeMap<String, BTreeMap<String, ()>> = BTreeMap::new();
+            for g in &new_structure.groups {
+                for item in &g.items {
+                    known
+                        .entry(g.name.clone())
+                        .or_default()
+                        .insert(item.key.clone(), ());
+                }
+            }
+            st.value_draft.retain(|g, items| {
+                known.contains_key(g) && {
+                    items.retain(|k, _| known[g].contains_key(k));
+                    !items.is_empty()
+                }
+            });
+            save(&*self.store, &branch_state_key(id, branch), &st)?;
+            events.push(PublishEvent {
+                project: id.clone(),
+                branch: branch.clone(),
+                version: vno,
+                ty: EventType::StructurePublish,
+                structure_version: new_structure.version,
+                comment: comment.to_string(),
+                request_id: request_id.to_string(),
+                changes: vec![],
+            });
+        }
+        save(&*self.store, &struct_key(id), &new_structure)?;
+        self.store.delete(struct_draft_key(id).as_bytes())?;
+        Ok(events)
+    }
+
+    fn apply_draft_update(
+        &mut self,
+        id: &ProjectId,
+        branch: &BranchName,
+        updates: &[crate::command::DraftUpdateItem],
+        deletes: &[(String, String)],
+        now_ms: i64,
+    ) -> ApplyOutcome {
+        let mut st = self
+            .get_branch_state(id, branch)?
+            .ok_or_else(|| Error::not_found(format!("branch {branch} of {id}")))?;
+        let structure = self
+            .get_structure(id)?
+            .ok_or_else(|| Error::not_found(format!("project {id}")))?;
+
+        // 建立 group → item 定义索引
+        let mut index: BTreeMap<String, BTreeMap<String, &ItemDef>> = BTreeMap::new();
+        for g in &structure.groups {
+            for item in &g.items {
+                index
+                    .entry(g.name.clone())
+                    .or_default()
+                    .insert(item.key.clone(), item);
+            }
+        }
+
+        let mut total = st.value_draft.values().map(|m| m.len()).sum::<usize>();
+        for u in updates {
+            let def = index
+                .get(&u.group)
+                .and_then(|m| m.get(&u.key))
+                .ok_or_else(|| Error::validation(format!("unknown item {}/{}", u.group, u.key)))?;
+            let errs = validator::validate_value(def, &u.value);
+            if !errs.is_empty() {
+                return Err(Error::validation(errs.join("; ")));
+            }
+            let size = serde_json::to_vec(&u.value)
+                .map_err(|e| Error::internal(format!("serialize value: {e}")))?
+                .len();
+            if size > MAX_VALUE_BYTES {
+                return Err(Error::limit_exceeded("value too large"));
+            }
+            let fresh = !st
+                .value_draft
+                .get(&u.group)
+                .is_some_and(|m| m.contains_key(&u.key));
+            if fresh {
+                total += 1;
+                if total > MAX_ITEMS_PER_PROJECT {
+                    return Err(Error::limit_exceeded("too many draft items"));
+                }
+            }
+        }
+        for (g, key) in deletes {
+            if let Some(m) = st.value_draft.get_mut(g) {
+                m.remove(key);
+            }
+        }
+        for u in updates {
+            st.value_draft.entry(u.group.clone()).or_default().insert(
+                u.key.clone(),
+                DraftValue {
+                    value: u.value.clone(),
+                    updated_at: now_ms,
+                },
+            );
+        }
+        save(&*self.store, &branch_state_key(id, branch), &st)?;
+        Ok(vec![])
+    }
+
+    fn apply_publish(
+        &mut self,
+        id: &ProjectId,
+        branch: &BranchName,
+        comment: &str,
+        request_id: &str,
+        now_ms: i64,
+    ) -> ApplyOutcome {
+        let mut st = self
+            .get_branch_state(id, branch)?
+            .ok_or_else(|| Error::not_found(format!("branch {branch} of {id}")))?;
+        let structure = self
+            .get_structure(id)?
+            .ok_or_else(|| Error::not_found(format!("project {id}")))?;
+
+        // 幂等（I10）：同 request_id 直接返回（已生效，不重复）
+        if st.last_request_id.as_deref() == Some(request_id) {
+            return Ok(vec![]);
+        }
+        if st.value_draft.is_empty() {
+            return Err(Error::new(ErrorKind::NoDraft, "no pending draft"));
+        }
+
+        // 完整性校验（M1 policy=block）
+        let draft_map: BTreeMap<String, BTreeMap<String, DraftValue>> = st.value_draft.clone();
+        let errs = validator::validate_publish(&draft_map, &structure);
+        if !errs.is_empty() {
+            return Err(Error::publish_blocked(
+                serde_json::json!({ "errors": errs }),
+            ));
+        }
+
+        // 物化：草稿值 + 共享库引用（草稿无值时取共享值）
+        let mut resolved: SnapshotMap = draft_map
+            .into_iter()
+            .map(|(g, items)| {
+                let m = items.into_iter().map(|(k, dv)| (k, dv.value)).collect();
+                (g, m)
+            })
+            .collect();
+        for binding in self.read_refs_of_project(id)? {
+            match binding.item_key.as_deref() {
+                Some(key) => {
+                    if resolved
+                        .get(&binding.group)
+                        .is_none_or(|m| !m.contains_key(key))
+                    {
+                        if let Some(shared) =
+                            self.get_shared(&binding.shared_group, &binding.shared_key)?
+                        {
+                            resolved
+                                .entry(binding.group.clone())
+                                .or_default()
+                                .insert(key.to_string(), shared.value.clone());
+                        }
+                    }
+                }
+                // 组级引用（B3）：整组绑定共享组 SG —— 结构组内 item 按 key 取共享项
+                None => {
+                    let struct_group = structure.groups.iter().find(|g| g.name == binding.group);
+                    if let Some(sg) = struct_group {
+                        for item in &sg.items {
+                            let entry = resolved.get(&binding.group);
+                            if entry.is_none_or(|m| !m.contains_key(&item.key)) {
+                                if let Some(shared) =
+                                    self.get_shared(&binding.shared_group, &item.key)?
+                                {
+                                    resolved
+                                        .entry(binding.group.clone())
+                                        .or_default()
+                                        .insert(item.key.clone(), shared.value.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let old = if st.active_version == 0 {
+            SnapshotMap::new()
+        } else {
+            self.snapshot_of(id, branch, st.active_version)?
+        };
+        let diff = compute_diff(&old, &resolved);
+
+        let vno = st.active_version + 1;
+        let record = VersionRecord {
+            no: vno,
+            structure_version: structure.version,
+            created_at: now_ms,
+            operator: "admin".into(),
+            comment: comment.to_string(),
+            rollback_of: None,
+            kind: VersionKind::Full,
+            snapshot_ref: None,
+            diff_ref: None,
+        };
+        save(&*self.store, &version_key(id, branch, vno), &record)?;
+        save(&*self.store, &snapshot_key(id, branch, vno), &resolved)?;
+        st.active_version = vno;
+        st.last_request_id = Some(request_id.to_string());
+        st.value_draft.clear();
+        save(&*self.store, &branch_state_key(id, branch), &st)?;
+
+        Ok(vec![PublishEvent {
+            project: id.clone(),
+            branch: branch.clone(),
+            version: vno,
+            ty: EventType::ValuePublish,
+            structure_version: structure.version,
+            comment: comment.to_string(),
+            request_id: request_id.to_string(),
+            changes: diff,
+        }])
+    }
+
+    // ---------------- 回滚（I6/I9） ----------------
+
+    fn apply_rollback(
+        &mut self,
+        project: &ProjectId,
+        branch: &BranchName,
+        to_version: u64,
+        comment: &str,
+        request_id: &str,
+        now_ms: i64,
+    ) -> ApplyOutcome {
+        let mut st = self
+            .get_branch_state(project, branch)?
+            .ok_or_else(|| Error::not_found(format!("branch {branch} of {project}")))?;
+        // 幂等（I10）
+        if st.last_request_id.as_deref() == Some(request_id) {
+            return Ok(vec![]);
+        }
+        if to_version == 0 || to_version >= st.active_version {
+            return Err(Error::validation(format!(
+                "to_version {to_version} must be 0 < v < active {}",
+                st.active_version
+            )));
+        }
+        let snap = self.snapshot_of(project, branch, to_version)?; // 不存在 → NotFound
+        let old = if st.active_version == 0 {
+            SnapshotMap::new()
+        } else {
+            self.snapshot_of(project, branch, st.active_version)?
+        };
+        let diff = compute_diff(&old, &snap);
+        let vno = st.active_version + 1;
+        let record = VersionRecord {
+            no: vno,
+            structure_version: st.structure_version,
+            created_at: now_ms,
+            operator: "admin".into(),
+            comment: comment.to_string(),
+            rollback_of: Some(to_version),
+            kind: VersionKind::Full,
+            snapshot_ref: None,
+            diff_ref: None,
+        };
+        save(&*self.store, &version_key(project, branch, vno), &record)?;
+        save(&*self.store, &snapshot_key(project, branch, vno), &snap)?;
+        st.active_version = vno;
+        st.last_request_id = Some(request_id.to_string());
+        save(&*self.store, &branch_state_key(project, branch), &st)?;
+        Ok(vec![PublishEvent {
+            project: project.clone(),
+            branch: branch.clone(),
+            version: vno,
+            ty: EventType::Rollback,
+            structure_version: st.structure_version,
+            comment: comment.to_string(),
+            request_id: request_id.to_string(),
+            changes: diff,
+        }])
+    }
+
+    // ---------------- 共享库（R6） ----------------
+
+    fn apply_shared_draft_update(&mut self, item: &SharedItem) -> ApplyOutcome {
+        if item.group.is_empty() || item.key.is_empty() {
+            return Err(Error::validation("shared item group/key required"));
+        }
+        let size = serde_json::to_vec(item)
+            .map_err(|e| Error::internal(format!("serialize shared: {e}")))?
+            .len();
+        if size > MAX_VALUE_BYTES {
+            return Err(Error::limit_exceeded("shared item too large"));
+        }
+        save(
+            &*self.store,
+            &shared_draft_key(&item.group, &item.key),
+            item,
+        )?;
+        Ok(vec![])
+    }
+
+    fn read_all_shared_drafts(&self) -> Result<Vec<SharedItem>, Error> {
+        let rows = self.store.get_prefix(K_SHARED_DRAFT.as_bytes())?;
+        let mut out = Vec::new();
+        for (_, v) in rows {
+            if let Ok(item) = serde_json::from_slice::<SharedItem>(&v) {
+                out.push(item);
+            }
+        }
+        out.sort_by(|a, b| {
+            (a.group.as_str(), a.key.as_str()).cmp(&(b.group.as_str(), b.key.as_str()))
+        });
+        Ok(out)
+    }
+
+    fn get_shared(&self, group: &str, key: &str) -> Result<Option<SharedItem>, Error> {
+        load(&*self.store, &shared_key(group, key))
+    }
+
+    /// 引用索引：idx/ref/{shared_group}/{shared_key}/{project}/{group}/{item_key} → "1"
+    fn ref_index_key(
+        shared_group: &str,
+        shared_key: &str,
+        project: &ProjectId,
+        group: &str,
+        item_key: &str,
+    ) -> String {
+        format!(
+            "{K_IDX_REF}{shared_group}/{shared_key}/{}/{group}/{item_key}",
+            project.as_str()
+        )
+    }
+
+    fn apply_shared_publish(
+        &mut self,
+        comment: &str,
+        request_id: &str,
+        now_ms: i64,
+    ) -> ApplyOutcome {
+        let drafts = self.read_all_shared_drafts()?;
+        if drafts.is_empty() {
+            return Err(Error::new(ErrorKind::NoDraft, "no shared draft"));
+        }
+        let mut events = Vec::new();
+        for item in &drafts {
+            let prev = self.get_shared(&item.group, &item.key)?;
+            let version = prev.as_ref().map(|p| p.version).unwrap_or(0) + 1;
+            let published = SharedItem {
+                group: item.group.clone(),
+                key: item.key.clone(),
+                ty: item.ty,
+                secret: item.secret,
+                required: item.required,
+                value: item.value.clone(),
+                version,
+            };
+            save(
+                &*self.store,
+                &shared_key(&item.group, &item.key),
+                &published,
+            )?;
+            self.store
+                .delete(shared_draft_key(&item.group, &item.key).as_bytes())?;
+
+            // 级联（auto）：引用该共享项的 (项目, 分支) 版本推进
+            let prefix = format!("{K_IDX_REF}{}/{}", item.group, item.key);
+            let rows = self.store.get_prefix(prefix.as_bytes())?;
+            for (k, _) in rows {
+                let ks = String::from_utf8_lossy(&k);
+                let rest = &ks[prefix.len() + 1..]; // {project}/{group}/{item_key}
+                let parts: Vec<&str> = rest.split('/').collect();
+                if parts.len() != 3 {
+                    continue;
+                }
+                let project = ProjectId(parts[0].to_string());
+                let group = parts[1].to_string();
+                let key = parts[2].to_string();
+                self.cascade_to_project(
+                    &project,
+                    &group,
+                    &key,
+                    &item.value,
+                    comment,
+                    request_id,
+                    now_ms,
+                    &mut events,
+                )?;
+            }
+            // 组级引用级联（B3）：idx/refg/{shared_group}/{project}/{group} —— 结构组内含该 key 则推进
+            let gprefix = format!("{K_IDX_REFG}{}", item.group);
+            let grows = self.store.get_prefix(gprefix.as_bytes())?;
+            for (gk, _) in grows {
+                let gks = String::from_utf8_lossy(&gk);
+                let grest = &gks[gprefix.len() + 1..]; // {project}/{group}
+                let gparts: Vec<&str> = grest.split('/').collect();
+                if gparts.len() != 2 {
+                    continue;
+                }
+                let project = ProjectId(gparts[0].to_string());
+                let group = gparts[1].to_string();
+                // 仅当项目结构组包含该共享 key 时级联（整组共享按结构组 item 集合匹配）
+                let structure = self.get_structure(&project)?.unwrap_or(Structure {
+                    version: 0,
+                    groups: vec![],
+                });
+                let has_key = structure
+                    .groups
+                    .iter()
+                    .any(|g| g.name == group && g.items.iter().any(|i| i.key == item.key));
+                if has_key {
+                    self.cascade_to_project(
+                        &project,
+                        &group,
+                        &item.key,
+                        &item.value,
+                        comment,
+                        request_id,
+                        now_ms,
+                        &mut events,
+                    )?;
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    /// 级联单个 (项目, group, key) 的值更新到全部分支（版本推进 + SharedCascade 事件）。
+    #[allow(clippy::too_many_arguments)]
+    fn cascade_to_project(
+        &mut self,
+        project: &ProjectId,
+        group: &str,
+        key: &str,
+        value: &Value,
+        comment: &str,
+        request_id: &str,
+        now_ms: i64,
+        events: &mut Vec<PublishEvent>,
+    ) -> Result<(), Error> {
+        for branch in self.list_branches(project)? {
+            let mut st = self
+                .get_branch_state(project, &branch)?
+                .ok_or_else(|| Error::internal("branch state missing"))?;
+            let old = if st.active_version == 0 {
+                SnapshotMap::new()
+            } else {
+                self.snapshot_of(project, &branch, st.active_version)?
+            };
+            let mut new_snap = old.clone();
+            new_snap
+                .entry(group.to_string())
+                .or_default()
+                .insert(key.to_string(), value.clone());
+            let diff = compute_diff(&old, &new_snap);
+            let vno = st.active_version + 1;
+            let record = VersionRecord {
+                no: vno,
+                structure_version: st.structure_version,
+                created_at: now_ms,
+                operator: "shared".into(),
+                comment: comment.to_string(),
+                rollback_of: None,
+                kind: VersionKind::Full,
+                snapshot_ref: None,
+                diff_ref: None,
+            };
+            save(&*self.store, &version_key(project, &branch, vno), &record)?;
+            save(
+                &*self.store,
+                &snapshot_key(project, &branch, vno),
+                &new_snap,
+            )?;
+            st.active_version = vno;
+            save(&*self.store, &branch_state_key(project, &branch), &st)?;
+            events.push(PublishEvent {
+                project: project.clone(),
+                branch,
+                version: vno,
+                ty: EventType::SharedCascade,
+                structure_version: st.structure_version,
+                comment: comment.to_string(),
+                request_id: request_id.to_string(),
+                changes: diff,
+            });
+        }
+        Ok(())
+    }
+
+    fn apply_ref_bind(&mut self, project: &ProjectId, binding: &RefBinding) -> ApplyOutcome {
+        let structure = self
+            .get_structure(project)?
+            .ok_or_else(|| Error::not_found(format!("project {project}")))?;
+        let group_def = structure
+            .groups
+            .iter()
+            .find(|g| g.name == binding.group)
+            .ok_or_else(|| {
+                Error::validation(format!("group {} not in project structure", binding.group))
+            })?;
+        match binding.item_key.as_deref() {
+            Some(item_key) => {
+                // 校验：结构内存在该 item
+                let found = group_def.items.iter().any(|i| i.key == item_key);
+                if !found {
+                    return Err(Error::validation(format!(
+                        "item {}/{} not in project structure",
+                        binding.group, item_key
+                    )));
+                }
+                // 校验：共享项已发布存在
+                if self
+                    .get_shared(&binding.shared_group, &binding.shared_key)?
+                    .is_none()
+                {
+                    return Err(Error::validation(format!(
+                        "shared item {}/{} not published",
+                        binding.shared_group, binding.shared_key
+                    )));
+                }
+                save(
+                    &*self.store,
+                    &ref_key(project, &binding.group, Some(item_key)),
+                    binding,
+                )?;
+                save(
+                    &*self.store,
+                    &Self::ref_index_key(
+                        &binding.shared_group,
+                        &binding.shared_key,
+                        project,
+                        &binding.group,
+                        item_key,
+                    ),
+                    &"1",
+                )?;
+            }
+            None => {
+                // 组级引用（B3）：整组绑定共享组 SG —— 结构组内 item 按 key 匹配已发布共享项（≥1 个）
+                let struct_keys: std::collections::HashSet<&str> =
+                    group_def.items.iter().map(|i| i.key.as_str()).collect();
+                let rows = self
+                    .store
+                    .get_prefix(shared_prefix(&binding.shared_group).as_bytes())?;
+                let mut matched = 0usize;
+                for (_, v) in rows {
+                    if let Ok(item) = serde_json::from_slice::<SharedItem>(&v) {
+                        if item.group == binding.shared_group
+                            && struct_keys.contains(item.key.as_str())
+                        {
+                            matched += 1;
+                        }
+                    }
+                }
+                if matched == 0 {
+                    return Err(Error::validation(format!(
+                        "shared group {} has no published item matching structure group {}",
+                        binding.shared_group, binding.group
+                    )));
+                }
+                save(
+                    &*self.store,
+                    &ref_key(project, &binding.group, None),
+                    binding,
+                )?;
+                save(
+                    &*self.store,
+                    &group_ref_index_key(&binding.shared_group, project, &binding.group),
+                    &"1",
+                )?;
+            }
+        }
+        Ok(vec![])
+    }
+
+    fn apply_ref_unbind(
+        &mut self,
+        project: &ProjectId,
+        group: &str,
+        item_key: Option<&str>,
+    ) -> ApplyOutcome {
+        match item_key {
+            Some(key) => {
+                let binding: Option<RefBinding> =
+                    load(&*self.store, &ref_key(project, group, Some(key)))?;
+                if let Some(b) = binding {
+                    self.store
+                        .delete(ref_key(project, group, Some(key)).as_bytes())?;
+                    self.store.delete(
+                        Self::ref_index_key(&b.shared_group, &b.shared_key, project, group, key)
+                            .as_bytes(),
+                    )?;
+                }
+            }
+            None => {
+                // 组级解绑
+                let binding: Option<RefBinding> =
+                    load(&*self.store, &ref_key(project, group, None))?;
+                if let Some(b) = binding {
+                    self.store
+                        .delete(ref_key(project, group, None).as_bytes())?;
+                    self.store
+                        .delete(group_ref_index_key(&b.shared_group, project, group).as_bytes())?;
+                }
+            }
+        }
+        Ok(vec![])
+    }
+
+    /// 读取项目全部 item 级引用。
+    fn read_refs_of_project(&self, project: &ProjectId) -> Result<Vec<RefBinding>, Error> {
+        let prefix = format!("{K_PROJECT}{}{K_REF}", project.as_str());
+        let rows = self.store.get_prefix(prefix.as_bytes())?;
+        let mut out = Vec::new();
+        for (_, v) in rows {
+            if let Ok(b) = serde_json::from_slice::<RefBinding>(&v) {
+                out.push(b);
+            }
+        }
+        Ok(out)
+    }
+
+    // ---------------- 会话（I7 单管理员；状态机内强制） ----------------
+
+    fn apply_session_login(
+        &mut self,
+        token_hash: &str,
+        issued_at: i64,
+        expires_at: Option<i64>,
+    ) -> ApplyOutcome {
+        if self.get_session()?.is_some() {
+            return Err(Error::new(ErrorKind::SessionInUse, "已有管理员在线"));
+        }
+        let session = AdminSession {
+            token_hash: token_hash.to_string(),
+            issued_at,
+            expires_at,
+            device_id: "cli".into(),
+        };
+        save(&*self.store, session_key(), &session)?;
+        Ok(vec![])
+    }
+
+    fn apply_session_logout(&mut self) -> ApplyOutcome {
+        self.store.delete(session_key().as_bytes())?;
+        Ok(vec![])
+    }
+
+    fn apply_session_heartbeat(&mut self, expires_at: Option<i64>) -> ApplyOutcome {
+        let mut session = self
+            .get_session()?
+            .ok_or_else(|| Error::new(ErrorKind::SessionExpired, "未登录"))?;
+        session.expires_at = expires_at;
+        save(&*self.store, session_key(), &session)?;
+        Ok(vec![])
+    }
+
+    /// 审计追加：seq 单调分配（audit/seq 计数），条目落 audit/{seq:020}。
+    /// 入参 entry.seq 忽略（由状态机分配）。
+    fn apply_audit_append(&mut self, entry: &AuditEntry) -> ApplyOutcome {
+        let prev: Option<u64> = load(&*self.store, K_AUDIT_SEQ)?;
+        let seq = prev.unwrap_or(0) + 1;
+        let entry = AuditEntry {
+            seq,
+            ..entry.clone()
+        };
+        save(&*self.store, &audit_key(seq), &entry)?;
+        save(&*self.store, K_AUDIT_SEQ, &seq)?;
+        Ok(vec![])
+    }
+}
+
+/// 会话令牌哈希（SHA-256 hex；明文 token 不落库/不落日志，I7）。
+pub fn token_hash(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(token.as_bytes());
+    h.finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+}

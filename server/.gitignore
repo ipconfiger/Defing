@@ -1,0 +1,14 @@
+# Rust
+target/
+/.cargo/
+Cargo.lock  # (application workspace: commit lockfile instead; uncomment if library)
+# local data
+data/
+*.db/
+# editor
+.idea/
+.vscode/
+*.swp
+# node (admin-ui, future)
+node_modules/
+dist/
