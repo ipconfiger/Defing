@@ -54,7 +54,7 @@ run_lang() { # $1=名称 $2=命令
 
 echo "== 安装依赖 =="
 (cd $REPO/sdk/ts && npm install --cache /tmp/dsh-npm-cache --silent >/dev/null 2>&1) && echo "  ts deps ok" || { echo "  ts deps FAIL"; exit 1; }
-pip install --quiet --disable-pip-version-check grpcio 2>/dev/null && echo "  py deps ok"
+pip install --quiet --disable-pip-version-check -r $REPO/sdk/python/requirements.txt && echo "  py deps ok" || { echo "  py deps FAIL"; exit 1; }
 (cd $REPO/sdk/go && go mod tidy >/dev/null 2>&1) && echo "  go deps ok"
 
 run_lang "ts"   "cd $REPO/sdk/ts && node --experimental-strip-types grpc-test.ts"

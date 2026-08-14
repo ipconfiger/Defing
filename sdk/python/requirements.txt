@@ -1,1 +1,2 @@
 grpcio>=1.60
+protobuf>=4.25,<7
