@@ -1,6 +1,7 @@
 [package]
 name = "dsh-api"
 version = "0.1.0"
+license.workspace = true
 edition = "2021"
 description = "Defing config service - HTTP/gRPC API surface: router, auth, error mapping, admin UI (module 05/09)"
 

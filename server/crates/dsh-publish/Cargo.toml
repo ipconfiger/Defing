@@ -1,6 +1,7 @@
 [package]
 name = "dsh-publish"
 version = "0.1.0"
+license.workspace = true
 edition = "2021"
 description = "Defing config service - publish orchestration: secret encryption + publish/rollback/structure (module 04)"
 

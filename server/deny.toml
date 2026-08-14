@@ -1,8 +1,7 @@
-# cargo-deny 配置（CI deny step；供应链接管：许可 + 依赖）
+# cargo-deny 配置（CI deny step；供应链接管：许可 + 依赖 + 漏洞）
+# cargo-deny 0.20 格式（模板见 cargo-deny crate deny.template.toml）
+
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
 ignore = []
 
 [licenses]
@@ -17,13 +16,13 @@ allow = [
     "CC0-1.0",
 ]
 confidence-threshold = 0.8
-unlicensed = "deny"
-allow-osi-fsf-free = "neither"
-default = "deny"
+
+[licenses.private]
+ignore = false
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+wildcards = "warn"  # workspace 内部 path 依赖视为合法
 
 [sources]
 unknown-registry = "deny"

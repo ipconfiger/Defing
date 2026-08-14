@@ -1,6 +1,7 @@
 [package]
 name = "dsh-watch"
 version = "0.1.0"
+license.workspace = true
 edition = "2021"
 description = "Defing config service - watch fan-out: broadcast hub + SSE (module 06)"
 
