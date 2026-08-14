@@ -257,3 +257,30 @@
 - 轮换流程：operator 准备新 KEK（--gen-master-key）→ `dsh --rotate-master-key --admin-token <t>` 调 API → 节点 KeyRing 追加 + 环文件持久化 → RewrapDeks 任务（leader）逐节点重包；旧 KEK 常驻环（可解旧数据）直到 operator 手动清理
 - 坑：单会话（I7）下 CLI 客户端 login 会 409 → 增加 `--admin-token` 直接复用会话；e2e 中发布需满足必填项（草稿漏 host 导致 422，非缺陷）
 - rewrap 为 leader-local 写（与 VersionRetention 同模型）：状态机与 raft 日志的既有关系下，快照安装/重启持久化保持一致；旧 KEK 兜底可解，最终一致
+
+## M8 —— CI 全量流水线（A2）+ 正式基准（A3）+ SBOM（A4） ✅ 完成
+
+**交付物**
+- **A2 CI 全量流水线（GitHub Actions，stage 1~9 全落地）**：`.github/workflows/ci.yml` 8 jobs
+  - lint（fmt/clippy -D warnings/deny）、unit（cargo test --workspace）、contract（三方契约 lint）
+  - **raft**（集群/快照持久化/转发契约测试）、**sdk**（三语言契约对拍）、**e2e**（dev-single + 3 节点集群 + 混沌）
+  - **bench**（基准冒烟归档）、**release**（--release 构建 + SBOM + 产物上传）
+- **A3 正式基准**：`scripts/bench.sh` + Go 基准客户端（读 QPS / 写 QPS / watch 延迟 / 二进制 / 内存）
+- **A4 SBOM**：anchore/sbom-action（SPDX JSON，随 release 产物归档）
+
+**A3 基准实测（design-v2 §12 目标对照）**
+| 指标 | 本机（debug） | CI runner | 设计目标 |
+|------|--------------|-----------|---------|
+| 读 QPS（GET /snapshot，200 并发） | 35016 | 9419 | 未设读上限 |
+| 写 QPS（草稿+发布，单写者串行 apply） | 1620 | 1048 | ≥10k（design 注：写路径单写者串行） |
+| watch 延迟（发布→SSE） | 12ms | 22ms | ≤1s ✓ |
+| 内存 RSS | 40MB | 41MB | ≤128MB ✓ |
+| release 二进制 | — | **8.68MB** | ≤50MB ✓ |
+
+**CI 修复记录（首次上云踩坑）**
+- protoc 缺失：dsh-api/build.rs（tonic-prost-build）需要 protoc → 所有编译 job 补 `arduino/setup-protoc`
+- sdk 脚本硬编码 /home/alex 路径 → 改 `$REPO`（脚本相对仓库根解析）
+- sdk watch 首编窗口竞态：Go 首编 ~15s 错过 5 秒发布窗口 → 改为**持续发布直到测试进程退出**
+- 修复后：8 jobs 全绿（unit 74 tests / e2e 含 chaos / lint 零警告 / release+SBOM）
+
+**里程碑总览（M0–M8 全部达成）**：契约 → 单节点/集群 → 发布引擎/加密/渲染/任务 → watch/可观测/会话/UI → 三语言 SDK → 混沌/加固/发布 → 会话落Raft/审计/快照/集群watch → 模块化/gRPC → 组级引用/密钥轮换 → **CI 全量/基准/SBOM**

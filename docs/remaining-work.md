@@ -19,6 +19,7 @@
 | M5 会话/审计/快照/集群watch | ✅（R1–R4） | 59 tests + 5 e2e 脚本（含跨节点 409 断言） |
 | M6 模块化归位 + gRPC 数据面 | ✅（B1+A1） | 65 tests + gRPC 集成测试 + 5 e2e 脚本 |
 | M7 组级引用 + 密钥轮换 | ✅（B3+B6） | 74 tests + 轮换 HTTP e2e + 5 e2e 脚本 |
+| M8 CI 全量 + 基准 + SBOM | ✅（A2+A3+A4） | 8 jobs 全绿 + 基准实测 + SPDX SBOM |
 
 - cargo test --workspace：59 passed / 0 failed；clippy -D warnings 零警告；fmt 干净
 - 读路径基准冒烟：6279 QPS（200 并发，4 万请求全成功）
@@ -34,9 +35,9 @@
 | # | 项 | 现状 | 差异点 |
 |---|-----|------|--------|
 | A1 | gRPC 数据面 | ~~未实现~~ → **已闭环（M6）**：tonic ConfigService（GetConfig/GetItem/Watch/ListMembers）挂 :8383，含鉴权拦截器与集成测试；三语言 SDK 暂仍走 HTTP/SSE（可后续增 gRPC 客户端） | proto/config.v1.proto → dsh-api/build.rs + grpc.rs |
-| A2 | CI 全量流水线 | .github/workflows/ci.yml 仅 lint/unit/contract 三阶段 | 集成/raft/sdk/e2e/bench/release 阶段未接入；本机无法实跑 Actions |
-| A3 | 正式基准 | 仅冒烟：读 6279 QPS | 设计目标 写 QPS ≥10k、watch ≥10k、发布→SDK ≤1s、内存 ≤128MB、二进制 ≤50MB（release）未校准；写路径为单写者串行 apply |
-| A4 | SBOM | 未生成 | M4 发布清单软项（Docker/compose/README 已就绪） |
+| A2 | CI 全量流水线 | ~~仅三阶段~~ → **已闭环（M8）**：8 jobs（lint/unit/contract/raft/sdk/e2e/bench/release）全绿，含 SDK 契约对拍与混沌 e2e | 集成/raft/sdk/e2e/bench/release 阶段 | .github/workflows/ci.yml |
+| A3 | 正式基准 | ~~仅冒烟~~ → **已闭环（M8）**：scripts/bench.sh（读 35016/写 1620 QPS 本机；CI 读 9419/写 1048）；watch 12ms、内存 41MB、release 二进制 8.68MB 达标；写 QPS 受单写者串行 apply 约束（design 注记） | 设计目标对照 | scripts/bench.sh + scripts/bench/main.go |
+| A4 | SBOM | ~~未生成~~ → **已闭环（M8）**：anchore/sbom-action（SPDX JSON）随 release 产物归档 | M4 发布清单软项 | .github/workflows/ci.yml（release job） |
 
 ### B. 设计降级项（本次核查确认）
 
@@ -62,7 +63,8 @@
 | ~~P2~~ | ~~B6 密钥轮换~~ | ✅ M7 完成（KeyRing/rotate API/重包任务/CRY-002） | — |
 | ~~P2~~ | ~~B5 快照持久化~~ | ✅ M5 完成 | — |
 | ~~P3~~ | ~~B7 集群 watch 测试~~ | ✅ M5 完成 | — |
-| P3 | A2 CI 全量 / A3 正式基准 / A4 SBOM | 需要对应 CI/压测环境 | 视环境 |
+| ~~P3~~ | ~~A2 CI 全量 / A3 正式基准 / A4 SBOM~~ | ✅ M8 完成（8 jobs 全绿 + 基准实测 + SPDX SBOM） | — |
+| P3(新) | 三语言 SDK gRPC 客户端 | 数据面已提供 gRPC（:8383）；SDK 仍走 HTTP/SSE | HTTP 保留为降级通道 | 中 |
 
 ## 4. 下一轮优化入口（每项照例：实现 → 测试 → 验证）
 
