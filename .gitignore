@@ -44,3 +44,7 @@ sdk/ts/node_modules/
 .cargo-target/
 
 .py-venv6/
+
+# 交叉编译本地缓存/临时 HOME
+.cargo-target-linux/
+.xb-home/
