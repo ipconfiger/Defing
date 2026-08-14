@@ -42,3 +42,5 @@ sdk/ts/node_modules/
 .agent-browser/
 
 .cargo-target/
+
+.py-venv6/
