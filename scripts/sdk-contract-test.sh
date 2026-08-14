@@ -35,10 +35,11 @@ run_lang() { # $1=名称 $2=命令
   publish_change "10.0.0.9"   # 重置为各语言测试期望值
   DSH_ENDPOINTS=$BASE DSH_PROJECT=$PROJECT sh -c "$2" > /tmp/sdk-$1.out 2>&1 &
   local TP=$!
-  # 循环发布，消除"测试启动编译耗时"的时序敏感（watch 会收到订阅后的第一个事件）
-  for i in 1 2 3 4 5; do
+  # 持续发布直到测试进程退出（消除首编/启动耗时导致的订阅窗口错过；watch 收到订阅后首个事件）
+  for i in $(seq 1 60); do
+    if ! kill -0 "$TP" 2>/dev/null; then break; fi
     sleep 1
-    publish_change "10.0.0.1$i"
+    publish_change "10.0.0.$((100 + i))"
   done
   if wait $TP; then
     cat /tmp/sdk-$1.out
