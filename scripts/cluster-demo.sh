@@ -136,5 +136,21 @@ api -sf "$H/api/v1/projects" 2>/dev/null | grep -q 'svc-b' && VISIBLE=1
 done
 [ "$VISIBLE" = "1" ] && echo "  kill 后写入成功且存活节点可见 ✅" || { echo "FAIL: svc-b not visible"; exit 1; }
 
+echo "== 8. remove-node：节点4 join 为 learner → /api/v1/cluster/remove 移除 =="
+H4=http://127.0.0.1:8604
+start_node 4 127.0.0.1:8604 127.0.0.1:8605 "$WORK/n4" --join "$LEADER"
+wait_ready "$H4"
+# 节点4 的 token（单会话集群级，登录时已共享；写入其文件以便后续查询）
+HOST4=127.0.0.1:8604
+echo "$TOK" > "$WORK/tok_"$HOST4
+sleep 1
+M=$(api -sf "$LEADER/api/v1/cluster/members")
+echo "$M" | python3 -c "import json,sys; d=json.load(sys.stdin); ids=[m['node_id'] for m in d['members']]; assert '4' in ids, ids" && echo "  node4 已入成员表 ✅"
+api -sf -X POST "$LEADER/api/v1/cluster/remove" -H 'Content-Type: application/json' -d '{"node_id":4}' >/tmp/remove.json || { echo "FAIL: cluster/remove"; exit 1; }
+sleep 1
+M=$(api -sf "$LEADER/api/v1/cluster/members")
+echo "$M" | python3 -c "import json,sys; d=json.load(sys.stdin); ids=[m['node_id'] for m in d['members']]; assert '4' not in ids, ids" && echo "  node4 已移除 ✅"
+echo "  remove-node 响应: $(cat /tmp/remove.json)"
+
 echo
 echo "======== M1 集群演示全部通过 ========"

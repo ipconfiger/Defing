@@ -10,6 +10,8 @@ pub mod types;
 
 pub use http_network::{HttpNetwork, HttpNetworkFactory};
 pub use network::{Network, NetworkFactory, RaftHandle};
+/// openraft 重新导出（成员变更等高级 API 供 dsh-api 使用）。
+pub use openraft;
 pub use raft::{
     client_write, dev_config, initialize_single, leader_http_addr, new_raft_node, try_client_write,
     wait_for_leader, wait_until, write_command, WriteError, WriteOutcome,

@@ -275,6 +275,22 @@ paths:
                   versions:
                     type: array
                     items: { $ref: '#/components/schemas/Version' }
+  /api/v1/projects/{p}/branches/{b}/config:
+    get:
+      summary: 管理面查看配置（secret 默认掩码；reveal=true 需会话+审计）
+      security:
+        - AdminSession: []
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { $ref: '#/components/parameters/BranchPath' }
+        - { name: reveal, in: query, schema: { type: boolean, default: false } }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigSnapshot' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /api/v1/projects/{p}/branches/{b}/rollback:
     post:
       summary: 回滚到指定版本（以旧内容创建新版本）
@@ -371,6 +387,38 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/SharedPublishResult' }
         '422': { $ref: '#/components/responses/PublishBlocked' }
+  /api/v1/shared/refs:
+    get:
+      summary: 项目共享引用绑定列表
+      parameters:
+        - { name: project, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RefBinding' }
+    post:
+      summary: 绑定项目 item/组 → 共享项（发布时物化；共享发布自动级联）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefBindingReq' }
+      responses:
+        '200': { description: 已绑定 }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    delete:
+      summary: 解绑
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefUnbindReq' }
+      responses:
+        '200': { description: 已解绑 }
   /api/v1/audit:
     get:
       summary: 审计查询
@@ -437,6 +485,42 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/MemberList' }
+  /api/v1/cluster/members:
+    get:
+      summary: 集群成员表（含节点地址/角色；SDK 端点池刷新用）
+      security: []
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node_id: { type: string, nullable: true }
+                  current_leader: { type: string, nullable: true }
+                  state: { type: string }
+                  members:
+                    type: array
+                    items: { $ref: '#/components/schemas/Member' }
+  /api/v1/admin/rotate-master-key:
+    post:
+      summary: 轮换主密钥（KeyRing 追加 + 环文件持久化；DEK 重包由后台任务执行）
+      security:
+        - AdminSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_key]
+              properties:
+                new_key: { type: string, description: base64 32B 新 KEK }
+      responses:
+        '200':
+          description: 已轮换（返回 generation 与环条目数）
+        '422': { $ref: '#/components/responses/ValidationFailed' }
   /healthz:
     get:
       summary: 存活检查
@@ -465,6 +549,44 @@ paths:
                   status: { type: string, enum: [ok] }
         '503':
           description: 未就绪
+  /metrics:
+    get:
+      summary: Prometheus 指标文本
+      security: []
+      responses:
+        '200':
+          description: 指标文本（text/plain; version=0.0.4）
+  /admin:
+    get:
+      summary: 内嵌 Admin UI
+      security: []
+      responses:
+        '200':
+          description: HTML 页面
+  /v1/projects/{p}/branches/{b}/snapshot:
+    get:
+      summary: SDK 数据面快照（纯值输出；secret 解密为真实值，面向应用经 TLS 拉取）
+      security: []
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { $ref: '#/components/parameters/BranchPath' }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigSnapshot' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/projects/{p}/branches/{b}/watch:
+    get:
+      summary: SDK 数据面 SSE 订阅（发布事件流；keepalive 注释帧）
+      security: []
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { $ref: '#/components/parameters/BranchPath' }
+      responses:
+        '200':
+          description: text/event-stream
   /v1/projects/{p}/branches/{b}/config:
     get:
       summary: 渲染输出配置文档（YAML/TOML/JSON；secret 默认掩码）
@@ -579,6 +701,20 @@ components:
         active_version: { type: integer, format: int64 }
         structure_version: { type: integer, format: int64 }
         created_at: { type: string, format: date-time }
+    ConfigSnapshot:
+      type: object
+      required: [project, branch, version]
+      properties:
+        project: { type: string }
+        branch: { type: string }
+        version: { type: integer, format: int64 }
+        structure_version: { type: integer, format: int64 }
+        groups:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties:
+              $ref: '#/components/schemas/Value'
     ItemDef:
       type: object
       required: [key, type]
@@ -743,6 +879,29 @@ components:
               project: { type: string }
               branch: { type: string }
               new_version: { type: integer, format: int64 }
+    RefBinding:
+      type: object
+      properties:
+        group: { type: string }
+        item_key: { type: string, nullable: true, description: null=整组引用 }
+        shared_group: { type: string }
+        shared_key: { type: string }
+    RefBindingReq:
+      type: object
+      required: [project, group, shared_group, shared_key]
+      properties:
+        project: { type: string }
+        group: { type: string }
+        item_key: { type: string, description: 缺省=整组绑定共享组 }
+        shared_group: { type: string }
+        shared_key: { type: string }
+    RefUnbindReq:
+      type: object
+      required: [project, group]
+      properties:
+        project: { type: string }
+        group: { type: string }
+        item_key: { type: string, description: 缺省=整组解绑 }
     AuditEntry:
       type: object
       properties:

@@ -15,7 +15,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
 use dsh_core::command::{Command, DraftUpdateItem};
-use dsh_core::model::{BranchName, GroupDef, ProjectId, Value};
+use dsh_core::model::{BranchName, GroupDef, ProjectId, RefBinding, SharedItem, Value, ValueType};
 use dsh_core::{ErrorKind, StateMachine};
 use dsh_crypto::Cipher;
 use dsh_observability::{cluster_members_json, is_ready, metrics_text, AuditLog};
@@ -590,34 +590,647 @@ async fn rollback(
     ))
 }
 
-async fn get_config(
+// ---------------- 项目/分支详情与删除（openapi 契约补全） ----------------
+
+async fn project_detail(
+    State(app): State<ApiState>,
+    AxumPath(pid): AxumPath<String>,
+) -> ApiResult<serde_json::Value> {
+    let sm = app.sm.lock().expect("sm lock");
+    let p = sm
+        .get_project(&ProjectId(pid.clone()))
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError(dsh_core::Error::not_found("project")))?;
+    Ok(Json(serde_json::json!({
+        "id": p.id.as_str(),
+        "name": p.name,
+        "created_at": p.created_at,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ForceQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn delete_project(
+    State(app): State<ApiState>,
+    AxumPath(pid): AxumPath<String>,
+    axum::extract::Query(q): axum::extract::Query<ForceQuery>,
+) -> Result<StatusCode, (StatusCode, Json<ApiErrorBody>)> {
+    if !q.force {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiErrorBody {
+                code: "ERR_VALIDATION".into(),
+                message: "删除项目需要 force=true 确认".into(),
+                detail: None,
+            }),
+        ));
+    }
+    let pid_obj = ProjectId(pid.clone());
+    app.write(&Command::ProjectDelete { id: pid_obj }, now_ms())
+        .await
+        .map_err(Into::<(StatusCode, Json<ApiErrorBody>)>::into)?;
+    app.audit
+        .append(
+            "project_delete",
+            Some(pid.clone()),
+            None,
+            None,
+            None,
+            serde_json::json!({}),
+        )
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn branch_detail(
     State(app): State<ApiState>,
     AxumPath((pid, branch)): AxumPath<(String, String)>,
-) -> ApiResult<ConfigResp> {
+) -> ApiResult<serde_json::Value> {
     let sm = app.sm.lock().expect("sm lock");
-    let snap = sm
-        .get_config(&ProjectId(pid.clone()), &BranchName(branch.clone()), 0)
+    let id = ProjectId(pid.clone());
+    let bname = BranchName(branch.clone());
+    let st = sm
+        .get_branch_state(&id, &bname)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError(dsh_core::Error::not_found("branch")))?;
+    let drafts: serde_json::Value = st
+        .value_draft
+        .iter()
+        .map(|(g, items)| {
+            let m: serde_json::Map<String, serde_json::Value> = items
+                .iter()
+                .map(|(k, dv)| {
+                    (
+                        k.clone(),
+                        serde_json::json!({ "value": dv.value, "updated_at": dv.updated_at }),
+                    )
+                })
+                .collect();
+            (g.clone(), serde_json::Value::Object(m))
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "name": branch,
+        "active_version": st.active_version,
+        "structure_version": st.structure_version,
+        "draft": drafts,
+    })))
+}
+
+async fn delete_branch(
+    State(app): State<ApiState>,
+    AxumPath((pid, branch)): AxumPath<(String, String)>,
+) -> Result<StatusCode, (StatusCode, Json<ApiErrorBody>)> {
+    app.write(
+        &Command::BranchDelete {
+            project: ProjectId(pid.clone()),
+            name: BranchName(branch.clone()),
+        },
+        now_ms(),
+    )
+    .await
+    .map_err(Into::<(StatusCode, Json<ApiErrorBody>)>::into)?;
+    app.audit
+        .append(
+            "branch_delete",
+            Some(pid.clone()),
+            Some(branch.clone()),
+            None,
+            None,
+            serde_json::json!({}),
+        )
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------- 分支对比 + 值提升（openapi 契约补全） ----------------
+
+#[derive(Deserialize)]
+struct DiffQuery {
+    branch_a: String,
+    branch_b: String,
+}
+
+async fn branch_diff(
+    State(app): State<ApiState>,
+    AxumPath(pid): AxumPath<String>,
+    axum::extract::Query(q): axum::extract::Query<DiffQuery>,
+) -> ApiResult<serde_json::Value> {
+    let sm = app.sm.lock().expect("sm lock");
+    let id = ProjectId(pid);
+    let a = sm
+        .get_config(&id, &BranchName(q.branch_a), 0)
         .map_err(ApiError::from)?;
-    // 解密 secret（输出明文；需主密钥）
-    let mut groups = snap.groups;
-    if let Some(cipher) = &app.cipher {
-        for items in groups.values_mut() {
-            for v in items.values_mut() {
-                if let Value::Secret(ct) = v {
-                    let plain = cipher.decrypt_secret(ct);
-                    *v = match plain {
-                        Ok(p) => Value::String(String::from_utf8_lossy(&p).into_owned()),
-                        Err(_) => Value::String("***".into()),
-                    };
+    let b = sm
+        .get_config(&id, &BranchName(q.branch_b), 0)
+        .map_err(ApiError::from)?;
+    let mut keys: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    for (g, items) in &a.groups {
+        for k in items.keys() {
+            keys.insert((g.clone(), k.clone()));
+        }
+    }
+    for (g, items) in &b.groups {
+        for k in items.keys() {
+            keys.insert((g.clone(), k.clone()));
+        }
+    }
+    let mut diffs = Vec::new();
+    let mut missing = Vec::new();
+    for (g, k) in keys {
+        let va = a.groups.get(&g).and_then(|m| m.get(&k));
+        let vb = b.groups.get(&g).and_then(|m| m.get(&k));
+        match (va, vb) {
+            (Some(x), Some(y)) if x != y => {
+                diffs.push(serde_json::json!({
+                    "group": g, "key": k, "branch_a": x, "branch_b": y,
+                }));
+            }
+            (Some(_), None) | (None, Some(_)) => missing.push(format!("{g}/{k}")),
+            _ => {}
+        }
+    }
+    Ok(Json(
+        serde_json::json!({ "diffs": diffs, "missing": missing }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct PromoteReq {
+    from: String,
+    to: String,
+    /// 限定 item（"group/key"）；缺省=全部
+    items: Option<Vec<String>>,
+    #[serde(default)]
+    force: bool,
+}
+
+/// 值提升（design-v2 §4.8）：把源分支活动版本值写入目标分支草稿（不发布）。
+/// 目标草稿已修改项默认跳过（force=true 覆盖）；items 中源分支没有的进入 missing_from。
+async fn promote(
+    State(app): State<ApiState>,
+    AxumPath(pid): AxumPath<String>,
+    Json(req): Json<PromoteReq>,
+) -> ApiResult<serde_json::Value> {
+    let pid_obj = ProjectId(pid.clone());
+    let from_b = BranchName(req.from.clone());
+    let to_b = BranchName(req.to.clone());
+    let filter: Option<Vec<(String, String)>> = req.items.as_ref().map(|items| {
+        items
+            .iter()
+            .filter_map(|s| {
+                s.split_once('/')
+                    .map(|(g, k)| (g.to_string(), k.to_string()))
+            })
+            .collect()
+    });
+    let (updates, applied, skipped, missing_from) = {
+        let sm = app.sm.lock().expect("sm lock");
+        let src = sm
+            .get_config(&pid_obj, &from_b, 0)
+            .map_err(ApiError::from)?;
+        let dst = sm
+            .get_branch_state(&pid_obj, &to_b)
+            .map_err(ApiError::from)?
+            .ok_or_else(|| ApiError(dsh_core::Error::not_found("target branch")))?;
+        let mut updates = Vec::new();
+        let mut applied = Vec::new();
+        let mut skipped = Vec::new();
+        let mut missing_from = Vec::new();
+        for (g, items) in &src.groups {
+            for (k, v) in items {
+                if let Some(f) = &filter {
+                    if !f.contains(&(g.clone(), k.clone())) {
+                        continue;
+                    }
+                }
+                let key = format!("{g}/{k}");
+                let draft_modified = dst.value_draft.get(g).is_some_and(|m| m.contains_key(k));
+                if draft_modified && !req.force {
+                    skipped.push(key);
+                    continue;
+                }
+                updates.push(DraftUpdateItem {
+                    group: g.clone(),
+                    key: k.clone(),
+                    value: v.clone(),
+                });
+                applied.push(key);
+            }
+        }
+        if let Some(f) = &filter {
+            for (g, k) in f {
+                if !src.groups.get(g).is_some_and(|m| m.contains_key(k)) {
+                    missing_from.push(format!("{g}/{k}"));
                 }
             }
         }
+        (updates, applied, skipped, missing_from)
+    };
+    if !updates.is_empty() {
+        app.publish
+            .update_draft(&pid_obj, &to_b, updates, vec![])
+            .await
+            .map_err(ApiError::from)?;
+    }
+    app.audit
+        .append(
+            "promote",
+            Some(pid.clone()),
+            Some(req.to.clone()),
+            None,
+            None,
+            serde_json::json!({
+                "from": req.from,
+                "applied": applied.len(),
+                "skipped": skipped.len(),
+                "missing_from": missing_from.len(),
+            }),
+        )
+        .await;
+    Ok(Json(serde_json::json!({
+        "applied": applied,
+        "skipped": skipped,
+        "missing_from": missing_from,
+    })))
+}
+
+// ---------------- 共享库（openapi 契约补全；core 已支持，补 HTTP 面） ----------------
+
+/// 共享项请求（对齐 openapi SharedItem；version 由状态机分配）。
+#[derive(Deserialize)]
+struct SharedItemReq {
+    group: String,
+    key: String,
+    r#type: ValueType,
+    #[serde(default)]
+    secret: bool,
+    #[serde(default)]
+    required: bool,
+    value: Value,
+}
+
+fn masked_shared_value(item: &SharedItem) -> serde_json::Value {
+    if item.secret {
+        serde_json::json!({ "type": "string", "str_value": "***", "masked": true })
+    } else {
+        serde_json::json!(item.value)
+    }
+}
+
+fn shared_item_json(item: &SharedItem) -> serde_json::Value {
+    serde_json::json!({
+        "group": item.group,
+        "key": item.key,
+        "type": item.ty,
+        "secret": item.secret,
+        "required": item.required,
+        "value": masked_shared_value(item),
+        "version": item.version,
+    })
+}
+
+/// 写共享草稿（secret 项提交前加密，I8）。
+async fn write_shared_draft(
+    app: &ApiState,
+    req: SharedItemReq,
+    action: &str,
+) -> Result<serde_json::Value, (StatusCode, Json<ApiErrorBody>)> {
+    let mut value = req.value;
+    if req.secret {
+        if let Value::String(plain) = &value {
+            let cipher = app.cipher.as_ref().ok_or_else(|| {
+                ApiError(dsh_core::Error::validation(
+                    "secret 共享项需要主密钥（--master-key-file 或 DSH_MASTER_KEY）",
+                ))
+            })?;
+            let ct = cipher
+                .encrypt_secret(plain.as_bytes())
+                .map_err(|e| ApiError(dsh_core::Error::internal(format!("encrypt: {e}"))))?;
+            value = Value::Secret(ct);
+        }
+    }
+    let item = SharedItem {
+        group: req.group.clone(),
+        key: req.key.clone(),
+        ty: req.r#type,
+        secret: req.secret,
+        required: req.required,
+        value,
+        version: 0,
+    };
+    app.write(&Command::SharedDraftUpdate { item }, now_ms())
+        .await
+        .map_err(Into::<(StatusCode, Json<ApiErrorBody>)>::into)?;
+    app.audit
+        .append(
+            action,
+            None,
+            None,
+            None,
+            None,
+            serde_json::json!({ "group": req.group, "key": req.key }),
+        )
+        .await;
+    Ok(serde_json::json!({
+        "saved": true,
+        "group": req.group,
+        "key": req.key,
+    }))
+}
+
+async fn create_shared(
+    State(app): State<ApiState>,
+    Json(req): Json<SharedItemReq>,
+) -> ApiResult<serde_json::Value> {
+    write_shared_draft(&app, req, "shared_draft_update")
+        .await
+        .map(Json)
+}
+
+async fn update_shared_draft(
+    State(app): State<ApiState>,
+    Json(req): Json<SharedItemReq>,
+) -> ApiResult<serde_json::Value> {
+    write_shared_draft(&app, req, "shared_draft_update")
+        .await
+        .map(Json)
+}
+
+async fn list_shared(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
+    let sm = app.sm.lock().expect("sm lock");
+    let items = sm
+        .list_shared_published()
+        .map_err(ApiError::from)?
+        .iter()
+        .map(shared_item_json)
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!(items)))
+}
+
+async fn list_shared_drafts(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
+    let sm = app.sm.lock().expect("sm lock");
+    let items = sm
+        .list_shared_drafts()
+        .map_err(ApiError::from)?
+        .iter()
+        .map(shared_item_json)
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!(items)))
+}
+
+async fn publish_shared(
+    State(app): State<ApiState>,
+    Json(req): Json<PublishReq>,
+) -> ApiResult<serde_json::Value> {
+    let rid = req.request_id.unwrap_or_else(new_request_id);
+    let outcome = app
+        .write(
+            &Command::SharedPublish {
+                comment: req.comment,
+                request_id: rid.clone(),
+            },
+            now_ms(),
+        )
+        .await?;
+    let mut affected = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for e in &outcome.events {
+        let k = (
+            e.project.as_str().to_string(),
+            e.branch.as_str().to_string(),
+        );
+        if seen.insert(k) {
+            affected.push(serde_json::json!({
+                "project": e.project.as_str(),
+                "branch": e.branch.as_str(),
+                "new_version": e.version,
+            }));
+        }
+    }
+    let max_version = {
+        let sm = app.sm.lock().expect("sm lock");
+        sm.list_shared_published()
+            .map_err(ApiError::from)?
+            .iter()
+            .map(|i| i.version)
+            .max()
+            .unwrap_or(0)
+    };
+    app.audit
+        .append(
+            "shared_publish",
+            None,
+            None,
+            None,
+            Some(rid.clone()),
+            serde_json::json!({ "affected": affected.len() }),
+        )
+        .await;
+    Ok(Json(serde_json::json!({
+        "version": max_version,
+        "affected": affected,
+        "request_id": rid,
+    })))
+}
+
+// ---------------- 共享引用绑定（core RefBind/RefUnbind 补 HTTP 面） ----------------
+
+#[derive(Deserialize)]
+struct RefBindReq {
+    project: String,
+    group: String,
+    #[serde(default)]
+    item_key: Option<String>,
+    shared_group: String,
+    shared_key: String,
+}
+
+#[derive(Deserialize)]
+struct RefUnbindReq {
+    project: String,
+    group: String,
+    #[serde(default)]
+    item_key: Option<String>,
+}
+
+async fn ref_bind(
+    State(app): State<ApiState>,
+    Json(req): Json<RefBindReq>,
+) -> ApiResult<serde_json::Value> {
+    let binding = RefBinding {
+        group: req.group.clone(),
+        item_key: req.item_key.clone(),
+        shared_group: req.shared_group.clone(),
+        shared_key: req.shared_key.clone(),
+    };
+    app.write(
+        &Command::RefBind {
+            project: ProjectId(req.project.clone()),
+            binding,
+        },
+        now_ms(),
+    )
+    .await?;
+    app.audit
+        .append(
+            "ref_bind",
+            Some(req.project.clone()),
+            None,
+            None,
+            None,
+            serde_json::json!({ "group": req.group, "item_key": req.item_key, "shared": format!("{}/{}", req.shared_group, req.shared_key) }),
+        )
+        .await;
+    Ok(Json(
+        serde_json::json!({ "bound": true, "project": req.project }),
+    ))
+}
+
+async fn ref_unbind(
+    State(app): State<ApiState>,
+    Json(req): Json<RefUnbindReq>,
+) -> ApiResult<serde_json::Value> {
+    app.write(
+        &Command::RefUnbind {
+            project: ProjectId(req.project.clone()),
+            group: req.group.clone(),
+            item_key: req.item_key.clone(),
+        },
+        now_ms(),
+    )
+    .await?;
+    app.audit
+        .append(
+            "ref_unbind",
+            Some(req.project.clone()),
+            None,
+            None,
+            None,
+            serde_json::json!({ "group": req.group, "item_key": req.item_key }),
+        )
+        .await;
+    Ok(Json(
+        serde_json::json!({ "unbound": true, "project": req.project }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct RefsQuery {
+    project: String,
+}
+
+async fn list_refs(
+    State(app): State<ApiState>,
+    axum::extract::Query(q): axum::extract::Query<RefsQuery>,
+) -> ApiResult<serde_json::Value> {
+    let sm = app.sm.lock().expect("sm lock");
+    let refs = sm
+        .list_refs(&ProjectId(q.project))
+        .map_err(ApiError::from)?;
+    Ok(Json(serde_json::json!(refs)))
+}
+
+/// secret 值处理策略（§7.6）：reveal=false 一律掩码；reveal=true 解密（需会话 + 审计）。
+/// 数据面（HTTP snapshot / gRPC）与渲染/导出默认掩码 —— 与 proto masked 语义及 gRPC 行为一致。
+fn apply_secret_policy(
+    groups: &mut std::collections::BTreeMap<String, std::collections::BTreeMap<String, Value>>,
+    cipher: Option<&Cipher>,
+    reveal: bool,
+) {
+    for items in groups.values_mut() {
+        for v in items.values_mut() {
+            if let Value::Secret(ct) = v {
+                *v = if reveal {
+                    match cipher.and_then(|c| c.decrypt_secret(ct).ok()) {
+                        Some(p) => Value::String(String::from_utf8_lossy(&p).into_owned()),
+                        None => Value::String("***".into()),
+                    }
+                } else {
+                    Value::String("***".into())
+                };
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ConfigQuery {
+    #[serde(default)]
+    reveal: bool,
+}
+
+/// 管理面查看配置（GET /api/v1/projects/{p}/branches/{b}/config）：
+/// secret 默认掩码；reveal=true 解密并审计（会话已由鉴权中间件保证）。
+async fn admin_config(
+    State(app): State<ApiState>,
+    AxumPath((pid, branch)): AxumPath<(String, String)>,
+    axum::extract::Query(q): axum::extract::Query<ConfigQuery>,
+) -> ApiResult<ConfigResp> {
+    let (version, project, branch_name, structure_version, mut groups) = {
+        let sm = app.sm.lock().expect("sm lock");
+        let snap = sm
+            .get_config(&ProjectId(pid.clone()), &BranchName(branch.clone()), 0)
+            .map_err(ApiError::from)?;
+        (
+            snap.version,
+            snap.project,
+            snap.branch,
+            snap.structure_version,
+            snap.groups,
+        )
+    };
+    apply_secret_policy(&mut groups, app.cipher.as_deref(), q.reveal);
+    if q.reveal {
+        app.audit
+            .append(
+                "config_reveal",
+                Some(pid.clone()),
+                Some(branch.clone()),
+                Some(version),
+                None,
+                serde_json::json!({}),
+            )
+            .await;
     }
     Ok(Json(ConfigResp {
-        project: snap.project,
-        branch: snap.branch,
-        version: snap.version,
-        structure_version: snap.structure_version,
+        project,
+        branch: branch_name,
+        version,
+        structure_version,
+        groups: plain_groups(&groups),
+    }))
+}
+
+/// SDK 数据面快照（GET /v1/projects/{p}/branches/{b}/snapshot）：纯值输出；
+/// secret 按数据面脱敏策略输出掩码（与 gRPC GetConfig masked 一致）。
+async fn snapshot(
+    State(app): State<ApiState>,
+    AxumPath((pid, branch)): AxumPath<(String, String)>,
+) -> ApiResult<ConfigResp> {
+    let (version, project, branch_name, structure_version, mut groups) = {
+        let sm = app.sm.lock().expect("sm lock");
+        let snap = sm
+            .get_config(&ProjectId(pid.clone()), &BranchName(branch.clone()), 0)
+            .map_err(ApiError::from)?;
+        (
+            snap.version,
+            snap.project,
+            snap.branch,
+            snap.structure_version,
+            snap.groups,
+        )
+    };
+    apply_secret_policy(&mut groups, app.cipher.as_deref(), false);
+    Ok(Json(ConfigResp {
+        project,
+        branch: branch_name,
+        version,
+        structure_version,
         groups: plain_groups(&groups),
     }))
 }
@@ -677,34 +1290,81 @@ fn plain_groups(
 struct RenderQuery {
     #[serde(default = "default_format")]
     format: String,
+    /// 目标版本（0=活动版本）
+    #[serde(default)]
+    version: u64,
+    /// 解密 secret 输出（需管理面会话 + 审计；默认掩码）
+    #[serde(default)]
+    reveal: bool,
 }
 
 fn default_format() -> String {
     "yaml".into()
 }
 
+/// 渲染配置文档（GET /v1/projects/{p}/branches/{b}/config?format=&version=&reveal=）。
+/// secret 默认掩码（渲染器对密文输出 "***"）；reveal=true 需管理员会话（Bearer）+ 审计。
 async fn render_config(
     State(app): State<ApiState>,
     AxumPath((pid, branch)): AxumPath<(String, String)>,
     axum::extract::Query(q): axum::extract::Query<RenderQuery>,
+    req: axum::extract::Request,
 ) -> Result<axum::response::Response, (StatusCode, Json<ApiErrorBody>)> {
-    let sm = app.sm.lock().expect("sm lock");
-    let snap = sm
-        .get_config(&ProjectId(pid.clone()), &BranchName(branch.clone()), 0)
-        .map_err(ApiError::from)?;
-    let mut groups = snap.groups;
-    if let Some(cipher) = &app.cipher {
-        for items in groups.values_mut() {
-            for v in items.values_mut() {
-                if let Value::Secret(ct) = v {
-                    let plain = cipher.decrypt_secret(ct);
-                    *v = match plain {
-                        Ok(p) => Value::String(String::from_utf8_lossy(&p).into_owned()),
-                        Err(_) => Value::String("***".into()),
-                    };
+    // reveal=true：校验管理面会话（本端点不在 /api/v1 鉴权中间件覆盖内，手动校验）
+    let session_ok = {
+        let auth = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|t| t.to_string());
+        match auth {
+            Some(t) => {
+                let hash = dsh_core::token_hash(&t);
+                let sm = app.sm.lock().expect("sm lock");
+                match sm.get_session().ok().flatten() {
+                    Some(s) => {
+                        s.token_hash == hash && s.expires_at.map(|e| now_ms() < e).unwrap_or(true)
+                    }
+                    None => false,
                 }
             }
+            None => false,
         }
+    };
+    if q.reveal && !session_ok {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorBody {
+                code: "ERR_SESSION_EXPIRED".into(),
+                message: "reveal=true 需要管理员会话".into(),
+                detail: None,
+            }),
+        ));
+    }
+    let (version, mut groups) = {
+        let sm = app.sm.lock().expect("sm lock");
+        let snap = sm
+            .get_config(
+                &ProjectId(pid.clone()),
+                &BranchName(branch.clone()),
+                q.version,
+            )
+            .map_err(ApiError::from)?;
+        (snap.version, snap.groups)
+    };
+    apply_secret_policy(&mut groups, app.cipher.as_deref(), q.reveal);
+    if q.reveal {
+        app.audit
+            .append(
+                "config_reveal",
+                Some(pid.clone()),
+                Some(branch.clone()),
+                Some(version),
+                None,
+                serde_json::json!({ "format": q.format }),
+            )
+            .await;
     }
     let format = Format::parse(&q.format).map_err(ApiError)?;
     let body = Renderer.render(&groups, format).map_err(ApiError)?;
@@ -978,6 +1638,58 @@ async fn cluster_promote(
     Ok(Json(serde_json::json!({ "voters": voters })))
 }
 
+/// 移除节点（openapi /api/v1/cluster/remove）：voter 从投票集剔除（retain=false 一并移出成员表），
+/// learner 用 RemoveNodes 直接移除；经 change_membership 提交。
+async fn cluster_remove(
+    State(app): State<ApiState>,
+    Json(req): Json<JoinReq>,
+) -> ApiResult<serde_json::Value> {
+    use dsh_raft::openraft::ChangeMembers;
+    use std::collections::BTreeSet;
+
+    let raft = app
+        .raft
+        .as_ref()
+        .ok_or_else(|| ApiError(dsh_core::Error::not_found("cluster mode")))?;
+    let metrics = raft.metrics().borrow().clone();
+    let m = metrics.membership_config.membership();
+    let mut set = BTreeSet::new();
+    set.insert(req.node_id);
+    let voter_ids: Vec<u64> = m.voter_ids().collect();
+    let node_ids: Vec<u64> = m.nodes().map(|(id, _)| *id).collect();
+    let is_voter = voter_ids.contains(&req.node_id);
+    let is_learner = node_ids.contains(&req.node_id);
+    if !is_voter && !is_learner {
+        return Err(ApiError(dsh_core::Error::validation("node not in membership")).into());
+    }
+    let changes = if is_voter {
+        ChangeMembers::RemoveVoters(set)
+    } else {
+        ChangeMembers::RemoveNodes(set)
+    };
+    raft.change_membership(changes, false)
+        .await
+        .map_err(|e| ApiError(dsh_core::Error::internal(e.to_string())))?;
+    let voters: Vec<u64> = raft
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .voter_ids()
+        .collect();
+    app.audit
+        .append(
+            "cluster_remove",
+            None,
+            None,
+            None,
+            None,
+            serde_json::json!({ "node_id": req.node_id, "voters": voters }),
+        )
+        .await;
+    Ok(Json(serde_json::json!({ "voters": voters })))
+}
+
 // ---------------- 密钥管理（B6） ----------------
 
 #[derive(Deserialize)]
@@ -1075,8 +1787,28 @@ pub fn build_router(app: ApiState) -> Router {
         .route("/api/v1/admin/rotate-master-key", post(rotate_master_key))
         .route("/api/v1/projects", get(list_projects).post(create_project))
         .route(
+            "/api/v1/projects/{p}",
+            get(project_detail).delete(delete_project),
+        )
+        .route(
             "/api/v1/projects/{p}/branches",
             get(list_branches).post(create_branch),
+        )
+        .route(
+            "/api/v1/projects/{p}/branches/{b}",
+            get(branch_detail).delete(delete_branch),
+        )
+        .route("/api/v1/projects/{p}/diff", get(branch_diff))
+        .route("/api/v1/projects/{p}/promote", post(promote))
+        .route("/api/v1/shared", get(list_shared).post(create_shared))
+        .route(
+            "/api/v1/shared-draft",
+            get(list_shared_drafts).put(update_shared_draft),
+        )
+        .route("/api/v1/shared/publish", post(publish_shared))
+        .route(
+            "/api/v1/shared/refs",
+            get(list_refs).post(ref_bind).delete(ref_unbind),
         )
         .route(
             "/api/v1/projects/{p}/structure-draft",
@@ -1089,20 +1821,24 @@ pub fn build_router(app: ApiState) -> Router {
         .route("/api/v1/projects/{p}/branches/{b}/draft", put(update_draft))
         .route("/api/v1/projects/{p}/branches/{b}/publish", post(publish))
         .route("/api/v1/projects/{p}/branches/{b}/rollback", post(rollback))
-        .route("/api/v1/projects/{p}/branches/{b}/config", get(get_config))
+        .route(
+            "/api/v1/projects/{p}/branches/{b}/config",
+            get(admin_config),
+        )
         .route(
             "/api/v1/projects/{p}/branches/{b}/versions",
             get(version_history),
         )
-        // 数据面快照（SDK get 用；无鉴权，面向应用拉取）
-        .route("/v1/projects/{p}/branches/{b}/snapshot", get(get_config))
+        // 数据面快照（SDK get 用；无鉴权，面向应用拉取；secret 脱敏输出）
+        .route("/v1/projects/{p}/branches/{b}/snapshot", get(snapshot))
         .route("/v1/projects/{p}/branches/{b}/config", get(render_config))
         .route("/v1/projects/{p}/branches/{b}/watch", get(watch_branch));
     if app.raft.is_some() {
         router = router
             .route("/api/v1/cluster/members", get(cluster_members))
             .route("/api/v1/cluster/join", post(cluster_join))
-            .route("/api/v1/cluster/promote", post(cluster_promote));
+            .route("/api/v1/cluster/promote", post(cluster_promote))
+            .route("/api/v1/cluster/remove", post(cluster_remove));
     }
     router = router.layer(axum::middleware::from_fn_with_state(
         app.clone(),

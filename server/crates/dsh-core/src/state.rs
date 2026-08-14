@@ -981,7 +981,8 @@ impl StateMachine {
         Ok(vec![])
     }
 
-    fn read_all_shared_drafts(&self) -> Result<Vec<SharedItem>, Error> {
+    /// 管理面访问器：共享草稿列表（GET /api/v1/shared-draft）。
+    pub fn list_shared_drafts(&self) -> Result<Vec<SharedItem>, Error> {
         let rows = self.store.get_prefix(K_SHARED_DRAFT.as_bytes())?;
         let mut out = Vec::new();
         for (_, v) in rows {
@@ -995,7 +996,27 @@ impl StateMachine {
         Ok(out)
     }
 
-    fn get_shared(&self, group: &str, key: &str) -> Result<Option<SharedItem>, Error> {
+    /// 管理面访问器：已发布共享项列表（GET /api/v1/shared）。
+    pub fn list_shared_published(&self) -> Result<Vec<SharedItem>, Error> {
+        let rows = self.store.get_prefix(K_SHARED.as_bytes())?;
+        let mut out = Vec::new();
+        for (_, v) in rows {
+            if let Ok(item) = serde_json::from_slice::<SharedItem>(&v) {
+                out.push(item);
+            }
+        }
+        out.sort_by(|a, b| {
+            (a.group.as_str(), a.key.as_str()).cmp(&(b.group.as_str(), b.key.as_str()))
+        });
+        Ok(out)
+    }
+
+    /// 管理面访问器：项目引用绑定列表（GET /api/v1/shared/refs?project=）。
+    pub fn list_refs(&self, project: &ProjectId) -> Result<Vec<RefBinding>, Error> {
+        self.read_refs_of_project(project)
+    }
+
+    pub fn get_shared(&self, group: &str, key: &str) -> Result<Option<SharedItem>, Error> {
         load(&*self.store, &shared_key(group, key))
     }
 
@@ -1019,7 +1040,7 @@ impl StateMachine {
         request_id: &str,
         now_ms: i64,
     ) -> ApplyOutcome {
-        let drafts = self.read_all_shared_drafts()?;
+        let drafts = self.list_shared_drafts()?;
         if drafts.is_empty() {
             return Err(Error::new(ErrorKind::NoDraft, "no shared draft"));
         }

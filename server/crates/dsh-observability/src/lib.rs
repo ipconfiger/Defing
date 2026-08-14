@@ -105,7 +105,7 @@ pub fn is_ready(raft: Option<&RaftHandle>) -> bool {
     }
 }
 
-/// 集群成员概要（/api/v1/cluster/members 数据源）。
+/// 集群成员概要（/api/v1/cluster/members 数据源；members 数组对齐 openapi Member schema）。
 pub fn cluster_members_json(raft: Option<&RaftHandle>, node_id: Option<u64>) -> serde_json::Value {
     let raft = match raft {
         Some(r) => r,
@@ -114,14 +114,32 @@ pub fn cluster_members_json(raft: Option<&RaftHandle>, node_id: Option<u64>) -> 
                 "node_id": node_id,
                 "current_leader": null,
                 "state": "dev-single",
+                "members": [],
             })
         }
     };
     let m = raft.metrics().borrow().clone();
+    let leader = m.current_leader;
+    let voter_ids: Vec<u64> = m.membership_config.membership().voter_ids().collect();
+    let members: Vec<serde_json::Value> = m
+        .membership_config
+        .membership()
+        .nodes()
+        .map(|(id, n)| {
+            serde_json::json!({
+                "node_id": id.to_string(),
+                "grpc_addr": n.grpc_addr,
+                "http_addr": n.http_addr,
+                "is_leader": Some(*id) == leader,
+                "is_voter": voter_ids.contains(id),
+            })
+        })
+        .collect();
     serde_json::json!({
         "node_id": node_id,
-        "current_leader": m.current_leader,
+        "current_leader": leader,
         "state": format!("{:?}", m.state),
+        "members": members,
     })
 }
 
