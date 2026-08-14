@@ -291,3 +291,57 @@
 - 修复后：8 jobs 全绿（unit 74 tests / e2e 含 chaos / lint 零警告 / release+SBOM）
 
 **里程碑总览（M0–M8 全部达成）**：契约 → 单节点/集群 → 发布引擎/加密/渲染/任务 → watch/可观测/会话/UI → 三语言 SDK → 混沌/加固/发布 → 会话落Raft/审计/快照/集群watch → 模块化/gRPC → 组级引用/密钥轮换 → **CI 全量/基准/SBOM**
+
+---
+
+## ✅ 后 M8 收尾（P0–P3 补全 · 基于剩余工作清单与源码审计）
+
+> 依据 docs/remaining-work.md（M8 终态后重新审计）+ 上轮发现清单；每项实现→测试→验证闭环。
+
+### P0 —— 管理面契约补全 + secret 掩码策略 ✅
+
+- **11 个缺失 HTTP 端点**（openapi 25→37 路径）：
+  项目详情/删除（force）、分支详情/删除、分支对比 diff、值提升 promote、
+  共享库 CRUD + 发布（级联）、共享引用绑定/解绑、cluster/remove（voter RemoveVoters / learner RemoveNodes）
+- core 新增公共访问器：list_shared_published / list_shared_drafts / list_refs
+- /api/v1/cluster/members 补全成员表（对齐 openapi Member schema）
+- **P0-b 安全修复**：管理面/渲染/数据面默认掩码 secret；reveal=true 需会话+审计
+  （render 端点新增 reveal/version 参数；与 gRPC 数据面 masked 语义一致）
+- 验证：scripts/api-surface-test.sh（13 组断言全过）；cluster-demo 增 remove-node 步骤
+
+### P1 —— 三语言 SDK gRPC 客户端 + Admin UI 控制台 ✅
+
+- **gRPC 数据面客户端**（TS/Go/Python）：GetConfig/GetItem/Watch（断线 after_version 续传）/
+  ListMembers；Endpoint{grpc?,http?} 优先 gRPC，纯字符串降级 HTTP/SSE；
+  TS 用 @grpc/proto-loader 动态加载；Go/Python 提交生成 stubs（configv1/、config/）
+- scripts/sdk-grpc-contract-test.sh：三语言对同一 :8383 契约对拍；CI sdk job 接入（补 setup-go 1.22）
+- **Admin UI 管理控制台**（单文件内嵌，替代原 72 行占位页）：登录/登出、项目 CRUD、
+  结构草稿+发布、分支草稿表单编辑（含 secret）+发布、版本历史+回滚、分支对比+promote、
+  共享库 CRUD+发布+引用绑定、审计查询、SSE watch；prompt/confirm 改内嵌 modal；
+  切 tab 实时刷新。浏览器自动化全流程验证通过（含回滚 v3）
+- 移除重复的 dsh-cli/admin（实际嵌入源为 dsh-api/admin）
+
+### P2 —— CLI admin 子命令 + watch 增强 ✅
+
+- `dsh admin {gen-master-key,rotate-master-key,force-logout,set-password,promote,
+  remove-node,snapshot,retention-status}`（全局 --admin-endpoint/--admin-token/--admin-password）
+- core 新增 Command::AdminSetPassword（哈希落状态机，集群一致；login 优先校验，回退节点配置）；
+  HTTP /api/v1/admin/{force-logout,set-password,snapshot,retention-status}（鉴权+审计）
+- **watch 增强**：SSE ?after_version=N 重放历史再转实时（与 gRPC 重放一致）；
+  广播溢出（慢消费者）→ gRPC 发 snapshot_required=true 关流 / SSE 结束流（客户端续传）
+- 三语言 SDK HTTP watch 断线带 after_version 续传
+
+### P3 —— 指标/测试/stub/供应链 ✅
+
+- 指标 2→9 项：dsh_{projects,branches,versions,shared_items,shared_drafts,
+  audit_entries,session_active,master_key_ok,raft_role,raft_term,raft_committed_index}
+- 测试补全：LIM-001 限额拒绝、AdminSetPassword 落库/读取；dsh-testkit 由占位改为真实夹具库
+  （demo_structure/seed_demo_project，grpc_data_plane 集成测试接入使用）
+- 删除 dsh-cli/src/lib.rs 占位；cargo-deny（server/deny.toml 许可白名单）+ CI deny step 去 no-op 兜底
+
+### 终态指标（本机实测）
+
+- cargo test --workspace：**76 passed / 0 failed**；clippy -D warnings 零警告；fmt 干净
+- 全部 e2e 脚本通过：dev-single-demo / cluster-demo（含 remove-node）/ api-surface-test /
+  sdk-contract-test（HTTP）/ sdk-grpc-contract-test（三语言 gRPC）/ check-contracts（37 paths）
+- Admin UI 浏览器自动化全流程验证（登录→建项目→结构→草稿→发布→对比→提升→回滚→共享→审计）

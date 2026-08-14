@@ -40,3 +40,5 @@ sdk/ts/node_modules/
 .ab-evidence/
 .ab-home/
 .agent-browser/
+
+.cargo-target/
