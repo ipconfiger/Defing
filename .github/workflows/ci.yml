@@ -99,6 +99,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
       - name: cache cargo
         uses: actions/cache@v4
         with:
@@ -109,10 +112,14 @@ jobs:
       - name: build dsh
         working-directory: server
         run: cargo build -p dsh-cli
-      - name: sdk contract test
+      - name: sdk contract test (HTTP/SSE)
         env:
           BIN: ${{ github.workspace }}/server/target/debug/dsh
         run: ./scripts/sdk-contract-test.sh
+      - name: sdk contract test (gRPC 数据面)
+        env:
+          BIN: ${{ github.workspace }}/server/target/debug/dsh
+        run: ./scripts/sdk-grpc-contract-test.sh
 
   # stage 7: 多进程 e2e（dev-single / 3 节点集群 / 混沌）
   e2e:

@@ -30,11 +30,15 @@ dsh --node-id 3 --join http://127.0.0.1:8384 --http-addr 127.0.0.1:8388 --raft-a
 
 ```ts
 import { ConfigClient } from './sdk/ts/src/index.ts';
-const c = new ConfigClient(['http://127.0.0.1:8384']);
-const snap = await c.get('my-app', 'dev');          // 读活动版本
-c.watch('my-app', 'dev', (e) => console.log(e));    // 订阅发布事件
+const c = new ConfigClient([{ grpc: '127.0.0.1:8383', http: 'http://127.0.0.1:8384' }]);
+const snap = await c.get('my-app', 'dev');          // 读活动版本（gRPC 数据面）
+c.watch('my-app', 'dev', (e) => console.log(e));    // 订阅发布事件（gRPC 流，断线 after_version 续传）
+await c.listMembers();                              // 集群成员（端点池刷新）
 ```
-Go：`sdk/go`（`configclient.New(endpoints)`）；Python：`sdk/python`（`ConfigClient(endpoints)`）。
+Go：`sdk/go`（`configclient.NewGrpc(addr, token)` / `New(endpoints)` HTTP 降级）；
+Python：`sdk/python`（`ConfigClient([{'grpc': ..., 'http': ...}])`）。
+端点带 `grpc` 地址时优先走 gRPC 数据面（:8383），纯字符串端点自动降级 HTTP/SSE；
+gRPC 契约测试：`bash scripts/sdk-grpc-contract-test.sh`（依赖：npm install、pip install grpcio、go mod tidy）。
 
 ## 核心能力
 

@@ -28,6 +28,17 @@ type WatchEvent struct {
 	Comment          string   `json:"comment"`
 	RequestID        string   `json:"request_id"`
 	Changes          []Change `json:"changes"`
+	SnapshotRequired bool     `json:"snapshot_required,omitempty"`
+}
+
+// Member — 集群成员（gRPC ListMembers）。
+type Member struct {
+	NodeID         string
+	GrpcAddr       string
+	HTTPAddr       string
+	IsLeader       bool
+	IsVoter        bool
+	CommittedIndex int64
 }
 
 type Snapshot struct {
