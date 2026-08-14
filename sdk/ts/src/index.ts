@@ -3,8 +3,6 @@
 // 数据面双通道：端点可带 grpc 地址（design §3.1 Endpoint{grpc?,http?}）→ 走 gRPC（:8383）；
 // 纯字符串端点 → HTTP/SSE（降级通道）。两通道 API 形状一致。
 
-import { GrpcConfigClient } from './grpc.ts';
-
 export interface Change {
   group: string;
   key: string;
@@ -57,19 +55,39 @@ export interface ConfigClientOptions {
   token?: string;
 }
 
+type GrpcClientLike = {
+  getConfig(project: string, branch: string, version?: number): Promise<any>;
+  getItem(project: string, branch: string, group: string, key: string, version?: number): Promise<unknown | undefined>;
+  listMembers(): Promise<any[]>;
+  watch(project: string, branch: string, listener: (e: any) => void, signal?: AbortSignal): void;
+  close(): void;
+};
+
 export class ConfigClient {
   private endpoints: Endpoint[];
-  private grpc: GrpcConfigClient | null = null;
+  private grpc: GrpcClientLike | null = null;
+  private grpcReady: Promise<GrpcClientLike | null> | null = null;
   private token?: string;
 
   constructor(endpoints: Endpoint[], opts?: ConfigClientOptions) {
     this.endpoints = endpoints;
     this.token = opts?.token;
-    // 优先首个端点的 gRPC 地址（design §3.1）
-    const ep = endpoints[0];
+  }
+
+  /** 懒加载 gRPC 客户端：仅当端点带 grpc 地址时动态 import（HTTP-only/浏览器零依赖）。 */
+  private ensureGrpc(): Promise<GrpcClientLike | null> {
+    if (this.grpc) return Promise.resolve(this.grpc);
+    if (this.grpcReady) return this.grpcReady;
+    const ep = this.endpoints[0];
     if (ep && typeof ep === 'object' && ep.grpc) {
-      this.grpc = new GrpcConfigClient({ grpc: ep.grpc, token: opts?.token });
+      this.grpcReady = import('./grpc.ts').then((m) => {
+        this.grpc = new m.GrpcConfigClient({ grpc: ep.grpc, token: this.token }) as GrpcClientLike;
+        return this.grpc;
+      });
+    } else {
+      this.grpcReady = Promise.resolve(null);
     }
+    return this.grpcReady;
   }
 
   private httpEndpoint(ep: Endpoint): string {
@@ -102,9 +120,10 @@ export class ConfigClient {
   }
 
   async get(project: string, branch: string, version = 0): Promise<Snapshot> {
-    if (this.grpc) {
+    const g = await this.ensureGrpc();
+    if (g) {
       try {
-        return await this.grpc.getConfig(project, branch, version);
+        return await g.getConfig(project, branch, version);
       } catch (e) {
         this.wrapGrpcErr(e);
       }
@@ -121,9 +140,10 @@ export class ConfigClient {
     key: string,
     version = 0,
   ): Promise<unknown | undefined> {
-    if (this.grpc) {
+    const g = await this.ensureGrpc();
+    if (g) {
       try {
-        return await this.grpc.getItem(project, branch, group, key, version);
+        return await g.getItem(project, branch, group, key, version);
       } catch (e) {
         this.wrapGrpcErr(e);
       }
@@ -134,9 +154,10 @@ export class ConfigClient {
 
   /** 集群成员（端点池动态刷新；仅 gRPC 通道提供）。 */
   async listMembers(): Promise<Member[]> {
-    if (this.grpc) {
+    const g = await this.ensureGrpc();
+    if (g) {
       try {
-        return await this.grpc.listMembers();
+        return await g.listMembers();
       } catch (e) {
         this.wrapGrpcErr(e);
       }
@@ -154,10 +175,23 @@ export class ConfigClient {
     listener: (e: WatchEvent) => void,
     signal?: AbortSignal,
   ): void {
-    if (this.grpc) {
-      this.grpc.watch(project, branch, listener, signal);
-      return;
-    }
+    const g = this.ensureGrpc();
+    g.then((client) => {
+      if (client) {
+        client.watch(project, branch, listener, signal);
+      } else {
+        this.watchHttp(project, branch, listener, signal);
+      }
+    });
+    return;
+  }
+
+  private watchHttp(
+    project: string,
+    branch: string,
+    listener: (e: WatchEvent) => void,
+    signal?: AbortSignal,
+  ): void {
     const path = '/v1/projects/' + project + '/branches/' + branch + '/watch';
     let lastVersion = 0;
     const connect = (attempt: number) => {
@@ -204,6 +238,6 @@ export class ConfigClient {
   }
 
   close(): void {
-    this.grpc?.close();
+    this.ensureGrpc().then((g) => g?.close());
   }
 }
