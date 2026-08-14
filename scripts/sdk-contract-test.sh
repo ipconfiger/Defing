@@ -2,6 +2,7 @@
 # M3 契约测试：三语言 SDK（TS/Go/Python）对同一 dev-single 服务：get + watch。
 set -u
 BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/dsh}
+REPO=$(cd "$(dirname "$0")/.." && pwd)
 BASE=http://127.0.0.1:8384
 PORT=8384
 PROJECT=sdk-project
@@ -49,9 +50,9 @@ run_lang() { # $1=名称 $2=命令
   fi
 }
 
-run_lang "ts"   "cd /home/alex/Projects/Defing/sdk/ts && node --experimental-strip-types test.ts"
-run_lang "go"   "export GOCACHE=/tmp/dsh-gocache && cd /home/alex/Projects/Defing/sdk/go && go run ./test"
-run_lang "py"   "cd /home/alex/Projects/Defing/sdk/python && python3 test.py"
+run_lang "ts"   "cd $REPO/sdk/ts && node --experimental-strip-types test.ts"
+run_lang "go"   "export GOCACHE=/tmp/dsh-gocache && cd $REPO/sdk/go && go run ./test"
+run_lang "py"   "cd $REPO/sdk/python && python3 test.py"
 
 echo
 echo "======== M3 SDK 契约测试全部通过 ========"
