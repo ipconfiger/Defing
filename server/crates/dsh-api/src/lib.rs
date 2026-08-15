@@ -1393,7 +1393,7 @@ async fn admin_config(
                 Some(version),
                 None,
                 serde_json::json!({}),
-                "admin",
+                &principal_op(&principal),
             )
             .await;
     }
@@ -1436,6 +1436,7 @@ async fn create_project_admin(
     AxumPath(pid): AxumPath<String>,
     Json(req): Json<ProjectAdminCreateReq>,
 ) -> Result<(StatusCode, Json<ProjectAdminResp>), (StatusCode, Json<ApiErrorBody>)> {
+    let now = now_ms();
     let (salt, hash) = salted_password_hash(&req.password);
     let cmd = Command::ProjectAdminCreate {
         project: ProjectId(pid.clone()),
@@ -1443,7 +1444,7 @@ async fn create_project_admin(
         salt,
         password_hash: hash,
     };
-    match app.write(&cmd, now_ms()).await {
+    match app.write(&cmd, now).await {
         Ok(_) => {
             app.audit
                 .append(
@@ -1456,18 +1457,13 @@ async fn create_project_admin(
                     "admin",
                 )
                 .await;
-            let sm = app.sm.lock().expect("sm lock");
-            let acct = sm
-                .get_project_admin(&req.username)
-                .ok()
-                .flatten()
-                .expect("just created");
+            // 响应用请求值构造（集群模式下 write 返回与本地 apply 读回存在竞态，禁 expect）
             Ok((
                 StatusCode::CREATED,
                 Json(ProjectAdminResp {
-                    username: acct.username,
-                    project: acct.project.0,
-                    created_at: acct.created_at,
+                    username: req.username,
+                    project: pid.clone(),
+                    created_at: now,
                 }),
             ))
         }
@@ -1743,7 +1739,10 @@ async fn render_config(
                 Some(version),
                 None,
                 serde_json::json!({ "format": q.format }),
-                "admin",
+                &principal
+                    .as_ref()
+                    .map(|p| principal_op(p))
+                    .unwrap_or_else(|_| "admin".to_string()),
             )
             .await;
     }
@@ -1952,13 +1951,13 @@ async fn pa_login(
         let sm = app.sm.lock().expect("sm lock");
         sm.get_project_admin(&username).ok().flatten()
     };
-    let ok = match &account {
-        Some(acct) => {
+    let ok = account
+        .as_ref()
+        .map(|acct| {
             let salted = format!("{}{}", acct.salt, req.password);
             dsh_core::token_hash(&salted) == acct.password_hash
-        }
-        None => false,
-    };
+        })
+        .unwrap_or(false);
     if !ok {
         app.audit
             .append(
@@ -1980,7 +1979,7 @@ async fn pa_login(
             }),
         ));
     }
-    let project = account.expect("checked above").project.0.clone();
+    let project = account.map(|a| a.project.0).unwrap_or_default();
     let operator = format!("pa:{username}");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut retried_expired = false;
@@ -2239,17 +2238,14 @@ async fn audit_list(
     axum::extract::Query(q): axum::extract::Query<AuditQuery>,
 ) -> ApiResult<serde_json::Value> {
     let sm = app.sm.lock().expect("sm lock");
-    let entries = sm
-        .get_audit(q.action.as_deref(), q.since, q.limit)
-        .map_err(ApiError::from)?;
-    // PA 强制过滤为自己项目（§4：无 query 绕过面；project=None 的全局条目对 PA 不可见）
-    let entries = match principal.0 {
-        dsh_core::Principal::Admin => entries,
-        dsh_core::Principal::ProjectAdmin { project, .. } => entries
-            .into_iter()
-            .filter(|e| e.project.as_deref() == Some(project.0.as_str()))
-            .collect(),
+    // PA 强制下推 project 过滤到状态机（§4 + R2：先截断后过滤会让 PA 视图被全局条目冲空）
+    let project_filter = match principal.0 {
+        dsh_core::Principal::Admin => None,
+        dsh_core::Principal::ProjectAdmin { project, .. } => Some(project.0),
     };
+    let entries = sm
+        .get_audit(q.action.as_deref(), project_filter.as_deref(), q.since, q.limit)
+        .map_err(ApiError::from)?;
     Ok(Json(serde_json::to_value(entries).expect("serialize")))
 }
 
@@ -2554,7 +2550,7 @@ async fn admin_retention_status(State(app): State<ApiState>) -> ApiResult<serde_
             }
         }
         let audits = sm
-            .get_audit(None, None, 1)
+            .get_audit(None, None, None, 1)
             .map(|v| v.first().map(|e| e.seq).unwrap_or(0))
             .unwrap_or(0);
         (projects, versions, audits)

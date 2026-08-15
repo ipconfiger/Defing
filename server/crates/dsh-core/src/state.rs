@@ -123,6 +123,7 @@ impl StateMachine {
     pub fn get_audit(
         &self,
         action: Option<&str>,
+        project: Option<&str>,
         since: Option<i64>,
         limit: usize,
     ) -> Result<Vec<AuditEntry>, Error> {
@@ -140,6 +141,11 @@ impl StateMachine {
             if let Ok(e) = serde_json::from_slice::<AuditEntry>(&v) {
                 if let Some(a) = action {
                     if e.action != a {
+                        continue;
+                    }
+                }
+                if let Some(p) = project {
+                    if e.project.as_deref() != Some(p) {
                         continue;
                     }
                 }
@@ -656,7 +662,7 @@ impl StateMachine {
         id: &ProjectId,
         base_version: u64,
         groups: &[GroupDef],
-        operator: &str,
+        _operator: &str,
     ) -> ApplyOutcome {
         let structure = self
             .get_structure(id)?
@@ -784,7 +790,7 @@ impl StateMachine {
         updates: &[crate::command::DraftUpdateItem],
         deletes: &[(String, String)],
         now_ms: i64,
-        operator: &str,
+        _operator: &str,
     ) -> ApplyOutcome {
         let mut st = self
             .get_branch_state(id, branch)?

@@ -807,23 +807,23 @@ fn audit_append_seq_monotonic_and_queryable() {
     s.apply(&audit_cmd("publish", 3000), 3).unwrap();
 
     // 全量（新 → 旧）
-    let all = s.get_audit(None, None, 100).unwrap();
+    let all = s.get_audit(None, None, None, 100).unwrap();
     assert_eq!(all.len(), 3);
     assert_eq!(all[0].seq, 3);
     assert_eq!(all[0].action, "publish");
     assert_eq!(all[2].seq, 1);
 
     // action 过滤
-    let pubs = s.get_audit(Some("publish"), None, 100).unwrap();
+    let pubs = s.get_audit(Some("publish"), None, None, 100).unwrap();
     assert_eq!(pubs.len(), 2);
     assert!(pubs.iter().all(|e| e.action == "publish"));
 
     // since 过滤（ts ≥ since）
-    let recent = s.get_audit(None, Some(1500), 100).unwrap();
+    let recent = s.get_audit(None, None, Some(1500), 100).unwrap();
     assert_eq!(recent.len(), 2);
 
     // limit 截断
-    let limited = s.get_audit(None, None, 2).unwrap();
+    let limited = s.get_audit(None, None, None, 2).unwrap();
     assert_eq!(limited.len(), 2);
     assert_eq!(limited[0].seq, 3);
 }
@@ -837,7 +837,7 @@ fn audit_persists_and_prunes() {
     // 保留最近 2 条
     let removed = s.prune_audit(2).unwrap();
     assert_eq!(removed, 3);
-    let all = s.get_audit(None, None, 100).unwrap();
+    let all = s.get_audit(None, None, None, 100).unwrap();
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].seq, 5);
     assert_eq!(all[1].seq, 4);
@@ -854,7 +854,7 @@ fn audit_seq_counter_survives_restore() {
     let mut s2 = StateMachine::new(Box::new(InMemoryStore::new()));
     s2.restore_all(&pairs).unwrap();
     s2.apply(&audit_cmd("logout", 2), 2).unwrap();
-    let all = s2.get_audit(None, None, 100).unwrap();
+    let all = s2.get_audit(None, None, None, 100).unwrap();
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].seq, 2);
 }

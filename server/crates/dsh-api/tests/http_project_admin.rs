@@ -289,6 +289,16 @@ async fn reveal_b2_regression() {
     // PA reveal 自己项目 → 200（无 secret 则正常输出）
     let (c, _) = req(&s.base, "GET", "/v1/projects/p1/branches/dev/config?reveal=true", Some(&pa), None).await;
     assert_eq!(c, 200);
+    // R1 回归：reveal 审计 operator 应为 pa:alice（不是 admin）
+    let (c, b) = req(&s.base, "GET", "/api/v1/audit?limit=10", Some(&pa), None).await;
+    assert_eq!(c, 200);
+    assert!(
+        b.as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "config_reveal" && e["operator"] == "pa:alice"),
+        "reveal 审计 operator 须为 pa:alice: {b}"
+    );
     // PA reveal 其他项目 → 403（B2 修复前是 200 越权）
     let (c, b) = req(&s.base, "GET", "/v1/projects/p2/branches/dev/config?reveal=true", Some(&pa), None).await;
     assert_eq!(c, 403, "B2 regression: {b}");
@@ -380,4 +390,45 @@ async fn admin_account_management_endpoints() {
     // 禁用名 admin
     let (c, _) = req(&s.base, "POST", "/api/v1/projects/p1/admins", Some(&admin), Some(serde_json::json!({"username": "admin", "password": "x"}))).await;
     assert!(c == 400 || c == 422, "禁用名 admin 应被拒绝: {c}");
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_session_relogin_and_heartbeat_ttl() {
+    let s = start().await;
+    let admin = admin_login(&s.base).await;
+    let _ = admin;
+
+    // 登录 → 登出 → 重登（N13 序列的登出半路径）
+    let (_, b1) = pa_login(&s.base, "alice", "alicepw").await;
+    let t1 = b1["token"].as_str().unwrap().to_string();
+    let (c, _) = req(&s.base, "POST", "/api/v1/logout", Some(&t1), None).await;
+    assert_eq!(c, 204);
+    let (c, b2) = pa_login(&s.base, "alice", "alicepw").await;
+    assert_eq!(c, 200, "登出后可重登");
+    let t2 = b2["token"].as_str().unwrap().to_string();
+
+    // heartbeat 返回续期后的 expires_at（B7：非 no-op）
+    let (c, _) = req(&s.base, "POST", "/api/v1/heartbeat", None, None).await; // 无 token → 401
+    assert_eq!(c, 401);
+    let (c, _) = req(&s.base, "POST", "/api/v1/heartbeat", Some(&t1), None).await; // 旧 token 已登出 → 401
+    assert_eq!(c, 401);
+    let (c, hb) = req(&s.base, "POST", "/api/v1/heartbeat", Some(&t2), None).await; // 新 token 续期 → 200
+    assert_eq!(c, 200, "heartbeat: {hb}");
+    assert!(hb["expires_at"].is_i64(), "heartbeat 应返回续期时间: {hb}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_login_single_session() {
+    let s = start().await;
+    // 并发两路登录同一账号（N13：最坏一路 409，恰一会话成立）
+    let (r1, r2) = tokio::join!(
+        pa_login(&s.base, "alice", "alicepw"),
+        pa_login(&s.base, "alice", "alicepw"),
+    );
+    let codes = [r1.0, r2.0];
+    let ok = codes.iter().filter(|&&c| c == 200).count();
+    let conflict = codes.iter().filter(|&&c| c == 409).count();
+    assert_eq!(ok, 1, "并发登录恰一成功: {codes:?}");
+    assert_eq!(conflict, 1, "另一路 409: {codes:?}");
 }

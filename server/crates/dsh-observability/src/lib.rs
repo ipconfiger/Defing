@@ -122,7 +122,7 @@ pub fn metrics_text(
     out.push_str(&format!("dsh_shared_drafts {drafts}\n"));
 
     let audits = guard
-        .get_audit(None, None, 1)
+        .get_audit(None, None, None, 1)
         .map(|v| v.first().map(|e| e.seq).unwrap_or(0))
         .unwrap_or(0);
     out.push_str("# HELP dsh_audit_entries 审计条目数\n");
