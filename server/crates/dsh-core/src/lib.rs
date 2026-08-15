@@ -18,9 +18,9 @@ pub use command::{Command, DraftUpdateItem};
 pub use error::{Error, ErrorKind};
 pub use model::{
     AdminSession, AuditEntry, BranchName, BranchState, ChangeKind, Ciphertext, DiffEntry,
-    DraftValue, EventType, GroupDef, ItemDef, Project, ProjectId, PublishEvent, RefBinding,
-    SharedItem, SnapshotMap, Structure, StructureDraft, Value, ValueType, VersionKind,
-    VersionRecord,
+    DraftValue, EventType, GroupDef, ItemDef, Principal, Project, ProjectAdminAccount, ProjectId,
+    PublishEvent, RefBinding, SharedItem, SnapshotMap, Structure, StructureDraft, Value, ValueType,
+    VersionKind, VersionRecord,
 };
 pub use state::{token_hash, ApplyOutcome, ConfigSnapshot, StateMachine};
 pub use store::{InMemoryStore, Store};

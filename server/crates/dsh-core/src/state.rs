@@ -415,54 +415,82 @@ impl StateMachine {
 
     pub fn apply(&mut self, cmd: &Command, now_ms: i64) -> ApplyOutcome {
         match cmd {
-            Command::ProjectCreate { name } => self.apply_project_create(name, now_ms),
-            Command::ProjectDelete { id } => self.apply_project_delete(id),
+            Command::ProjectCreate { name, operator } => {
+                self.apply_project_create(name, now_ms, operator)
+            }
+            Command::ProjectDelete { id, operator } => self.apply_project_delete(id, operator),
             Command::BranchCreate {
                 project,
                 name,
                 source,
-            } => self.apply_branch_create(project, name, source.as_ref(), now_ms),
-            Command::BranchDelete { project, name } => self.apply_branch_delete(project, name),
+                operator,
+            } => self.apply_branch_create(project, name, source.as_ref(), now_ms, operator),
+            Command::BranchDelete {
+                project,
+                name,
+                operator,
+            } => self.apply_branch_delete(project, name, operator),
             Command::StructureDraftSet {
                 project,
                 base_version,
                 groups,
-            } => self.apply_structure_draft_set(project, *base_version, groups),
+                operator,
+            } => self.apply_structure_draft_set(project, *base_version, groups, operator),
             Command::PublishStructure {
                 project,
                 comment,
                 request_id,
-            } => self.apply_publish_structure(project, comment, request_id, now_ms),
+                operator,
+            } => self.apply_publish_structure(project, comment, request_id, now_ms, operator),
             Command::DraftUpdate {
                 project,
                 branch,
                 updates,
                 deletes,
-            } => self.apply_draft_update(project, branch, updates, deletes, now_ms),
+                operator,
+            } => self.apply_draft_update(project, branch, updates, deletes, now_ms, operator),
             Command::Publish {
                 project,
                 branch,
                 comment,
                 request_id,
-            } => self.apply_publish(project, branch, comment, request_id, now_ms),
+                operator,
+            } => self.apply_publish(project, branch, comment, request_id, now_ms, operator),
             Command::Rollback {
                 project,
                 branch,
                 to_version,
                 comment,
                 request_id,
-            } => self.apply_rollback(project, branch, *to_version, comment, request_id, now_ms),
-            Command::SharedDraftUpdate { item } => self.apply_shared_draft_update(item),
+                operator,
+            } => self.apply_rollback(
+                project,
+                branch,
+                *to_version,
+                comment,
+                request_id,
+                now_ms,
+                operator,
+            ),
+            Command::SharedDraftUpdate { item, operator } => {
+                self.apply_shared_draft_update(item, operator)
+            }
             Command::SharedPublish {
                 comment,
                 request_id,
-            } => self.apply_shared_publish(comment, request_id, now_ms),
-            Command::RefBind { project, binding } => self.apply_ref_bind(project, binding),
+                operator,
+            } => self.apply_shared_publish(comment, request_id, now_ms, operator),
+            Command::RefBind {
+                project,
+                binding,
+                operator,
+            } => self.apply_ref_bind(project, binding, operator),
             Command::RefUnbind {
                 project,
                 group,
                 item_key,
-            } => self.apply_ref_unbind(project, group, item_key.as_deref()),
+                operator,
+            } => self.apply_ref_unbind(project, group, item_key.as_deref(), operator),
             Command::SessionLogin {
                 token_hash,
                 issued_at,
@@ -470,6 +498,29 @@ impl StateMachine {
             } => self.apply_session_login(token_hash, *issued_at, *expires_at),
             Command::SessionLogout => self.apply_session_logout(),
             Command::SessionHeartbeat { expires_at } => self.apply_session_heartbeat(*expires_at),
+            Command::ProjectAdminCreate {
+                project,
+                username,
+                salt,
+                password_hash,
+            } => self.apply_project_admin_create(project, username, salt, password_hash, now_ms),
+            Command::ProjectAdminDelete { username } => self.apply_project_admin_delete(username),
+            Command::ProjectAdminSetPassword {
+                username,
+                salt,
+                password_hash,
+            } => self.apply_project_admin_set_password(username, salt, password_hash),
+            Command::PaSessionLogin {
+                username,
+                token_hash,
+                issued_at,
+                expires_at,
+                device_id,
+            } => self.apply_pa_session_login(username, token_hash, *issued_at, *expires_at, device_id),
+            Command::PaSessionLogout { username } => self.apply_pa_session_logout(username),
+            Command::PaSessionHeartbeat { username, expires_at } => {
+                self.apply_pa_session_heartbeat(username, *expires_at)
+            }
             Command::AdminSetPassword { password_hash } => {
                 self.apply_admin_set_password(password_hash)
             }
@@ -477,7 +528,7 @@ impl StateMachine {
         }
     }
 
-    fn apply_project_create(&mut self, name: &str, now_ms: i64) -> ApplyOutcome {
+    fn apply_project_create(&mut self, name: &str, now_ms: i64, _operator: &str) -> ApplyOutcome {
         if !valid_name(name) {
             return Err(Error::validation(format!("invalid project name: {name:?}")));
         }
@@ -507,7 +558,7 @@ impl StateMachine {
         Ok(vec![])
     }
 
-    fn apply_project_delete(&mut self, id: &ProjectId) -> ApplyOutcome {
+    fn apply_project_delete(&mut self, id: &ProjectId, _operator: &str) -> ApplyOutcome {
         let project = self
             .get_project(id)?
             .ok_or_else(|| Error::not_found(format!("project {id}")))?;
@@ -516,6 +567,13 @@ impl StateMachine {
             self.store.delete(&k)?;
         }
         self.store.delete(idx_pname(&project.name).as_bytes())?;
+        // 级联删除该项目全部项目管理员账号及其会话（设计 §5）
+        for acct in self.list_project_admins(&id.0)? {
+            self.store
+                .delete(pa_session_key(&acct.username).as_bytes())?;
+            self.store
+                .delete(project_admin_key(&acct.username).as_bytes())?;
+        }
         Ok(vec![])
     }
 
@@ -525,6 +583,7 @@ impl StateMachine {
         name: &BranchName,
         source: Option<&BranchName>,
         now_ms: i64,
+        _operator: &str,
     ) -> ApplyOutcome {
         if !valid_branch(name.as_str()) {
             return Err(Error::validation(format!("invalid branch name: {name:?}")));
@@ -576,7 +635,7 @@ impl StateMachine {
         Ok(vec![])
     }
 
-    fn apply_branch_delete(&mut self, id: &ProjectId, name: &BranchName) -> ApplyOutcome {
+    fn apply_branch_delete(&mut self, id: &ProjectId, name: &BranchName, _operator: &str) -> ApplyOutcome {
         let st = self
             .get_branch_state(id, name)?
             .ok_or_else(|| Error::not_found(format!("branch {name} of {id}")))?;
@@ -597,6 +656,7 @@ impl StateMachine {
         id: &ProjectId,
         base_version: u64,
         groups: &[GroupDef],
+        operator: &str,
     ) -> ApplyOutcome {
         let structure = self
             .get_structure(id)?
@@ -631,6 +691,7 @@ impl StateMachine {
         comment: &str,
         request_id: &str,
         now_ms: i64,
+        operator: &str,
     ) -> ApplyOutcome {
         let structure = self
             .get_structure(id)?
@@ -672,7 +733,7 @@ impl StateMachine {
                 no: vno,
                 structure_version: new_structure.version,
                 created_at: now_ms,
-                operator: "admin".into(),
+                operator: Self::operator_id(operator),
                 comment: comment.to_string(),
                 rollback_of: None,
                 kind: VersionKind::Full,
@@ -723,6 +784,7 @@ impl StateMachine {
         updates: &[crate::command::DraftUpdateItem],
         deletes: &[(String, String)],
         now_ms: i64,
+        operator: &str,
     ) -> ApplyOutcome {
         let mut st = self
             .get_branch_state(id, branch)?
@@ -794,6 +856,7 @@ impl StateMachine {
         comment: &str,
         request_id: &str,
         now_ms: i64,
+        operator: &str,
     ) -> ApplyOutcome {
         let mut st = self
             .get_branch_state(id, branch)?
@@ -878,7 +941,7 @@ impl StateMachine {
             no: vno,
             structure_version: structure.version,
             created_at: now_ms,
-            operator: "admin".into(),
+            operator: Self::operator_id(operator),
             comment: comment.to_string(),
             rollback_of: None,
             kind: VersionKind::Full,
@@ -914,6 +977,7 @@ impl StateMachine {
         comment: &str,
         request_id: &str,
         now_ms: i64,
+        operator: &str,
     ) -> ApplyOutcome {
         let mut st = self
             .get_branch_state(project, branch)?
@@ -940,7 +1004,7 @@ impl StateMachine {
             no: vno,
             structure_version: st.structure_version,
             created_at: now_ms,
-            operator: "admin".into(),
+            operator: Self::operator_id(operator),
             comment: comment.to_string(),
             rollback_of: Some(to_version),
             kind: VersionKind::Full,
@@ -966,7 +1030,7 @@ impl StateMachine {
 
     // ---------------- 共享库（R6） ----------------
 
-    fn apply_shared_draft_update(&mut self, item: &SharedItem) -> ApplyOutcome {
+    fn apply_shared_draft_update(&mut self, item: &SharedItem, _operator: &str) -> ApplyOutcome {
         if item.group.is_empty() || item.key.is_empty() {
             return Err(Error::validation("shared item group/key required"));
         }
@@ -1042,6 +1106,7 @@ impl StateMachine {
         comment: &str,
         request_id: &str,
         now_ms: i64,
+        operator: &str,
     ) -> ApplyOutcome {
         let drafts = self.list_shared_drafts()?;
         if drafts.is_empty() {
@@ -1192,7 +1257,7 @@ impl StateMachine {
         Ok(())
     }
 
-    fn apply_ref_bind(&mut self, project: &ProjectId, binding: &RefBinding) -> ApplyOutcome {
+    fn apply_ref_bind(&mut self, project: &ProjectId, binding: &RefBinding, _operator: &str) -> ApplyOutcome {
         let structure = self
             .get_structure(project)?
             .ok_or_else(|| Error::not_found(format!("project {project}")))?;
@@ -1283,6 +1348,7 @@ impl StateMachine {
         project: &ProjectId,
         group: &str,
         item_key: Option<&str>,
+        operator: &str,
     ) -> ApplyOutcome {
         match item_key {
             Some(key) => {
@@ -1327,6 +1393,15 @@ impl StateMachine {
 
     // ---------------- 会话（I7 单管理员；状态机内强制） ----------------
 
+    /// 命令 operator 的落库值：空串（旧客户端/全局管理员）→ "admin"。
+    fn operator_id(operator: &str) -> String {
+        if operator.is_empty() {
+            "admin".to_string()
+        } else {
+            operator.to_string()
+        }
+    }
+
     fn apply_session_login(
         &mut self,
         token_hash: &str,
@@ -1341,6 +1416,7 @@ impl StateMachine {
             issued_at,
             expires_at,
             device_id: "cli".into(),
+            principal: Principal::Admin,
         };
         save(&*self.store, session_key(), &session)?;
         Ok(vec![])
@@ -1361,6 +1437,152 @@ impl StateMachine {
     }
 
     /// 设置管理员密码哈希（set-password；集群一致，登录时优先于节点配置）。
+
+    // ---------------- 项目管理员（Project Admin）----------------
+    // 设计文档 docs/design/project-admin.md §3.1/§6。
+    // 会话判定只看 is_some()，不读墙钟（D16 确定性）。
+
+    fn valid_pa_username(name: &str) -> bool {
+        !name.is_empty()
+            && name != "admin"
+            && name.len() <= 64
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            && name.len() >= 2
+    }
+
+    fn apply_project_admin_create(
+        &mut self,
+        project: &ProjectId,
+        username: &str,
+        salt: &str,
+        password_hash: &str,
+        now_ms: i64,
+    ) -> ApplyOutcome {
+        if !Self::valid_pa_username(username) {
+            return Err(Error::new(
+                ErrorKind::Validation,
+                "用户名须为 2-64 位 [A-Za-z0-9_-] 且不可为 admin",
+            ));
+        }
+        if load::<Project>(&*self.store, &project_key(project))?.is_none() {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                &format!("项目 {project} 不存在"),
+            ));
+        }
+        let key = project_admin_key(username);
+        if load::<ProjectAdminAccount>(&*self.store, &key)?.is_some() {
+            return Err(Error::new(ErrorKind::Conflict, "账号已存在"));
+        }
+        let acct = ProjectAdminAccount {
+            username: username.to_string(),
+            project: project.clone(),
+            salt: salt.to_string(),
+            password_hash: password_hash.to_string(),
+            created_at: now_ms,
+        };
+        save(&*self.store, &key, &acct)?;
+        Ok(vec![])
+    }
+
+    fn apply_project_admin_delete(&mut self, username: &str) -> ApplyOutcome {
+        let key = project_admin_key(username);
+        if load::<ProjectAdminAccount>(&*self.store, &key)?.is_none() {
+            return Err(Error::new(ErrorKind::NotFound, "账号不存在"));
+        }
+        self.store.delete(pa_session_key(username).as_bytes())?;
+        self.store.delete(key.as_bytes())?;
+        Ok(vec![])
+    }
+
+    fn apply_project_admin_set_password(
+        &mut self,
+        username: &str,
+        salt: &str,
+        password_hash: &str,
+    ) -> ApplyOutcome {
+        let key = project_admin_key(username);
+        let Some(mut acct) = load::<ProjectAdminAccount>(&*self.store, &key)? else {
+            return Err(Error::new(ErrorKind::NotFound, "账号不存在"));
+        };
+        acct.salt = salt.to_string();
+        acct.password_hash = password_hash.to_string();
+        save(&*self.store, &key, &acct)?;
+        // 改密即时收回会话（权限立即生效）
+        self.store.delete(pa_session_key(username).as_bytes())?;
+        Ok(vec![])
+    }
+
+    fn apply_pa_session_login(
+        &mut self,
+        username: &str,
+        token_hash: &str,
+        issued_at: i64,
+        expires_at: Option<i64>,
+        device_id: &str,
+    ) -> ApplyOutcome {
+        let key = pa_session_key(username);
+        if load::<AdminSession>(&*self.store, &key)?.is_some() {
+            return Err(Error::new(ErrorKind::SessionInUse, "该账号已有会话在线"));
+        }
+        let Some(acct) = load::<ProjectAdminAccount>(&*self.store, &project_admin_key(username))? else {
+            return Err(Error::new(ErrorKind::NotFound, "账号不存在"));
+        };
+        let session = AdminSession {
+            token_hash: token_hash.to_string(),
+            issued_at,
+            expires_at,
+            device_id: device_id.to_string(),
+            principal: Principal::ProjectAdmin {
+                username: username.to_string(),
+                project: acct.project.clone(),
+            },
+        };
+        save(&*self.store, &key, &session)?;
+        Ok(vec![])
+    }
+
+    fn apply_pa_session_logout(&mut self, username: &str) -> ApplyOutcome {
+        self.store.delete(pa_session_key(username).as_bytes())?;
+        Ok(vec![])
+    }
+
+    fn apply_pa_session_heartbeat(&mut self, username: &str, expires_at: Option<i64>) -> ApplyOutcome {
+        let key = pa_session_key(username);
+        let Some(mut session) = load::<AdminSession>(&*self.store, &key)? else {
+            return Err(Error::new(ErrorKind::SessionExpired, "会话不存在"));
+        };
+        session.expires_at = expires_at;
+        save(&*self.store, &key, &session)?;
+        Ok(vec![])
+    }
+
+    /// 读取项目管理员账号。
+    pub fn get_project_admin(&self, username: &str) -> Result<Option<ProjectAdminAccount>, Error> {
+        load(&*self.store, &project_admin_key(username))
+    }
+
+    /// 列出项目全部项目管理员账号（扫 adm/pa/ 前缀过滤，O(账号数)）。
+    pub fn list_project_admins(&self, project: &str) -> Result<Vec<ProjectAdminAccount>, Error> {
+        let mut out = vec![];
+        for (_, raw) in self.store.get_prefix(K_PA_ACCOUNT.as_bytes())? {
+            if let Ok(acct) = serde_json::from_slice::<ProjectAdminAccount>(&raw) {
+                if acct.project.0 == project {
+                    out.push(acct);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.username.cmp(&b.username));
+        Ok(out)
+    }
+
+    /// 读取项目管理员会话。
+    pub fn get_pa_session(&self, username: &str) -> Result<Option<AdminSession>, Error> {
+        load(&*self.store, &pa_session_key(username))
+    }
+
     fn apply_admin_set_password(&mut self, password_hash: &str) -> ApplyOutcome {
         save(&*self.store, K_ADMIN_PW, &password_hash.to_string())?;
         Ok(vec![])

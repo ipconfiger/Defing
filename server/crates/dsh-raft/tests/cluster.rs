@@ -133,6 +133,8 @@ async fn three_node_bootstrap_join_failover() {
         &leader_raft,
         Command::ProjectCreate {
             name: "order-service".into(),
+        
+            operator: String::new(),
         },
         Duration::from_secs(10),
     )
@@ -180,6 +182,8 @@ async fn three_node_bootstrap_join_failover() {
             project: "order-service".into(),
             base_version: 1,
             groups: groups.clone(),
+        
+            operator: String::new(),
         },
         Duration::from_secs(10),
     )
@@ -192,6 +196,8 @@ async fn three_node_bootstrap_join_failover() {
             project: "order-service".into(),
             comment: "init".into(),
             request_id: "s1".into(),
+        
+            operator: String::new(),
         },
         Duration::from_secs(10),
     )
@@ -216,7 +222,9 @@ async fn three_node_bootstrap_join_failover() {
                 },
             ],
             deletes: vec![],
-        },
+        
+                    operator: String::new(),
+                },
         Duration::from_secs(10),
     )
     .await
@@ -229,6 +237,8 @@ async fn three_node_bootstrap_join_failover() {
             branch: BranchName("dev".into()),
             comment: "dev".into(),
             request_id: "r1".into(),
+        
+            operator: String::new(),
         },
         Duration::from_secs(10),
     )
@@ -268,6 +278,8 @@ async fn three_node_bootstrap_join_failover() {
         &leader_raft,
         Command::ProjectCreate {
             name: "svc-b".into(),
+        
+            operator: String::new(),
         },
         Duration::from_secs(10),
     )
@@ -420,6 +432,8 @@ async fn cluster_watch_events_reach_subscribers() {
         &n1.raft,
         Command::ProjectCreate {
             name: "watch-proj".into(),
+        
+            operator: String::new(),
         },
         Duration::from_secs(10),
     )
@@ -442,6 +456,8 @@ async fn cluster_watch_events_reach_subscribers() {
             project: "watch-proj".into(),
             base_version: 1,
             groups,
+        
+            operator: String::new(),
         },
         Duration::from_secs(10),
     )
@@ -454,6 +470,8 @@ async fn cluster_watch_events_reach_subscribers() {
             project: "watch-proj".into(),
             comment: "init".into(),
             request_id: "ws1".into(),
+        
+            operator: String::new(),
         },
         Duration::from_secs(10),
     )

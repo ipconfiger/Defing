@@ -57,6 +57,8 @@ pub fn seed_demo_project(
     g.apply(
         &Command::ProjectCreate {
             name: project.into(),
+        
+            operator: String::new(),
         },
         1,
     )?;
@@ -65,6 +67,8 @@ pub fn seed_demo_project(
             project: pid.clone(),
             base_version: 1,
             groups: demo_structure(),
+        
+            operator: String::new(),
         },
         2,
     )?;
@@ -73,6 +77,8 @@ pub fn seed_demo_project(
             project: pid.clone(),
             comment: "init structure".into(),
             request_id: "s1".into(),
+        
+            operator: String::new(),
         },
         3,
     )?;
@@ -93,7 +99,9 @@ pub fn seed_demo_project(
                 },
             ],
             deletes: vec![],
-        },
+        
+                    operator: String::new(),
+                },
         4,
     )?;
     g.apply(
@@ -102,6 +110,8 @@ pub fn seed_demo_project(
             branch: dev.clone(),
             comment: "dev v2".into(),
             request_id: "r1".into(),
+        
+            operator: String::new(),
         },
         5,
     )?;

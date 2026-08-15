@@ -41,7 +41,8 @@ fn setup(s: &mut StateMachine) -> (ProjectId, Vec<BranchName>) {
     assert!(s
         .apply(
             &Command::ProjectCreate {
-                name: "order-service".into()
+                name: "order-service".into(),
+                operator: String::new(),
             },
             1
         )
@@ -56,7 +57,8 @@ fn setup(s: &mut StateMachine) -> (ProjectId, Vec<BranchName>) {
             &Command::StructureDraftSet {
                 project: pid.clone(),
                 base_version: 1,
-                groups: redis_structure()
+                groups: redis_structure(),
+                operator: String::new(),
             },
             2,
         )
@@ -67,6 +69,7 @@ fn setup(s: &mut StateMachine) -> (ProjectId, Vec<BranchName>) {
                 project: pid.clone(),
                 comment: "init".into(),
                 request_id: "s1".into(),
+                operator: String::new(),
             },
             3,
         )
@@ -99,6 +102,7 @@ fn full_flow_dev_publish() {
                     },
                 ],
                 deletes: vec![],
+                operator: String::new(),
             },
             4,
         )
@@ -117,6 +121,7 @@ fn full_flow_dev_publish() {
                 branch: BranchName("dev".into()),
                 comment: "dev host".into(),
                 request_id: "r1".into(),
+                operator: String::new(),
             },
             5,
         )
@@ -156,7 +161,9 @@ fn publish_is_idempotent_by_request_id() {
                 value: Value::String("x".into()),
             }],
             deletes: vec![],
-        },
+        
+                operator: String::new(),
+            },
         4,
     )
     .unwrap();
@@ -165,7 +172,9 @@ fn publish_is_idempotent_by_request_id() {
         branch: b.clone(),
         comment: "c".into(),
         request_id: "r9".into(),
-    };
+    
+                operator: String::new(),
+            };
     let first = s.apply(&cmd, 5).unwrap();
     assert_eq!(first.len(), 1);
     // 同 request_id 重放 → 不重复生效（I10）
@@ -190,7 +199,9 @@ fn required_unset_blocks_publish() {
                 value: Value::Int(6379),
             }],
             deletes: vec![],
-        },
+        
+                operator: String::new(),
+            },
         4,
     )
     .unwrap();
@@ -201,6 +212,7 @@ fn required_unset_blocks_publish() {
                 branch: b.clone(),
                 comment: "c".into(),
                 request_id: "r2".into(),
+                operator: String::new(),
             },
             5,
         )
@@ -221,6 +233,7 @@ fn no_draft_publish_errors() {
                 branch: BranchName("test".into()),
                 comment: "c".into(),
                 request_id: "r3".into(),
+                operator: String::new(),
             },
             5,
         )
@@ -243,7 +256,9 @@ fn branch_inherits_structure_and_values() {
                 value: Value::String("10.0.0.1".into()),
             }],
             deletes: vec![],
-        },
+        
+                operator: String::new(),
+            },
         4,
     )
     .unwrap();
@@ -253,7 +268,9 @@ fn branch_inherits_structure_and_values() {
             branch: BranchName("dev".into()),
             comment: "c".into(),
             request_id: "r4".into(),
-        },
+        
+                operator: String::new(),
+            },
         5,
     )
     .unwrap();
@@ -263,7 +280,8 @@ fn branch_inherits_structure_and_values() {
             &Command::BranchCreate {
                 project: pid.clone(),
                 name: "gray".into(),
-                source: Some(BranchName("dev".into()))
+                source: Some(BranchName("dev".into())),
+                operator: String::new(),
             },
             6
         )
@@ -295,6 +313,7 @@ fn draft_update_validates_unknown_item_and_type() {
                     value: Value::String("x".into()),
                 }],
                 deletes: vec![],
+                operator: String::new(),
             },
             4,
         )
@@ -312,6 +331,7 @@ fn draft_update_validates_unknown_item_and_type() {
                     value: Value::String("abc".into()),
                 }],
                 deletes: vec![],
+                operator: String::new(),
             },
             4,
         )
@@ -322,10 +342,14 @@ fn draft_update_validates_unknown_item_and_type() {
 #[test]
 fn duplicate_project_conflicts() {
     let mut s = sm();
-    s.apply(&Command::ProjectCreate { name: "p1".into() }, 1)
+    s.apply(&Command::ProjectCreate { name: "p1".into(),
+                operator: String::new(),
+            }, 1)
         .unwrap();
     let err = s
-        .apply(&Command::ProjectCreate { name: "p1".into() }, 2)
+        .apply(&Command::ProjectCreate { name: "p1".into(),
+                operator: String::new(),
+            }, 2)
         .unwrap_err();
     assert_eq!(err.kind, ErrorKind::Conflict);
 }
@@ -334,7 +358,9 @@ fn duplicate_project_conflicts() {
 fn project_delete_removes_everything() {
     let mut s = sm();
     let (pid, _) = setup(&mut s);
-    s.apply(&Command::ProjectDelete { id: pid.clone() }, 10)
+    s.apply(&Command::ProjectDelete { id: pid.clone(),
+                operator: String::new(),
+            }, 10)
         .unwrap();
     assert!(s.get_project(&pid).unwrap().is_none());
     assert!(s.list_projects().unwrap().is_empty());
@@ -352,6 +378,7 @@ fn branch_delete_guards_published() {
             &Command::BranchDelete {
                 project: pid.clone(),
                 name: BranchName("test".into()),
+                operator: String::new(),
             },
             5,
         )
@@ -377,7 +404,9 @@ fn rollback_creates_new_version_with_old_content() {
                 value: Value::String("10.0.0.9".into()),
             }],
             deletes: vec![],
-        },
+        
+                operator: String::new(),
+            },
         4,
     )
     .unwrap();
@@ -387,7 +416,9 @@ fn rollback_creates_new_version_with_old_content() {
             branch: b.clone(),
             comment: "v2".into(),
             request_id: "r1".into(),
-        },
+        
+                operator: String::new(),
+            },
         5,
     )
     .unwrap();
@@ -402,6 +433,7 @@ fn rollback_creates_new_version_with_old_content() {
                 to_version: 1,
                 comment: "rollback".into(),
                 request_id: "rb1".into(),
+                operator: String::new(),
             },
             6,
         )
@@ -428,6 +460,7 @@ fn rollback_creates_new_version_with_old_content() {
                 to_version: 1,
                 comment: "x".into(),
                 request_id: "rb1".into(),
+                operator: String::new(),
             },
             7,
         )
@@ -449,6 +482,7 @@ fn rollback_invalid_version_rejected() {
                 to_version: 1,
                 comment: "x".into(),
                 request_id: "r".into(),
+                operator: String::new(),
             },
             5,
         )
@@ -462,6 +496,7 @@ fn rollback_invalid_version_rejected() {
                 to_version: 99,
                 comment: "x".into(),
                 request_id: "r".into(),
+                operator: String::new(),
             },
             5,
         )
@@ -483,7 +518,9 @@ fn publish_shared(s: &mut StateMachine, group: &str, key: &str, value: Value, re
                 value,
                 version: 0,
             },
-        },
+        
+                operator: String::new(),
+            },
         10,
     )
     .unwrap();
@@ -491,7 +528,9 @@ fn publish_shared(s: &mut StateMachine, group: &str, key: &str, value: Value, re
         &Command::SharedPublish {
             comment: "shared".into(),
             request_id: request_id.into(),
-        },
+        
+                operator: String::new(),
+            },
         11,
     )
     .unwrap();
@@ -554,7 +593,9 @@ fn shared_cascade_updates_referencing_branches() {
                     }],
                 },
             ],
-        },
+        
+                operator: String::new(),
+            },
         12,
     )
     .unwrap();
@@ -563,7 +604,9 @@ fn shared_cascade_updates_referencing_branches() {
             project: pid.clone(),
             comment: "add db".into(),
             request_id: "s2".into(),
-        },
+        
+                operator: String::new(),
+            },
         13,
     )
     .unwrap();
@@ -578,7 +621,9 @@ fn shared_cascade_updates_referencing_branches() {
                 shared_group: "infra".into(),
                 shared_key: "db_host".into(),
             },
-        },
+        
+                operator: String::new(),
+            },
         14,
     )
     .unwrap();
@@ -594,7 +639,9 @@ fn shared_cascade_updates_referencing_branches() {
                 value: Value::String("127.0.0.1".into()),
             }],
             deletes: vec![],
-        },
+        
+                operator: String::new(),
+            },
         15,
     )
     .unwrap();
@@ -609,7 +656,9 @@ fn shared_cascade_updates_referencing_branches() {
             branch: BranchName("dev".into()),
             comment: "dev".into(),
             request_id: "r1".into(),
-        },
+        
+                operator: String::new(),
+            },
         16,
     )
     .unwrap();
@@ -657,6 +706,7 @@ fn ref_requires_published_shared() {
                     shared_group: "infra".into(),
                     shared_key: "nope".into(),
                 },
+                operator: String::new(),
             },
             12,
         )
@@ -840,6 +890,7 @@ fn group_ref_bind_requires_matching_shared_item() {
                     shared_group: "infra".into(),
                     shared_key: "redis".into(),
                 },
+                operator: String::new(),
             },
             20,
         )
@@ -861,7 +912,9 @@ fn group_ref_materializes_matching_items_at_publish() {
                 shared_group: "infra".into(),
                 shared_key: "redis".into(),
             },
-        },
+        
+                operator: String::new(),
+            },
         30,
     )
     .unwrap();
@@ -876,7 +929,9 @@ fn group_ref_materializes_matching_items_at_publish() {
                 value: Value::String("local-host".into()),
             }],
             deletes: vec![],
-        },
+        
+                operator: String::new(),
+            },
         31,
     )
     .unwrap();
@@ -886,7 +941,9 @@ fn group_ref_materializes_matching_items_at_publish() {
             branch: BranchName("dev".into()),
             comment: "g1".into(),
             request_id: "gr1".into(),
-        },
+        
+                operator: String::new(),
+            },
         32,
     )
     .unwrap();
@@ -919,7 +976,9 @@ fn group_ref_cascade_on_shared_publish() {
                 shared_group: "infra".into(),
                 shared_key: "redis".into(),
             },
-        },
+        
+                operator: String::new(),
+            },
         40,
     )
     .unwrap();
@@ -956,7 +1015,9 @@ fn group_ref_unbind_stops_materialization() {
                 shared_group: "infra".into(),
                 shared_key: "redis".into(),
             },
-        },
+        
+                operator: String::new(),
+            },
         50,
     )
     .unwrap();
@@ -965,7 +1026,9 @@ fn group_ref_unbind_stops_materialization() {
             project: pid.clone(),
             group: "redis".into(),
             item_key: None,
-        },
+        
+                operator: String::new(),
+            },
         51,
     )
     .unwrap();
@@ -980,7 +1043,9 @@ fn group_ref_unbind_stops_materialization() {
                 value: Value::String("h".into()),
             }],
             deletes: vec![],
-        },
+        
+                operator: String::new(),
+            },
         52,
     )
     .unwrap();
@@ -990,7 +1055,9 @@ fn group_ref_unbind_stops_materialization() {
             branch: BranchName("dev".into()),
             comment: "g2".into(),
             request_id: "gr2".into(),
-        },
+        
+                operator: String::new(),
+            },
         53,
     )
     .unwrap();
@@ -1031,7 +1098,9 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
                 value: fake_ct(1),
                 version: 0,
             },
-        },
+        
+                operator: String::new(),
+            },
         60,
     )
     .unwrap();
@@ -1039,7 +1108,9 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
         &Command::SharedPublish {
             comment: "c".into(),
             request_id: "rw1".into(),
-        },
+        
+                operator: String::new(),
+            },
         61,
     )
     .unwrap();
@@ -1061,7 +1132,9 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
                 },
             ],
             deletes: vec![],
-        },
+        
+                operator: String::new(),
+            },
         62,
     )
     .unwrap();
@@ -1071,7 +1144,9 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
             branch: BranchName("dev".into()),
             comment: "c".into(),
             request_id: "rw2".into(),
-        },
+        
+                operator: String::new(),
+            },
         63,
     )
     .unwrap();
@@ -1119,7 +1194,9 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
                 value: fake_ct(1),
             }],
             deletes: vec![],
-        },
+        
+                operator: String::new(),
+            },
         64,
     )
     .unwrap();
@@ -1164,7 +1241,9 @@ fn shared_item_over_limit_rejected() {
         version: 0,
     };
     let err = s
-        .apply(&dsh_core::command::Command::SharedDraftUpdate { item }, 1)
+        .apply(&dsh_core::command::Command::SharedDraftUpdate { item,
+                operator: String::new(),
+            }, 1)
         .unwrap_err();
     assert_eq!(
         err.kind,

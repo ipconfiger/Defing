@@ -369,7 +369,9 @@ async fn create_project(
     Json(req): Json<CreateProjectReq>,
 ) -> ApiResult<serde_json::Value> {
     let pid = ProjectId(req.name.clone());
-    app.write(&Command::ProjectCreate { name: req.name }, now_ms())
+    app.write(&Command::ProjectCreate { name: req.name 
+                operator: String::new(),
+            }, now_ms())
         .await?;
     app.audit
         .append(
@@ -429,6 +431,8 @@ async fn create_branch(
             project: ProjectId(pid.clone()),
             name: BranchName(req.name.clone()),
             source,
+        
+            operator: String::new(),
         },
         now_ms(),
     )
@@ -474,6 +478,8 @@ async fn set_structure_draft(
             project: ProjectId(pid.clone()),
             base_version: req.base_version,
             groups: req.groups,
+        
+            operator: String::new(),
         },
         now_ms(),
     )
@@ -663,7 +669,9 @@ async fn delete_project(
         ));
     }
     let pid_obj = ProjectId(pid.clone());
-    app.write(&Command::ProjectDelete { id: pid_obj }, now_ms())
+    app.write(&Command::ProjectDelete { id: pid_obj 
+                operator: String::new(),
+            }, now_ms())
         .await
         .map_err(Into::<(StatusCode, Json<ApiErrorBody>)>::into)?;
     app.audit
@@ -722,6 +730,8 @@ async fn delete_branch(
         &Command::BranchDelete {
             project: ProjectId(pid.clone()),
             name: BranchName(branch.clone()),
+        
+            operator: String::new(),
         },
         now_ms(),
     )
@@ -956,7 +966,9 @@ async fn write_shared_draft(
         value,
         version: 0,
     };
-    app.write(&Command::SharedDraftUpdate { item }, now_ms())
+    app.write(&Command::SharedDraftUpdate { item 
+                operator: String::new(),
+            }, now_ms())
         .await
         .map_err(Into::<(StatusCode, Json<ApiErrorBody>)>::into)?;
     app.audit
@@ -1026,6 +1038,8 @@ async fn publish_shared(
             &Command::SharedPublish {
                 comment: req.comment,
                 request_id: rid.clone(),
+            
+                operator: String::new(),
             },
             now_ms(),
         )
@@ -1105,6 +1119,8 @@ async fn ref_bind(
         &Command::RefBind {
             project: ProjectId(req.project.clone()),
             binding,
+        
+            operator: String::new(),
         },
         now_ms(),
     )
@@ -1133,6 +1149,8 @@ async fn ref_unbind(
             project: ProjectId(req.project.clone()),
             group: req.group.clone(),
             item_key: req.item_key.clone(),
+        
+            operator: String::new(),
         },
         now_ms(),
     )

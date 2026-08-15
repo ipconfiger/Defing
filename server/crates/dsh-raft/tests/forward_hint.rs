@@ -60,7 +60,9 @@ async fn learner_forward_hint() {
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     // learner 上 client_write → ForwardToLeader 且携带 leader 的 http_addr（login 转发依赖此契约）
-    let r = try_client_write(&raft2, Command::ProjectCreate { name: "x".into() }).await;
+    let r = try_client_write(&raft2, Command::ProjectCreate { name: "x".into() 
+                operator: String::new(),
+            }).await;
     match r {
         Err(WriteError::ForwardToLeader {
             leader_id: Some(1),

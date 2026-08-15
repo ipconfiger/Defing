@@ -33,7 +33,9 @@ async fn snapshot_persists_across_restart() {
         let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(rocks))));
         sm.lock()
             .unwrap()
-            .apply(&Command::ProjectCreate { name: "p".into() }, 1)
+            .apply(&Command::ProjectCreate { name: "p".into() 
+                operator: String::new(),
+            }, 1)
             .unwrap();
         let mut sm_store = StateMachineStore::new(sm.clone(), db.clone());
         let mut builder = sm_store.get_snapshot_builder().await;

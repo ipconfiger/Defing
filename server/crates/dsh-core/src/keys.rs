@@ -21,6 +21,10 @@ pub const K_IDX_PNAME: &str = "idx/pname/";
 pub const K_IDX_REF: &str = "idx/ref/";
 /// 组级引用反查索引：idx/refg/{shared_group}/{project}/{group} → "1"
 pub const K_IDX_REFG: &str = "idx/refg/";
+/// 项目管理员账号前缀：adm/pa/{username} → ProjectAdminAccount。
+pub const K_PA_ACCOUNT: &str = "adm/pa/";
+/// 项目管理员会话前缀：sess/pa/{username} → AdminSession（每账号单会话）。
+pub const K_PA_SESSION: &str = "sess/pa/";
 
 pub fn project_key(id: &ProjectId) -> String {
     format!("{K_PROJECT}{}", id.as_str())
@@ -74,6 +78,14 @@ pub fn shared_draft_key(group: &str, key: &str) -> String {
 }
 pub fn session_key() -> &'static str {
     K_SESSION
+}
+/// 项目管理员账号键：adm/pa/{username}。
+pub fn project_admin_key(username: &str) -> String {
+    format!("{K_PA_ACCOUNT}{username}")
+}
+/// 项目管理员会话键：sess/pa/{username}。
+pub fn pa_session_key(username: &str) -> String {
+    format!("{K_PA_SESSION}{username}")
 }
 pub fn audit_key(seq: u64) -> String {
     format!("{K_AUDIT}{seq:020}")

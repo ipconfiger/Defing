@@ -157,7 +157,9 @@ mod tests {
     #[test]
     fn retention_keeps_active_and_recent() {
         let mut sm = StateMachine::new(Box::new(InMemoryStore::new()));
-        sm.apply(&Command::ProjectCreate { name: "p".into() }, 1)
+        sm.apply(&Command::ProjectCreate { name: "p".into(),
+                operator: String::new(),
+            }, 1)
             .unwrap();
         sm.apply(
             &Command::StructureDraftSet {
@@ -173,7 +175,9 @@ mod tests {
                         validate: None,
                     }],
                 }],
-            },
+            
+                        operator: String::new(),
+                    },
             2,
         )
         .unwrap();
@@ -182,6 +186,8 @@ mod tests {
                 project: "p".into(),
                 comment: "s".into(),
                 request_id: "s1".into(),
+            
+                operator: String::new(),
             },
             3,
         )
@@ -198,7 +204,9 @@ mod tests {
                         value: dsh_core::model::Value::String(format!("v{i}")),
                     }],
                     deletes: vec![],
-                },
+                
+                        operator: String::new(),
+                    },
                 10 + i,
             )
             .unwrap();
@@ -208,6 +216,8 @@ mod tests {
                     branch: BranchName("dev".into()),
                     comment: "c".into(),
                     request_id: format!("r{i}"),
+                
+                    operator: String::new(),
                 },
                 20 + i,
             )
@@ -247,7 +257,9 @@ mod rewrap_tests {
     fn rewrap_job_bumps_generation_and_keeps_data() {
         let cipher = Arc::new(Cipher::new([1u8; 32]));
         let mut sm = StateMachine::new(Box::new(InMemoryStore::new()));
-        sm.apply(&Command::ProjectCreate { name: "p".into() }, 1)
+        sm.apply(&Command::ProjectCreate { name: "p".into(),
+                operator: String::new(),
+            }, 1)
             .unwrap();
         sm.apply(
             &Command::StructureDraftSet {
@@ -272,7 +284,9 @@ mod rewrap_tests {
                         },
                     ],
                 }],
-            },
+            
+                            operator: String::new(),
+                        },
             2,
         )
         .unwrap();
@@ -281,6 +295,8 @@ mod rewrap_tests {
                 project: "p".into(),
                 comment: "s".into(),
                 request_id: "s1".into(),
+            
+                operator: String::new(),
             },
             3,
         )
@@ -303,7 +319,9 @@ mod rewrap_tests {
                     },
                 ],
                 deletes: vec![],
-            },
+            
+                        operator: String::new(),
+                    },
             4,
         )
         .unwrap();
@@ -313,6 +331,8 @@ mod rewrap_tests {
                 branch: BranchName("dev".into()),
                 comment: "v".into(),
                 request_id: "r1".into(),
+            
+                operator: String::new(),
             },
             5,
         )
@@ -329,7 +349,9 @@ mod rewrap_tests {
                     value: Value::Secret(cipher.encrypt_secret(b"shared-job").unwrap()),
                     version: 0,
                 },
-            },
+            
+                    operator: String::new(),
+                },
             6,
         )
         .unwrap();
@@ -337,6 +359,8 @@ mod rewrap_tests {
             &Command::SharedPublish {
                 comment: "c".into(),
                 request_id: "sp".into(),
+            
+                operator: String::new(),
             },
             7,
         )

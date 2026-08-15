@@ -342,7 +342,37 @@ pub struct RefBinding {
     pub shared_key: String,
 }
 
-/// 管理员会话（I7 单会话强制；状态机内只存 token 哈希，明文令牌不落库/不落日志）。
+/// 会话主体（区分全局管理员与项目管理员；旧数据无此字段 → Admin）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind")]
+pub enum Principal {
+    /// 全局管理员。
+    #[default]
+    Admin,
+    /// 项目管理员：仅管理 `project` 的配置，不能触碰共享面/全局面。
+    ProjectAdmin {
+        username: String,
+        project: ProjectId,
+    },
+}
+
+/// 项目管理员账号（设计文档 docs/design/project-admin.md §2）。
+/// 密码 = SHA-256(salt || password) 加盐哈希；明文与哈希均不出现在日志。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectAdminAccount {
+    /// 全局唯一，[A-Za-z0-9_-]{2,64}，禁用 "admin"。
+    pub username: String,
+    /// 所属项目（创建时必须存在）。
+    pub project: ProjectId,
+    /// 每账号随机盐（hex）。
+    pub salt: String,
+    /// SHA-256(salt || password) hex。
+    pub password_hash: String,
+    /// 创建时间（墙钟 ms，API 层注入）。
+    pub created_at: i64,
+}
+
+/// 管理员会话（每主体单会话；状态机内只存 token 哈希，明文令牌不落库/不落日志）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdminSession {
     /// SHA-256(token) hex。
@@ -353,6 +383,9 @@ pub struct AdminSession {
     pub expires_at: Option<i64>,
     /// 设备标识（MVP 固定 "cli"）。
     pub device_id: String,
+    /// 会话主体（旧数据缺省 = 全局管理员）。
+    #[serde(default)]
+    pub principal: Principal,
 }
 
 /// 审计条目（落库 audit/{seq:020}；对齐 schema/storage.v1.schema.json 的 AuditEntry）。
