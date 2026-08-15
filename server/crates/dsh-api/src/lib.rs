@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, Sse};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
 use dsh_core::command::{Command, DraftUpdateItem};
@@ -312,13 +312,118 @@ async fn security_headers(
     resp
 }
 
-/// 管理面鉴权中间件（单管理员会话；除 login/healthz/readyz 外均需 Bearer）。
+/// 会话主体解析结果（中间件与 render_config 共用，N15：禁止第三份解析实现）。
+fn resolve_principal(
+    app: &ApiState,
+    auth_header: Option<&str>,
+) -> Result<dsh_core::Principal, ()> {
+    let token = auth_header
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(())?;
+    let hash = dsh_core::token_hash(token);
+    let sm = app.sm.lock().expect("sm lock");
+    // token 前缀路由（§3）：pa.{username}.{secret} → sess/pa/{username}；
+    // adm.{secret} 或无前缀（旧格式 fallback）→ sess/admin。
+    let (principal, session) = if let Some(rest) = token.strip_prefix("pa.") {
+        let username = rest.split('.').next().unwrap_or("");
+        let session = sm.get_pa_session(username).ok().flatten();
+        (
+            dsh_core::Principal::ProjectAdmin {
+                username: username.to_string(),
+                project: dsh_core::ProjectId(String::new()),
+            },
+            session,
+        )
+    } else {
+        (
+            dsh_core::Principal::Admin,
+            sm.get_session().ok().flatten(),
+        )
+    };
+    match session {
+        Some(s) => {
+            let hash_ok = s.token_hash == hash;
+            let not_expired = s.expires_at.map(|e| now_ms() < e).unwrap_or(true);
+            if !(hash_ok && not_expired) {
+                return Err(());
+            }
+            // 以状态机中存储的 principal 为准（PA 的 project 归属不可由 token 伪造）
+            Ok(s.principal)
+        }
+        None => Err(()),
+    }
+}
+
+/// 从未解码 path 提取 /api/v1/projects/{p}/... 的 {p} 段（N2：URL 编码/大写/特殊字符
+/// 不通过 valid_name → None → 对 PA 默认拒绝）。
+fn project_segment(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/api/v1/projects/")?;
+    let seg = rest.split('/').next()?;
+    if !seg.is_empty() && seg.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        Some(seg.to_string())
+    } else {
+        None
+    }
+}
+
+/// 项目管理员授权矩阵（§4：默认拒绝、显式放行）。
+/// 返回 true=放行。全局管理员永远放行（调用方判断）。
+fn pa_allowed(principal: &dsh_core::Principal, method: &str, path: &str) -> bool {
+    let dsh_core::Principal::ProjectAdmin { project, .. } = principal else {
+        return true; // 全局管理员
+    };
+    let pid = &project.0;
+
+    // 自身会话（显式放行，防锁死 B5）
+    if (method == "POST" && path == "/api/v1/logout")
+        || (method == "POST" && path == "/api/v1/heartbeat")
+    {
+        return true;
+    }
+    // 读项目列表（handler 内过滤为自己项目）
+    if method == "GET" && path == "/api/v1/projects" {
+        return true;
+    }
+    // 审计（handler 内强制过滤 project）
+    if method == "GET" && path == "/api/v1/audit" {
+        return true;
+    }
+    // 共享引用只读（handler 内强制覆写 project，N11）
+    if method == "GET" && path == "/api/v1/shared/refs" {
+        return true;
+    }
+    // 项目本地端点：/api/v1/projects/{p}/... 且 p == 自己项目
+    if let Some(p) = project_segment(path) {
+        if &p != pid {
+            return false; // 跨项目
+        }
+        // PA 账号管理端点（全局面）拒绝
+        if path
+            .strip_prefix(&format!("/api/v1/projects/{pid}"))
+            .is_some_and(|r| r.starts_with("/admins"))
+        {
+            return false;
+        }
+        // 项目面操作拒绝：删除/创建项目本身（即使 {p}==自己项目也不许自毁/建新项目）
+        if method == "DELETE" && path == format!("/api/v1/projects/{pid}") {
+            return false;
+        }
+        // 其余项目本地端点全部放行（结构/值/分支/版本/对比/promote/diff/config/reveal）
+        return true;
+    }
+    // 非项目路径：默认拒绝（共享写、集群、全局 admin、账号等）
+    false
+}
+
+/// 管理面鉴权中间件（全局管理员 + 项目管理员双主体；除 login/healthz/readyz 外均需 Bearer）。
 async fn auth_middleware(
     State(app): State<ApiState>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, (StatusCode, Json<ApiErrorBody>)> {
     let path = req.uri().path().to_string();
+    let method = req.method().as_str().to_string();
     // cluster/join 是节点加入前的引导调用（尚无管理员会话），豁免鉴权
     if path == "/api/v1/login"
         || path == "/healthz"
@@ -332,34 +437,32 @@ async fn auth_middleware(
             .headers()
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
             .map(|t| t.to_string());
-        let ok = match auth {
-            Some(t) => {
-                // 校验状态机会话（跨节点唯一，I7）：token 哈希匹配 + 未过期
-                let hash = dsh_core::token_hash(&t);
-                let sm = app.sm.lock().expect("sm lock");
-                match sm.get_session().ok().flatten() {
-                    Some(s) => {
-                        let hash_ok = s.token_hash == hash;
-                        let not_expired = s.expires_at.map(|e| now_ms() < e).unwrap_or(true);
-                        hash_ok && not_expired
-                    }
-                    None => false,
-                }
+        let principal = match resolve_principal(&app, auth.as_deref()) {
+            Ok(p) => p,
+            Err(_) => {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(ApiErrorBody {
+                        code: "ERR_SESSION_EXPIRED".into(),
+                        message: "需要管理员会话".into(),
+                        detail: None,
+                    }),
+                ));
             }
-            None => false,
         };
-        if !ok {
+        // 授权矩阵：项目管理员默认拒绝、显式放行（§4）
+        if !pa_allowed(&principal, &method, &path) {
             return Err((
-                StatusCode::UNAUTHORIZED,
+                StatusCode::FORBIDDEN,
                 Json(ApiErrorBody {
-                    code: "ERR_SESSION_EXPIRED".into(),
-                    message: "需要管理员会话".into(),
+                    code: "ERR_FORBIDDEN".into(),
+                    message: "项目管理员无权访问该资源".into(),
                     detail: None,
                 }),
             ));
         }
+        req.extensions_mut().insert(principal);
     }
     Ok(next.run(req).await)
 }
@@ -369,8 +472,9 @@ async fn create_project(
     Json(req): Json<CreateProjectReq>,
 ) -> ApiResult<serde_json::Value> {
     let pid = ProjectId(req.name.clone());
-    app.write(&Command::ProjectCreate { name: req.name 
-                operator: String::new(),
+    app.write(&Command::ProjectCreate {
+                name: req.name.clone(),
+                operator: "admin".to_string(),
             }, now_ms())
         .await?;
     app.audit
@@ -381,6 +485,7 @@ async fn create_project(
             None,
             None,
             serde_json::json!({}),
+            "admin",
         )
         .await;
     Ok(Json(
@@ -388,14 +493,21 @@ async fn create_project(
     ))
 }
 
-async fn list_projects(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
+async fn list_projects(
+    State(app): State<ApiState>,
+    principal: axum::Extension<dsh_core::Principal>,
+) -> ApiResult<serde_json::Value> {
     let sm = app.sm.lock().expect("sm lock");
-    let projects = sm
+    let mut projects = sm
         .list_projects()
         .map_err(ApiError::from)?
         .into_iter()
         .map(|p| serde_json::json!({ "id": p.id.as_str(), "name": p.name }))
         .collect::<Vec<_>>();
+    // PA 只能看到自己项目（§4：handler 层过滤）
+    if let dsh_core::Principal::ProjectAdmin { project, .. } = principal.0 {
+        projects.retain(|p| p.get("id").and_then(|i| i.as_str()) == Some(project.0.as_str()));
+    }
     Ok(Json(serde_json::json!(projects)))
 }
 
@@ -445,6 +557,7 @@ async fn create_branch(
             None,
             None,
             serde_json::json!({}),
+            "admin",
         )
         .await;
     Ok(Json(
@@ -469,6 +582,7 @@ async fn get_structure_draft(
 }
 
 async fn set_structure_draft(
+    principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
     AxumPath(pid): AxumPath<String>,
     Json(req): Json<StructureDraftReq>,
@@ -492,12 +606,14 @@ async fn set_structure_draft(
             None,
             None,
             serde_json::json!({ "kind": "structure-draft" }),
+            "admin",
         )
         .await;
     Ok(Json(serde_json::json!({ "saved": true, "project": pid })))
 }
 
 async fn publish_structure(
+    principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
     AxumPath(pid): AxumPath<String>,
     Json(req): Json<PublishReq>,
@@ -505,7 +621,7 @@ async fn publish_structure(
     let rid = req.request_id.unwrap_or_else(new_request_id);
     let outcome = app
         .publish
-        .publish_structure(&ProjectId(pid.clone()), &req.comment, &rid)
+        .publish_structure(&ProjectId(pid.clone()), &req.comment, &rid, &principal_op(&principal))
         .await
         .map_err(ApiError::from)?;
     let affected = outcome
@@ -521,6 +637,7 @@ async fn publish_structure(
             None,
             Some(rid.clone()),
             serde_json::json!({ "affected_branches": affected }),
+            "admin",
         )
         .await;
     Ok(Json(
@@ -529,6 +646,7 @@ async fn publish_structure(
 }
 
 async fn update_draft(
+    principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
     AxumPath((pid, branch)): AxumPath<(String, String)>,
     Json(req): Json<DraftUpdateReq>,
@@ -546,7 +664,7 @@ async fn update_draft(
     let pid_obj = ProjectId(pid.clone());
     let branch_obj = BranchName(branch.clone());
     app.publish
-        .update_draft(&pid_obj, &branch_obj, req.updates, deletes)
+        .update_draft(&pid_obj, &branch_obj, req.updates, deletes, &principal_op(&principal))
         .await
         .map_err(ApiError::from)?;
     app.audit
@@ -557,6 +675,7 @@ async fn update_draft(
             None,
             None,
             serde_json::json!({ "updates": updates_len, "deletes": deletes_len }),
+            "admin",
         )
         .await;
     Ok(Json(
@@ -566,6 +685,7 @@ async fn update_draft(
 
 async fn publish(
     State(app): State<ApiState>,
+    principal: axum::Extension<dsh_core::Principal>,
     AxumPath((pid, branch)): AxumPath<(String, String)>,
     Json(req): Json<PublishReq>,
 ) -> ApiResult<serde_json::Value> {
@@ -577,6 +697,7 @@ async fn publish(
             &BranchName(branch.clone()),
             &req.comment,
             &rid,
+            &principal_op(&principal),
         )
         .await
         .map_err(ApiError::from)?;
@@ -588,6 +709,7 @@ async fn publish(
             Some(outcome.version),
             Some(rid.clone()),
             serde_json::json!({}),
+            "admin",
         )
         .await;
     Ok(Json(serde_json::json!({
@@ -598,6 +720,7 @@ async fn publish(
 }
 
 async fn rollback(
+    principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
     AxumPath((pid, branch)): AxumPath<(String, String)>,
     Json(req): Json<RollbackReq>,
@@ -611,6 +734,7 @@ async fn rollback(
             req.to_version,
             &req.comment,
             &rid,
+            &principal_op(&principal),
         )
         .await
         .map_err(ApiError::from)?;
@@ -622,6 +746,7 @@ async fn rollback(
             Some(new_version),
             Some(rid.clone()),
             serde_json::json!({ "to_version": req.to_version }),
+            "admin",
         )
         .await;
     Ok(Json(
@@ -669,8 +794,9 @@ async fn delete_project(
         ));
     }
     let pid_obj = ProjectId(pid.clone());
-    app.write(&Command::ProjectDelete { id: pid_obj 
-                operator: String::new(),
+    app.write(&Command::ProjectDelete {
+                id: pid_obj,
+                operator: "admin".to_string(),
             }, now_ms())
         .await
         .map_err(Into::<(StatusCode, Json<ApiErrorBody>)>::into)?;
@@ -682,6 +808,7 @@ async fn delete_project(
             None,
             None,
             serde_json::json!({}),
+            "admin",
         )
         .await;
     Ok(StatusCode::NO_CONTENT)
@@ -745,6 +872,7 @@ async fn delete_branch(
             None,
             None,
             serde_json::json!({}),
+            "admin",
         )
         .await;
     Ok(StatusCode::NO_CONTENT)
@@ -815,6 +943,7 @@ struct PromoteReq {
 /// 值提升（design-v2 §4.8）：把源分支活动版本值写入目标分支草稿（不发布）。
 /// 目标草稿已修改项默认跳过（force=true 覆盖）；items 中源分支没有的进入 missing_from。
 async fn promote(
+    principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
     AxumPath(pid): AxumPath<String>,
     Json(req): Json<PromoteReq>,
@@ -876,7 +1005,7 @@ async fn promote(
     };
     if !updates.is_empty() {
         app.publish
-            .update_draft(&pid_obj, &to_b, updates, vec![])
+            .update_draft(&pid_obj, &to_b, updates, vec![], &principal_op(&principal))
             .await
             .map_err(ApiError::from)?;
     }
@@ -893,6 +1022,7 @@ async fn promote(
                 "skipped": skipped.len(),
                 "missing_from": missing_from.len(),
             }),
+            "admin",
         )
         .await;
     Ok(Json(serde_json::json!({
@@ -966,8 +1096,9 @@ async fn write_shared_draft(
         value,
         version: 0,
     };
-    app.write(&Command::SharedDraftUpdate { item 
-                operator: String::new(),
+    app.write(&Command::SharedDraftUpdate {
+                item,
+                operator: "admin".to_string(),
             }, now_ms())
         .await
         .map_err(Into::<(StatusCode, Json<ApiErrorBody>)>::into)?;
@@ -979,6 +1110,7 @@ async fn write_shared_draft(
             None,
             None,
             serde_json::json!({ "group": req.group, "key": req.key }),
+            "admin",
         )
         .await;
     Ok(serde_json::json!({
@@ -1076,6 +1208,7 @@ async fn publish_shared(
             None,
             Some(rid.clone()),
             serde_json::json!({ "affected": affected.len() }),
+            "admin",
         )
         .await;
     Ok(Json(serde_json::json!({
@@ -1133,6 +1266,7 @@ async fn ref_bind(
             None,
             None,
             serde_json::json!({ "group": req.group, "item_key": req.item_key, "shared": format!("{}/{}", req.shared_group, req.shared_key) }),
+            "admin",
         )
         .await;
     Ok(Json(
@@ -1163,6 +1297,7 @@ async fn ref_unbind(
             None,
             None,
             serde_json::json!({ "group": req.group, "item_key": req.item_key }),
+            "admin",
         )
         .await;
     Ok(Json(
@@ -1177,8 +1312,13 @@ struct RefsQuery {
 
 async fn list_refs(
     State(app): State<ApiState>,
-    axum::extract::Query(q): axum::extract::Query<RefsQuery>,
+    principal: axum::Extension<dsh_core::Principal>,
+    axum::extract::Query(mut q): axum::extract::Query<RefsQuery>,
 ) -> ApiResult<serde_json::Value> {
+    // N11：PA 强制覆写 project 为自己项目（防跨项目绑定元数据读取）
+    if let dsh_core::Principal::ProjectAdmin { project, .. } = principal.0 {
+        q.project = project.0;
+    }
     let sm = app.sm.lock().expect("sm lock");
     let refs = sm
         .list_refs(&ProjectId(q.project))
@@ -1245,6 +1385,7 @@ async fn admin_config(
                 Some(version),
                 None,
                 serde_json::json!({}),
+                "admin",
             )
             .await;
     }
@@ -1257,8 +1398,183 @@ async fn admin_config(
     }))
 }
 
-/// SDK 数据面快照（GET /v1/projects/{p}/branches/{b}/snapshot）：纯值输出；
-/// secret 按数据面脱敏策略输出掩码（与 gRPC GetConfig masked 一致）。
+// ---------------- 项目管理员账号管理（§5，全局管理员专用；中间件已对 PA 拒绝 /admins 路径）----------------
+
+#[derive(Deserialize)]
+struct ProjectAdminCreateReq {
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct ProjectAdminResp {
+    username: String,
+    project: String,
+    created_at: i64,
+}
+
+/// 生成盐 + 加盐哈希（sha256(salt || password)，§2）。
+fn salted_password_hash(password: &str) -> (String, String) {
+    use rand::RngCore;
+    let mut salt_bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut salt_bytes);
+    let salt = salt_bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let hash = dsh_core::token_hash(&format!("{salt}{password}"));
+    (salt, hash)
+}
+
+async fn create_project_admin(
+    State(app): State<ApiState>,
+    AxumPath(pid): AxumPath<String>,
+    Json(req): Json<ProjectAdminCreateReq>,
+) -> Result<(StatusCode, Json<ProjectAdminResp>), (StatusCode, Json<ApiErrorBody>)> {
+    let (salt, hash) = salted_password_hash(&req.password);
+    let cmd = Command::ProjectAdminCreate {
+        project: ProjectId(pid.clone()),
+        username: req.username.clone(),
+        salt,
+        password_hash: hash,
+    };
+    match app.write(&cmd, now_ms()).await {
+        Ok(_) => {
+            app.audit
+                .append(
+                    "project_admin_create",
+                    Some(pid.clone()),
+                    None,
+                    None,
+                    None,
+                    serde_json::json!({"username": req.username}),
+                    "admin",
+                )
+                .await;
+            let sm = app.sm.lock().expect("sm lock");
+            let acct = sm
+                .get_project_admin(&req.username)
+                .ok()
+                .flatten()
+                .expect("just created");
+            Ok((
+                StatusCode::CREATED,
+                Json(ProjectAdminResp {
+                    username: acct.username,
+                    project: acct.project.0,
+                    created_at: acct.created_at,
+                }),
+            ))
+        }
+        Err(e) if e.0.kind == ErrorKind::Conflict => Err((
+            StatusCode::CONFLICT,
+            Json(ApiErrorBody {
+                code: "ERR_ACCOUNT_EXISTS".into(),
+                message: e.0.message.clone(),
+                detail: e.0.detail.clone(),
+            }),
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn list_project_admins(
+    State(app): State<ApiState>,
+    AxumPath(pid): AxumPath<String>,
+) -> ApiResult<serde_json::Value> {
+    let sm = app.sm.lock().expect("sm lock");
+    let accounts = sm
+        .list_project_admins(&pid)
+        .map_err(ApiError::from)?
+        .into_iter()
+        .map(|a| serde_json::json!({ "username": a.username, "created_at": a.created_at }))
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!(accounts)))
+}
+
+async fn delete_project_admin(
+    State(app): State<ApiState>,
+    AxumPath((pid, username)): AxumPath<(String, String)>,
+) -> Result<StatusCode, (StatusCode, Json<ApiErrorBody>)> {
+    match app
+        .write(
+            &Command::ProjectAdminDelete {
+                username: username.clone(),
+            },
+            now_ms(),
+        )
+        .await
+    {
+        Ok(_) => {
+            app.audit
+                .append(
+                    "project_admin_delete",
+                    Some(pid),
+                    None,
+                    None,
+                    None,
+                    serde_json::json!({"username": username}),
+                    "admin",
+                )
+                .await;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(e) if e.0.kind == ErrorKind::NotFound => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorBody {
+                code: "ERR_ACCOUNT_NOT_FOUND".into(),
+                message: e.0.message.clone(),
+                detail: e.0.detail.clone(),
+            }),
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[derive(Deserialize)]
+struct ProjectAdminSetPasswordReq {
+    password: String,
+}
+
+async fn set_project_admin_password(
+    State(app): State<ApiState>,
+    AxumPath((pid, username)): AxumPath<(String, String)>,
+    Json(req): Json<ProjectAdminSetPasswordReq>,
+) -> Result<StatusCode, (StatusCode, Json<ApiErrorBody>)> {
+    let (salt, hash) = salted_password_hash(&req.password);
+    match app
+        .write(
+            &Command::ProjectAdminSetPassword {
+                username: username.clone(),
+                salt,
+                password_hash: hash,
+            },
+            now_ms(),
+        )
+        .await
+    {
+        Ok(_) => {
+            app.audit
+                .append(
+                    "project_admin_set_password",
+                    Some(pid),
+                    None,
+                    None,
+                    None,
+                    serde_json::json!({"username": username}),
+                    "admin",
+                )
+                .await;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(e) if e.0.kind == ErrorKind::NotFound => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorBody {
+                code: "ERR_ACCOUNT_NOT_FOUND".into(),
+                message: e.0.message.clone(),
+                detail: e.0.detail.clone(),
+            }),
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
 async fn snapshot(
     State(app): State<ApiState>,
     AxumPath((pid, branch)): AxumPath<(String, String)>,
@@ -1361,38 +1677,43 @@ async fn render_config(
     axum::extract::Query(q): axum::extract::Query<RenderQuery>,
     req: axum::extract::Request,
 ) -> Result<axum::response::Response, (StatusCode, Json<ApiErrorBody>)> {
-    // reveal=true：校验管理面会话（本端点不在 /api/v1 鉴权中间件覆盖内，手动校验）
-    let session_ok = {
-        let auth = req
-            .headers()
+    // reveal=true：校验管理面会话（本端点不在 /api/v1 鉴权中间件覆盖内，手动校验）。
+    // B2 修复：走共享 resolve_principal（与中间件同一实现，N15），PA 只能 reveal 自己项目。
+    // 区分两种失败：无有效会话 → 401；已认证但越权 → 403。
+    let principal = resolve_principal(
+        &app,
+        req.headers()
             .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(|t| t.to_string());
-        match auth {
-            Some(t) => {
-                let hash = dsh_core::token_hash(&t);
-                let sm = app.sm.lock().expect("sm lock");
-                match sm.get_session().ok().flatten() {
-                    Some(s) => {
-                        s.token_hash == hash && s.expires_at.map(|e| now_ms() < e).unwrap_or(true)
-                    }
-                    None => false,
-                }
-            }
-            None => false,
-        }
+            .and_then(|v| v.to_str().ok()),
+    );
+    let session_ok = match &principal {
+        Ok(dsh_core::Principal::Admin) => true,
+        Ok(dsh_core::Principal::ProjectAdmin { project, .. }) => project.0 == pid,
+        Err(_) => false,
     };
-    if q.reveal && !session_ok {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ApiErrorBody {
-                code: "ERR_SESSION_EXPIRED".into(),
-                message: "reveal=true 需要管理员会话".into(),
-                detail: None,
-            }),
-        ));
+    if q.reveal {
+        if principal.is_err() {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ApiErrorBody {
+                    code: "ERR_SESSION_EXPIRED".into(),
+                    message: "reveal=true 需要管理员会话".into(),
+                    detail: None,
+                }),
+            ));
+        }
+        if !session_ok {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ApiErrorBody {
+                    code: "ERR_FORBIDDEN".into(),
+                    message: "项目管理员只能查看本项目的配置明文".into(),
+                    detail: None,
+                }),
+            ));
+        }
     }
+    let _ = session_ok;
     let (version, mut groups) = {
         let sm = app.sm.lock().expect("sm lock");
         let snap = sm
@@ -1414,6 +1735,7 @@ async fn render_config(
                 Some(version),
                 None,
                 serde_json::json!({ "format": q.format }),
+                "admin",
             )
             .await;
     }
@@ -1435,17 +1757,40 @@ async fn render_config(
 #[derive(Deserialize, Serialize)]
 struct LoginReq {
     password: String,
+    /// 项目管理员用户名（缺省/空 = 全局管理员，向后兼容）。
+    #[serde(default)]
+    username: Option<String>,
 }
 
 #[derive(Serialize)]
 struct LoginResp {
     token: String,
+    /// "admin" | "project_admin"（调用方感知身份）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+}
+
+/// 生成项目管理员 token：pa.{username}.{secret}（§3 token 前缀路由）。
+fn new_pa_token(username: &str) -> String {
+    format!("pa.{username}.{}", new_token())
 }
 
 async fn login(
     State(app): State<ApiState>,
     Json(req): Json<LoginReq>,
 ) -> Result<Json<LoginResp>, (StatusCode, Json<ApiErrorBody>)> {
+    // 项目管理员登录分支（§3）：username 非空 → 校验 adm/pa/{username}。
+    let pa_username = req
+        .username
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string);
+    if let Some(username) = pa_username {
+        return pa_login(app, req, username).await;
+    }
     // 密码校验：set-password 落状态机后优先；未设置时回退节点配置（--admin-password）。
     let sm_pw_ok = {
         let sm = app.sm.lock().expect("sm lock");
@@ -1455,11 +1800,23 @@ async fn login(
         }
     };
     if !sm_pw_ok {
+        app.audit
+            .append(
+                "login_failed",
+                None,
+                None,
+                None,
+                None,
+                serde_json::json!({}),
+                "admin",
+            )
+            .await;
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(ApiErrorBody {
-                code: "ERR_FORBIDDEN".into(),
-                message: "密码错误".into(),
+                // N4：登录失败统一码（与 403 ERR_FORBIDDEN 区分），文案不区分账号是否存在（防枚举）
+                code: "ERR_BAD_CREDENTIALS".into(),
+                message: "账号或密码错误".into(),
                 detail: None,
             }),
         ));
@@ -1485,9 +1842,13 @@ async fn login(
         match res {
             Ok(_) => {
                 app.audit
-                    .append("login", None, None, None, None, serde_json::json!({}))
+                    .append("login", None, None, None, None, serde_json::json!({}), "admin")
                     .await;
-                return Ok(Json(LoginResp { token }));
+                return Ok(Json(LoginResp {
+                    token,
+                    role: Some("admin".into()),
+                    project: None,
+                }));
             }
             Err(ApiError(e)) if e.kind == ErrorKind::LeaderRedirect => {
                 let hint = e.leader_hint.unwrap_or_default();
@@ -1499,11 +1860,14 @@ async fn login(
                         format!("http://{hint}")
                     };
                     let client = reqwest::Client::new();
+                    // N1：转发体透传 username（PA 登录不能在非 leader 节点被当 admin 路径）
+                    let fwd = LoginReq {
+                        password: req.password.clone(),
+                        username: req.username.clone(),
+                    };
                     match client
                         .post(format!("{base}/api/v1/login"))
-                        .json(&LoginReq {
-                            password: req.password.clone(),
-                        })
+                        .json(&fwd)
                         .send()
                         .await
                     {
@@ -1517,7 +1881,15 @@ async fn login(
                                     .and_then(|t| t.as_str())
                                     .unwrap_or_default()
                                     .to_string();
-                                return Ok(Json(LoginResp { token }));
+                                let role = body
+                                    .get("role")
+                                    .and_then(|r| r.as_str())
+                                    .map(str::to_string);
+                                let project = body
+                                    .get("project")
+                                    .and_then(|p| p.as_str())
+                                    .map(str::to_string);
+                                return Ok(Json(LoginResp { token, role, project }));
                             }
                             // 409 ERR_SESSION_IN_USE 等：原样转发 leader 的错误体
                             let code = body
@@ -1560,41 +1932,263 @@ async fn login(
     }
 }
 
+/// 项目管理员登录（§3）：加盐哈希校验 → PaSessionLogin（apply 判 SessionInUse，不读时钟）；
+/// SessionInUse 时复查会话已过期则先登出重试一轮（N13，过期重登在 API 层组合）。
+async fn pa_login(
+    app: ApiState,
+    req: LoginReq,
+    username: String,
+) -> Result<Json<LoginResp>, (StatusCode, Json<ApiErrorBody>)> {
+    // 校验账号与密码（统一 401，防枚举）
+    let account = {
+        let sm = app.sm.lock().expect("sm lock");
+        sm.get_project_admin(&username).ok().flatten()
+    };
+    let ok = match &account {
+        Some(acct) => {
+            let salted = format!("{}{}", acct.salt, req.password);
+            dsh_core::token_hash(&salted) == acct.password_hash
+        }
+        None => false,
+    };
+    if !ok {
+        app.audit
+            .append(
+                "login_failed",
+                None,
+                None,
+                None,
+                None,
+                serde_json::json!({"username": username}),
+                &format!("pa:{username}"),
+            )
+            .await;
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorBody {
+                code: "ERR_BAD_CREDENTIALS".into(),
+                message: "账号或密码错误".into(),
+                detail: None,
+            }),
+        ));
+    }
+    let project = account.expect("checked above").project.0.clone();
+    let operator = format!("pa:{username}");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut retried_expired = false;
+    loop {
+        let token = new_pa_token(&username);
+        let hash = dsh_core::token_hash(&token);
+        let ttl = app.session_ttl;
+        let now = now_ms();
+        let res = app
+            .write(
+                &Command::PaSessionLogin {
+                    username: username.clone(),
+                    token_hash: hash,
+                    issued_at: now,
+                    expires_at: (ttl.as_secs() > 0).then(|| now + ttl.as_secs() as i64),
+                    device_id: "cli".into(),
+                },
+                now,
+            )
+            .await;
+        match res {
+            Ok(_) => {
+                app.audit
+                    .append(
+                        "login",
+                        Some(project.clone()),
+                        None,
+                        None,
+                        None,
+                        serde_json::json!({"username": username}),
+                        &operator,
+                    )
+                    .await;
+                return Ok(Json(LoginResp {
+                    token,
+                    role: Some("project_admin".into()),
+                    project: Some(project),
+                }));
+            }
+            Err(ApiError(e)) if e.kind == ErrorKind::SessionInUse => {
+                // N13：已有会话已过期 → 先登出再重试一轮（仅一次）
+                let expired = {
+                    let sm = app.sm.lock().expect("sm lock");
+                    sm.get_pa_session(&username)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.expires_at)
+                        .map(|exp| now_ms() >= exp)
+                        .unwrap_or(false)
+                };
+                if expired && !retried_expired {
+                    retried_expired = true;
+                    let _ = app
+                        .write(
+                            &Command::PaSessionLogout {
+                                username: username.clone(),
+                            },
+                            now_ms(),
+                        )
+                        .await;
+                    continue;
+                }
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(ApiErrorBody {
+                        code: "ERR_SESSION_IN_USE".into(),
+                        message: "该账号已有会话在线".into(),
+                        detail: None,
+                    }),
+                ));
+            }
+            Err(ApiError(e)) if e.kind == ErrorKind::LeaderRedirect => {
+                // 非 leader：转发到 leader（透传 username）
+                let hint = e.leader_hint.unwrap_or_default();
+                if !hint.is_empty() {
+                    let base = if hint.starts_with("http://") || hint.starts_with("https://") {
+                        hint
+                    } else {
+                        format!("http://{hint}")
+                    };
+                    let client = reqwest::Client::new();
+                    let fwd = LoginReq {
+                        password: req.password.clone(),
+                        username: Some(username.clone()),
+                    };
+                    if let Ok(resp) = client
+                        .post(format!("{base}/api/v1/login"))
+                        .json(&fwd)
+                        .send()
+                        .await
+                    {
+                        let status = resp.status();
+                        let body: serde_json::Value =
+                            resp.json().await.unwrap_or(serde_json::json!({}));
+                        if status.is_success() {
+                            return Ok(Json(LoginResp {
+                                token: body
+                                    .get("token")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                role: body.get("role").and_then(|r| r.as_str()).map(str::to_string),
+                                project: body
+                                    .get("project")
+                                    .and_then(|p| p.as_str())
+                                    .map(str::to_string),
+                            }));
+                        }
+                        let code = body
+                            .get("code")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("ERR_INTERNAL")
+                            .to_string();
+                        let message = body
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("login failed")
+                            .to_string();
+                        let detail = body.get("detail").cloned();
+                        return Err((status, Json(ApiErrorBody { code, message, detail })));
+                    }
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ApiErrorBody {
+                    code: "ERR_LEADER_REDIRECT".into(),
+                    message: "login forwarding to leader timed out".into(),
+                    detail: None,
+                }),
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 async fn logout(
     State(app): State<ApiState>,
+    principal: axum::Extension<dsh_core::Principal>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiErrorBody>)> {
-    app.write(&Command::SessionLogout, now_ms()).await?;
+    let operator = principal_op(&principal);
+    match principal.0 {
+        dsh_core::Principal::Admin => {
+            app.write(&Command::SessionLogout, now_ms()).await?;
+        }
+        dsh_core::Principal::ProjectAdmin { ref username, .. } => {
+            app.write(
+                &Command::PaSessionLogout {
+                    username: username.clone(),
+                },
+                now_ms(),
+            )
+            .await?;
+        }
+    }
     app.audit
-        .append("logout", None, None, None, None, serde_json::json!({}))
+        .append("logout", None, None, None, None, serde_json::json!({}), &operator)
         .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Principal → 审计 operator 值（"admin" / "pa:{username}"）。
+fn principal_op(p: &dsh_core::Principal) -> String {
+    match p {
+        dsh_core::Principal::Admin => "admin".into(),
+        dsh_core::Principal::ProjectAdmin { username, .. } => format!("pa:{username}"),
+    }
+}
+
 async fn heartbeat(
     State(app): State<ApiState>,
+    principal: axum::Extension<dsh_core::Principal>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiErrorBody>)> {
     let ttl = app.session_ttl;
     let now = now_ms();
     let expires = (ttl.as_secs() > 0).then(|| now + ttl.as_secs() as i64);
-    app.write(
-        &Command::SessionHeartbeat {
-            expires_at: expires,
-        },
-        now,
-    )
-    .await?;
+    match principal.0 {
+        dsh_core::Principal::Admin => {
+            app.write(
+                &Command::SessionHeartbeat {
+                    expires_at: expires,
+                },
+                now,
+            )
+            .await?;
+        }
+        dsh_core::Principal::ProjectAdmin { ref username, .. } => {
+            app.write(
+                &Command::PaSessionHeartbeat {
+                    username: username.clone(),
+                    expires_at: expires,
+                },
+                now,
+            )
+            .await?;
+        }
+    }
     Ok(Json(serde_json::json!({ "expires_at": expires })))
 }
 
 // ---------------- 可观测性（模块 10） ----------------
 
 async fn metrics(State(app): State<ApiState>) -> String {
+    // 聚合判定：全局管理员或任一项目管理员会话活动即 1（N7）
     let session_active = {
         let sm = app.sm.lock().expect("sm lock");
-        match sm.get_session().ok().flatten() {
-            Some(s) => s.expires_at.map(|e| now_ms() < e).unwrap_or(true),
-            None => false,
-        }
+        let admin_active = sm
+            .get_session()
+            .ok()
+            .flatten()
+            .map(|s| s.expires_at.map(|e| now_ms() < e).unwrap_or(true))
+            .unwrap_or(false);
+        admin_active || sm.any_pa_session_active(now_ms())
     };
     metrics_text(
         &app.sm,
@@ -1633,12 +2227,21 @@ fn default_audit_limit() -> usize {
 /// 审计查询（读状态机落库）。
 async fn audit_list(
     State(app): State<ApiState>,
+    principal: axum::Extension<dsh_core::Principal>,
     axum::extract::Query(q): axum::extract::Query<AuditQuery>,
 ) -> ApiResult<serde_json::Value> {
     let sm = app.sm.lock().expect("sm lock");
     let entries = sm
         .get_audit(q.action.as_deref(), q.since, q.limit)
         .map_err(ApiError::from)?;
+    // PA 强制过滤为自己项目（§4：无 query 绕过面；project=None 的全局条目对 PA 不可见）
+    let entries = match principal.0 {
+        dsh_core::Principal::Admin => entries,
+        dsh_core::Principal::ProjectAdmin { project, .. } => entries
+            .into_iter()
+            .filter(|e| e.project.as_deref() == Some(project.0.as_str()))
+            .collect(),
+    };
     Ok(Json(serde_json::to_value(entries).expect("serialize")))
 }
 
@@ -1675,6 +2278,7 @@ async fn cluster_join(
             None,
             None,
             serde_json::json!({ "node_id": req.node_id }),
+            "admin",
         )
         .await;
     Ok(Json(serde_json::json!({ "added_learner": req.node_id })))
@@ -1704,6 +2308,7 @@ async fn cluster_promote(
             None,
             None,
             serde_json::json!({ "voters": voters }),
+            "admin",
         )
         .await;
     Ok(Json(serde_json::json!({ "voters": voters })))
@@ -1756,6 +2361,7 @@ async fn cluster_remove(
             None,
             None,
             serde_json::json!({ "node_id": req.node_id, "voters": voters }),
+            "admin",
         )
         .await;
     Ok(Json(serde_json::json!({ "voters": voters })))
@@ -1801,6 +2407,7 @@ async fn rotate_master_key(
             None,
             None,
             serde_json::json!({ "generation": generation }),
+            "admin",
         )
         .await;
     Ok(Json(
@@ -1810,9 +2417,33 @@ async fn rotate_master_key(
 
 // ---------------- 管理员运维（P2：force-logout / set-password / snapshot / retention-status） ----------------
 
-/// 强制下线当前管理员会话（CLI `dsh admin force-logout` 兜底，design §9.3/I7）。
-async fn admin_force_logout(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
-    app.write(&Command::SessionLogout, now_ms()).await?;
+#[derive(Deserialize, Default)]
+struct ForceLogoutReq {
+    /// 缺省 = 踢全局管理员会话；指定 username = 踢对应项目管理员会话（N16）。
+    #[serde(default)]
+    username: Option<String>,
+}
+
+/// 强制下线会话（CLI `dsh admin force-logout` 兜底，design §9.3/I7）。
+async fn admin_force_logout(
+    State(app): State<ApiState>,
+    axum::extract::Json(req): axum::extract::Json<ForceLogoutReq>,
+) -> ApiResult<serde_json::Value> {
+    match req.username.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+        None => {
+            app.write(&Command::SessionLogout, now_ms()).await?;
+        }
+        Some(username) => {
+            // 踢 PA 会话（账号本体不动；不存在账号也幂等成功——会话本就无）
+            app.write(
+                &Command::PaSessionLogout {
+                    username: username.to_string(),
+                },
+                now_ms(),
+            )
+            .await?;
+        }
+    }
     app.audit
         .append(
             "force_logout",
@@ -1820,7 +2451,8 @@ async fn admin_force_logout(State(app): State<ApiState>) -> ApiResult<serde_json
             None,
             None,
             None,
-            serde_json::json!({}),
+            serde_json::json!({ "username": req.username }),
+            "admin",
         )
         .await;
     Ok(Json(serde_json::json!({ "logged_out": true })))
@@ -1857,6 +2489,7 @@ async fn admin_set_password(
             None,
             None,
             serde_json::json!({}),
+            "admin",
         )
         .await;
     Ok(Json(serde_json::json!({ "changed": true })))
@@ -1885,6 +2518,7 @@ async fn admin_snapshot(State(app): State<ApiState>) -> ApiResult<serde_json::Va
             None,
             None,
             serde_json::json!({ "entries": entries.len() }),
+            "admin",
         )
         .await;
     Ok(Json(serde_json::json!({
@@ -2027,6 +2661,14 @@ pub fn build_router(app: ApiState) -> Router {
             get(admin_retention_status),
         )
         .route("/api/v1/projects", get(list_projects).post(create_project))
+        .route(
+            "/api/v1/projects/{p}/admins",
+            get(list_project_admins).post(create_project_admin),
+        )
+        .route(
+            "/api/v1/projects/{p}/admins/{u}",
+            delete(delete_project_admin).put(set_project_admin_password),
+        )
         .route(
             "/api/v1/projects/{p}",
             get(project_detail).delete(delete_project),

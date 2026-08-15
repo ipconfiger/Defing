@@ -1579,7 +1579,20 @@ impl StateMachine {
     }
 
     /// 读取项目管理员会话。
-    pub fn get_pa_session(&self, username: &str) -> Result<Option<AdminSession>, Error> {
+        /// 是否存在任一活动项目管理员会话（metrics 聚合用）。
+    pub fn any_pa_session_active(&self, now_ms: i64) -> bool {
+        match self.store.get_prefix(K_PA_SESSION.as_bytes()) {
+            Ok(entries) => entries.iter().any(|(_, raw)| {
+                serde_json::from_slice::<AdminSession>(raw)
+                    .ok()
+                    .map(|s| s.expires_at.map(|e| now_ms < e).unwrap_or(true))
+                    .unwrap_or(false)
+            }),
+            Err(_) => false,
+        }
+    }
+
+pub fn get_pa_session(&self, username: &str) -> Result<Option<AdminSession>, Error> {
         load(&*self.store, &pa_session_key(username))
     }
 

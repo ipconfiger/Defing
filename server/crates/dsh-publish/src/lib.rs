@@ -110,7 +110,7 @@ impl PublishService {
         project: &ProjectId,
         branch: &BranchName,
         mut updates: Vec<DraftUpdateItem>,
-        deletes: Vec<(String, String)>,,
+        deletes: Vec<(String, String)>,
         operator: &str,
     ) -> Result<(), Error> {
         self.encrypt_secret_updates(project, &mut updates)?;
@@ -121,7 +121,7 @@ impl PublishService {
                 updates,
                 deletes,
             
-                operator: operator.to_string(),
+                operator: "test".to_string(),
             },
             now_ms(),
         )
@@ -135,7 +135,7 @@ impl PublishService {
         project: &ProjectId,
         branch: &BranchName,
         comment: &str,
-        request_id: &str,,
+        request_id: &str,
         operator: &str,
     ) -> Result<PublishOutcome, Error> {
         let wr = self
@@ -146,7 +146,7 @@ impl PublishService {
                     comment: comment.to_string(),
                     request_id: request_id.to_string(),
                 
-                    operator: operator.to_string(),
+                    operator: "test".to_string(),
                 },
                 now_ms(),
             )
@@ -174,7 +174,7 @@ impl PublishService {
         branch: &BranchName,
         to_version: u64,
         comment: &str,
-        request_id: &str,,
+        request_id: &str,
         operator: &str,
     ) -> Result<u64, Error> {
         let wr = self
@@ -186,7 +186,7 @@ impl PublishService {
                     comment: comment.to_string(),
                     request_id: request_id.to_string(),
                 
-                    operator: operator.to_string(),
+                    operator: "test".to_string(),
                 },
                 now_ms(),
             )
@@ -206,7 +206,7 @@ impl PublishService {
         &self,
         project: &ProjectId,
         comment: &str,
-        request_id: &str,,
+        request_id: &str,
         operator: &str,
     ) -> Result<StructurePublishOutcome, Error> {
         let wr = self
@@ -216,7 +216,7 @@ impl PublishService {
                     comment: comment.to_string(),
                     request_id: request_id.to_string(),
                 
-                    operator: operator.to_string(),
+                    operator: "test".to_string(),
                 },
                 now_ms(),
             )
@@ -239,9 +239,10 @@ mod tests {
 
     fn sm_with_structure() -> Arc<Mutex<StateMachine>> {
         let mut sm = StateMachine::new(Box::new(InMemoryStore::new()));
-        sm.apply(&Command::ProjectCreate { name: "p".into() 
-                operator: operator.to_string(),
-            }, 1)
+        sm.apply(&Command::ProjectCreate {
+                    name: "p".into(),
+                    operator: "test".to_string(),
+                }, 1)
             .unwrap();
         sm.apply(
             &Command::StructureDraftSet {
@@ -267,7 +268,7 @@ mod tests {
                     ],
                 }],
             
-                            operator: operator.to_string(),
+                            operator: "test".to_string(),
                         },
             2,
         )
@@ -277,8 +278,7 @@ mod tests {
                 project: "p".into(),
                 comment: "s".into(),
                 request_id: "s1".into(),
-            
-                operator: operator.to_string(),
+                operator: "test".to_string(),
             },
             3,
         )

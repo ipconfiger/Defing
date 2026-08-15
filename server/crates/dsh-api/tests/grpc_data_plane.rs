@@ -186,6 +186,7 @@ async fn watch_delivers_publish_events() {
                 value: Value::String("10.0.0.2".into()),
             }],
             vec![],
+            "test",
         )
         .await
         .unwrap();
@@ -196,6 +197,7 @@ async fn watch_delivers_publish_events() {
             &BranchName("dev".into()),
             "v3",
             "r3",
+            "test",
         )
         .await
         .unwrap();
