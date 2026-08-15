@@ -13,6 +13,8 @@ target/
 
 # 本地数据目录
 /data/
+# 本机 Docker 运行的二进制产物目录（docker-compose.local.yml）
+/local-bin/
 *.db
 *.log
 

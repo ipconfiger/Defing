@@ -1,0 +1,84 @@
+# 本机单实例运行/测试（非 deploy/ 下的 3 节点集群演示）
+#
+# 用法：
+#   1) 构建并拷贝二进制到 local-bin/：
+#      docker compose -f docker-compose.local.yml run --rm builder
+#   2) 启动单实例（HTTP API 映射到本机 8384）：
+#      docker compose -f docker-compose.local.yml up -d dsh
+#   3) 冒烟验证：
+#      curl -s -X POST http://127.0.0.1:8384/api/v1/login -H 'Content-Type: application/json' -d '{"password":"dev-admin-pass"}'
+#
+# 说明：
+#   - 宿主为 Apple Silicon，Docker 引擎 linux/arm64，容器内原生编译产物即 arm64 Linux ELF。
+#   - 公共 target 目录复用 server/target（已在 .gitignore 中），容器内 CARGO_TARGET_DIR 指向该挂载。
+#   - Cargo/Rustup 工具链与 registry 缓存放在 named volume，重复构建无需重新下载。
+#   - dsh 运行期只读环境变量 DSH_MASTER_KEY（base64 32B），其余均为 CLI 参数。
+
+name: dsh-local
+
+x-ubuntu: &ubuntu
+  image: ubuntu:24.04
+
+services:
+  # 一次性构建器：cargo build --release 后把二进制拷贝到 /app（= 宿主 local-bin/）
+  builder:
+    <<: *ubuntu
+    profiles: ["tools"]
+    environment:
+      DEBIAN_FRONTEND: noninteractive
+      CARGO_HOME: /cargo-home
+      RUSTUP_HOME: /cargo-home/rustup
+      CARGO_TARGET_DIR: /src/server/target
+      # GCC 与 RocksDB 9.x 的 uint64_t 兼容问题，注入 <cstdint>（同 scripts/build-env.sh）
+      CXXFLAGS: "-include cstdint"
+    volumes:
+      - ./server:/src/server          # 源码（Cargo 需可写 Cargo.lock）
+      - ./proto:/src/proto            # dsh-api/build.rs 经 ../../../proto 引用（只读即可）
+      - ./local-bin:/app              # 产物输出目录
+      - dsh-cargo-home:/cargo-home    # 工具链 + registry 缓存
+    command:
+      - bash
+      - -euxc
+      - |
+        exec > >(tee /app/build.log) 2>&1
+        apt-get update
+        apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config clang libclang-dev protobuf-compiler
+        if [ ! -x "$$CARGO_HOME/bin/cargo" ]; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.97.0 --no-modify-path
+        fi
+        export PATH="$$CARGO_HOME/bin:$$PATH"
+        rustup toolchain install 1.97.0 --profile minimal
+        rustup default 1.97.0
+        cd /src/server
+        cargo build --release -p dsh-cli
+        cp -f "$$CARGO_TARGET_DIR/release/dsh" /app/dsh
+        chmod +x /app/dsh
+        echo "=== OK: $(ls -lh /app/dsh) ==="
+
+  # 单实例运行（dev-single 模式，Raft 关闭，数据落 /app/data = 宿主 local-bin/data）
+  dsh:
+    <<: *ubuntu
+    init: true
+    environment:
+      # 开发用主密钥（仅供本机测试，勿用于生产）
+      DSH_MASTER_KEY: "q4UbfiDw6b7wRGnKepAu2Xa0msYz/hIQOGlGr2uhcy8="
+    volumes:
+      - ./local-bin:/app
+    ports:
+      - "127.0.0.1:8384:8384"         # HTTP API 仅绑定本机
+    command:
+      - /app/dsh
+      - --dev-single
+      - --http-addr=0.0.0.0:8384
+      - --admin-password=dev-admin-pass
+      - --data-dir=/app/data
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8384"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  dsh-cargo-home:
