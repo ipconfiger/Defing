@@ -418,7 +418,7 @@ async fn expired_session_relogin_and_heartbeat_ttl() {
     assert!(hb["expires_at"].is_i64(), "heartbeat 应返回续期时间: {hb}");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_login_single_session() {
     let s = start().await;
     // 并发两路登录同一账号（N13：最坏一路 409，恰一会话成立）
@@ -431,4 +431,32 @@ async fn concurrent_login_single_session() {
     let conflict = codes.iter().filter(|&&c| c == 409).count();
     assert_eq!(ok, 1, "并发登录恰一成功: {codes:?}");
     assert_eq!(conflict, 1, "另一路 409: {codes:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_session_auto_relogin() {
+    // S6/N13 核心分支：已有会话但已过期 → API 层自动登出+重登（不是 409）
+    let s = start().await;
+    // 直接向状态机注入一条已过期的 PA 会话（apply 不读墙钟，过期判定在 API 层）
+    {
+        let mut sm = s._state.sm.lock().unwrap();
+        sm.apply(
+            &Command::PaSessionLogin {
+                username: "alice".into(),
+                token_hash: dsh_core::token_hash("stale"),
+                issued_at: 1,
+                expires_at: Some(2), // 早已过期（now_ms() >> 2）
+                device_id: "cli".into(),
+            },
+            1,
+        )
+        .unwrap();
+    }
+    // HTTP 重登：应走「复查已过期 → 自动登出 → 重登成功」路径
+    let (c, b) = pa_login(&s.base, "alice", "alicepw").await;
+    assert_eq!(c, 200, "过期会话应自动重登而非 409: {b}");
+    let token = b["token"].as_str().unwrap();
+    // 新 token 可用
+    let (c, _) = req(&s.base, "GET", "/api/v1/projects/p1", Some(token), None).await;
+    assert_eq!(c, 200);
 }
