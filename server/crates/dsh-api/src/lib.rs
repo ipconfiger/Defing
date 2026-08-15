@@ -468,6 +468,7 @@ async fn auth_middleware(
 }
 
 async fn create_project(
+    principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
     Json(req): Json<CreateProjectReq>,
 ) -> ApiResult<serde_json::Value> {
@@ -485,7 +486,7 @@ async fn create_project(
             None,
             None,
             serde_json::json!({}),
-            "admin",
+            &principal_op(&principal),
         )
         .await;
     Ok(Json(
@@ -533,6 +534,7 @@ async fn list_branches(
 }
 
 async fn create_branch(
+    principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
     AxumPath(pid): AxumPath<String>,
     Json(req): Json<CreateBranchReq>,
@@ -544,7 +546,7 @@ async fn create_branch(
             name: BranchName(req.name.clone()),
             source,
         
-            operator: String::new(),
+            operator: principal_op(&principal),
         },
         now_ms(),
     )
@@ -557,7 +559,7 @@ async fn create_branch(
             None,
             None,
             serde_json::json!({}),
-            "admin",
+            &principal_op(&principal),
         )
         .await;
     Ok(Json(
@@ -593,7 +595,7 @@ async fn set_structure_draft(
             base_version: req.base_version,
             groups: req.groups,
         
-            operator: String::new(),
+            operator: principal_op(&principal),
         },
         now_ms(),
     )
@@ -606,7 +608,7 @@ async fn set_structure_draft(
             None,
             None,
             serde_json::json!({ "kind": "structure-draft" }),
-            "admin",
+            &principal_op(&principal),
         )
         .await;
     Ok(Json(serde_json::json!({ "saved": true, "project": pid })))
@@ -637,7 +639,7 @@ async fn publish_structure(
             None,
             Some(rid.clone()),
             serde_json::json!({ "affected_branches": affected }),
-            "admin",
+            &principal_op(&principal),
         )
         .await;
     Ok(Json(
@@ -675,7 +677,7 @@ async fn update_draft(
             None,
             None,
             serde_json::json!({ "updates": updates_len, "deletes": deletes_len }),
-            "admin",
+            &principal_op(&principal),
         )
         .await;
     Ok(Json(
@@ -684,8 +686,8 @@ async fn update_draft(
 }
 
 async fn publish(
-    State(app): State<ApiState>,
     principal: axum::Extension<dsh_core::Principal>,
+    State(app): State<ApiState>,
     AxumPath((pid, branch)): AxumPath<(String, String)>,
     Json(req): Json<PublishReq>,
 ) -> ApiResult<serde_json::Value> {
@@ -709,7 +711,7 @@ async fn publish(
             Some(outcome.version),
             Some(rid.clone()),
             serde_json::json!({}),
-            "admin",
+            &principal_op(&principal),
         )
         .await;
     Ok(Json(serde_json::json!({
@@ -746,7 +748,7 @@ async fn rollback(
             Some(new_version),
             Some(rid.clone()),
             serde_json::json!({ "to_version": req.to_version }),
-            "admin",
+            &principal_op(&principal),
         )
         .await;
     Ok(Json(
@@ -779,6 +781,7 @@ struct ForceQuery {
 }
 
 async fn delete_project(
+    principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
     AxumPath(pid): AxumPath<String>,
     axum::extract::Query(q): axum::extract::Query<ForceQuery>,
@@ -808,7 +811,7 @@ async fn delete_project(
             None,
             None,
             serde_json::json!({}),
-            "admin",
+            &principal_op(&principal),
         )
         .await;
     Ok(StatusCode::NO_CONTENT)
@@ -850,6 +853,7 @@ async fn branch_detail(
 }
 
 async fn delete_branch(
+    principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
     AxumPath((pid, branch)): AxumPath<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiErrorBody>)> {
@@ -858,7 +862,7 @@ async fn delete_branch(
             project: ProjectId(pid.clone()),
             name: BranchName(branch.clone()),
         
-            operator: String::new(),
+            operator: principal_op(&principal),
         },
         now_ms(),
     )
@@ -872,7 +876,7 @@ async fn delete_branch(
             None,
             None,
             serde_json::json!({}),
-            "admin",
+            &principal_op(&principal),
         )
         .await;
     Ok(StatusCode::NO_CONTENT)
@@ -1022,7 +1026,7 @@ async fn promote(
                 "skipped": skipped.len(),
                 "missing_from": missing_from.len(),
             }),
-            "admin",
+            &principal_op(&principal),
         )
         .await;
     Ok(Json(serde_json::json!({
@@ -1161,6 +1165,7 @@ async fn list_shared_drafts(State(app): State<ApiState>) -> ApiResult<serde_json
 }
 
 async fn publish_shared(
+    principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
     Json(req): Json<PublishReq>,
 ) -> ApiResult<serde_json::Value> {
@@ -1171,7 +1176,7 @@ async fn publish_shared(
                 comment: req.comment,
                 request_id: rid.clone(),
             
-                operator: String::new(),
+                operator: principal_op(&principal),
             },
             now_ms(),
         )
@@ -1208,7 +1213,7 @@ async fn publish_shared(
             None,
             Some(rid.clone()),
             serde_json::json!({ "affected": affected.len() }),
-            "admin",
+            &principal_op(&principal),
         )
         .await;
     Ok(Json(serde_json::json!({
@@ -1239,6 +1244,7 @@ struct RefUnbindReq {
 }
 
 async fn ref_bind(
+    principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
     Json(req): Json<RefBindReq>,
 ) -> ApiResult<serde_json::Value> {
@@ -1253,7 +1259,7 @@ async fn ref_bind(
             project: ProjectId(req.project.clone()),
             binding,
         
-            operator: String::new(),
+            operator: principal_op(&principal),
         },
         now_ms(),
     )
@@ -1266,7 +1272,7 @@ async fn ref_bind(
             None,
             None,
             serde_json::json!({ "group": req.group, "item_key": req.item_key, "shared": format!("{}/{}", req.shared_group, req.shared_key) }),
-            "admin",
+            &principal_op(&principal),
         )
         .await;
     Ok(Json(
@@ -1275,6 +1281,7 @@ async fn ref_bind(
 }
 
 async fn ref_unbind(
+    principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
     Json(req): Json<RefUnbindReq>,
 ) -> ApiResult<serde_json::Value> {
@@ -1284,7 +1291,7 @@ async fn ref_unbind(
             group: req.group.clone(),
             item_key: req.item_key.clone(),
         
-            operator: String::new(),
+            operator: principal_op(&principal),
         },
         now_ms(),
     )
@@ -1297,7 +1304,7 @@ async fn ref_unbind(
             None,
             None,
             serde_json::json!({ "group": req.group, "item_key": req.item_key }),
-            "admin",
+            &principal_op(&principal),
         )
         .await;
     Ok(Json(
@@ -1358,6 +1365,7 @@ struct ConfigQuery {
 /// 管理面查看配置（GET /api/v1/projects/{p}/branches/{b}/config）：
 /// secret 默认掩码；reveal=true 解密并审计（会话已由鉴权中间件保证）。
 async fn admin_config(
+    principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
     AxumPath((pid, branch)): AxumPath<(String, String)>,
     axum::extract::Query(q): axum::extract::Query<ConfigQuery>,
