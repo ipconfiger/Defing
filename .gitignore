@@ -50,3 +50,6 @@ sdk/ts/node_modules/
 # 交叉编译本地缓存/临时 HOME
 .cargo-target-linux/
 .xb-home/
+
+# 宿主机独立编译目录（M3 测试用）
+server/target-host/
