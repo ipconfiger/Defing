@@ -30,10 +30,10 @@
 | # | 项 | 说明 |
 |---|-----|------|
 | D1 | CLI 配置旋钮未实现 | design §13.1 的 --read-mode/--publish-policy/--shared-cascade/--watch-event-retain/--allow-no-master-key 未实现；当前行为即 design 默认（本地读/block/auto/版本链重放）。--allow-no-master-key 若实现会要求无密钥拒启，与现有无密钥演示流程冲突，故维持现状 |
-| D2 | HTTP 数据面无 token 鉴权 | /v1 snapshot/watch 未接 --data-plane-token（仅 gRPC 有）；secret 已掩码输出，明文需走 reveal（会话+审计）。SDK 直连生产建议 TLS 前置 |
-| D3 | SDK 未实现 leader redirect 跟随 | 数据面读请求任意节点本地可服务（无需转发）；管理面写请求的 ERR_LEADER_REDIRECT 跟随属于未来 SDK 管理能力 |
-| D4 | 具名用例未全覆盖 | design-v3 §5 的 RAFT-002（网络分区）、WCH-002（慢消费者自动化）、SDK-002（幂等重试契约）未自动化；SHR-002 级联原子性由单 apply 语义保证（core 测试覆盖级联） |
-| D5 | 登录失败限次/设备绑定 | 登录限次已实现（2025-08：进程内固定窗口 5 次/10min → 429，按 X-Forwarded-For 首值，集群各节点独立）；device_id 绑定仍未实现（单会话已从机制上收敛并发）；另密码哈希已升级 argon2（旧 sha256 兼容） |
+| D2 | HTTP 数据面无 token 鉴权 | **已闭环（P3）**：`--data-plane-token` 现同时保护 HTTP 数据面 /v1/*（Bearer 或 ?token=，SSE 兼容）与 gRPC；未配置仍开放（演示兼容），生产建议配置 + TLS 前置 |
+| D3 | SDK 未实现 leader redirect 跟随 | 数据面读请求任意节点本地可服务（无需转发）；管理面写请求的 ERR_LEADER_REDIRECT 跟随（现返回 428 + leader_hint）属于未来 SDK 管理能力 |
+| D4 | 具名用例未全覆盖 | design-v3 §5 的 RAFT-002（网络分区）、WCH-002（慢消费者自动化）、SDK-002（幂等重试契约）未自动化；WCH-002 的语义已实现（F5/D-PRUNED：慢消费者与裁剪起点均结束流并发 snapshot_required），仅缺自动化脚本 |
+| D5 | 设备绑定未实现 | device_id 绑定仍未实现（单会话已从机制上收敛并发）；登录限次（--trusted-proxy 后基于对端 IP，不可伪造）+ argon2 已落地 |
 
 ## 4. 环境备忘
 

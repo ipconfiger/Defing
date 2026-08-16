@@ -303,3 +303,50 @@ O2 与 N2 的"默认开启版本保留"会影响现有行为 → 按"有影响�
 
 **第 3 轮验证**：`cargo fmt --check` PASS、`cargo clippy --all-targets --all-features -D warnings` 0 告警、
 `cargo test --workspace` **121 用例全绿**；`/metrics` 冒烟——`dsh_session_active` 不再输出，`dsh_projects/dsh_master_key_ok/dsh_raft_role` 正常。
+
+### 第 4 轮（2025-08-16 续）：deep-analysis F1–F20 全量实施（docs/fix-design-p0-p1.md）
+
+> 依据 docs/deep-analysis-2025.md 的 F1–F20 + docs/fix-design-p0-p1.md 设计；
+> 实测：`cargo test --workspace` **130 用例全绿**、clippy/fmt 零告警、dev-single/api-surface/
+> cluster/chaos 四个 e2e 脚本全过、集群轮换（共享主密钥）跨节点验证通过。
+
+| 项 | 状态 | 实施要点 |
+|----|------|----------|
+| F1 HTTP watch 密文泄漏 | ✅ | dsh-core 新增 `wire.rs`（`masked_value`/`mask_event_for_wire`）；`watch_sse` 序列化前统一掩码（重放+实时唯一出口）；实测 watch 事件输出 `{"type":"string","str_value":"***"}` 无密文 |
+| F2 branch_diff 密文泄漏 | ✅ | diff 值经 `masked_value` 输出（lib.rs branch_diff） |
+| F3 join/raft token 默认关闭 | ✅ | 集群模式（--node-id）启动强制 `--join-token` 与 `--raft-token`（缺失报错退出）；脚本/README/compose 全部注入 demo token；实测无 token 启动报错 |
+| F6 集群写响应 changes 恒空 | ✅ | `TypeConfig::R: u64 → WriteAck{version, events}`；apply 事件随响应返回；PublishService 移除多余 fallback；实测集群 publish 响应含 changes、结构发布 affected_branches 非空 |
+| 部署 Dockerfile 缺 protoc | ✅ | builder 阶段补 `protobuf-compiler`；compose 密码/令牌改环境变量 |
+| F9 secret 共享项明文 | ✅ | API+状态机双层校验：secret 项必须 type=secret 且值为字符串；type=secret 必须 secret=true |
+| F7a redb 文件 0644 | ✅ | open 后 `chmod 0600`（含存量修复）+ unix 权限断言测试 |
+| F7b KEK 明文进 Raft 日志 | ✅ | `RotateMasterKey.kek_enc`（当前 KEK 自加密新 KEK）；钩子逐 KEK 尝试解开；实测日志 `"kek":[]`、跨节点轮换后旧数据可解、ring 2 项 |
+| F4 登录节流键伪造 | ✅ | `--trusted-proxy` CIDR 配置；未配置时用对端 socket 地址（PeerAddr 提取器），忽略 XFF；login/pa_login/rotate 转发透传 XFF；单测 3 个 |
+| F8 转发无超时 | ✅ | `forward_request` 统一 helper（connect 3s + total 10s + XFF 透传），三处转发样板收敛 |
+| SDK Go ctx/5s 掐断 | ✅ | gRPC 全部方法改用调用方 ctx（Watch 可取消）；SSE 用无整体超时独立 client；事件按版本去重；未知类型显式 nil |
+| SDK TS 超时/声明/去重 | ✅ | request 加 AbortController 10s；动态 import 捕获回落 HTTP；声明改"gRPC Node-only"；watch 去重；listMembers 返回 Member[] |
+| SDK Python 退避/去重 | ✅ | gRPC watch 指数退避（200ms→15s）；事件去重；空端点列表抛 ConfigError；tls 参数标注 no-op |
+| UI 草稿编辑器数据破坏 | ✅ | 按类型渲染（bool 判 bool_value、number/textarea/password 分型回显与回读、NaN 显式报错）；secret 留空不改；分支选择保持；401 跳登录 |
+| F5 SSE 慢消费者静默丢事件 | ✅ | `take_while(is_ok)`——Lagged/Closed 结束流（不再静默丢） |
+| D-PRUNED 裁剪起点静默丢事件 | ✅ | gRPC 与 HTTP 重放前检测起点被裁剪 → 发 `snapshot_required` 事件并关流（SSE 合成事件带该标志） |
+| D-TYPE 重放事件类型失真 | ✅ | `VersionRecord.event_ty` 落标（structure_publish/shared_cascade/rollback/value_publish）；重放直接用，旧日志回退推断 |
+| F14 join 校验 | ✅ | node_id 未占用 + http/raft 地址 host:port 校验 |
+| D-DEL deletes 静默丢弃 | ✅ | 无 `/` 的 deletes 条目返回 422 |
+| D-DOC 契约文档矛盾 | ✅ | openapi snapshot 描述改"恒脱敏"；proto SECRET 注释改"数据面恒脱敏"；README 集群示例补 token |
+
+**未实施（明确跳过/延后）**：D-CSP（内联脚本外置，与 UI 改造合批，P3）；D-STATUS（LeaderRedirect 409 语义，影响 SDK，P3）；D-N2（版本保留默认 0，有数据删除风险）；D-OPENAPI 补 PA 路由（文档项，P3）；`deploy/docker-compose.yml` root 用户（O2，需 compose 改造，P3）。
+
+### 第 5 轮（2025-08-16 续）：P3 全项实施（deep-analysis §7 剩余项）
+
+> 实测：`cargo test --workspace` **132 用例全绿**（+2 D-TEST）、clippy/fmt 零告警、4 个 e2e 全过、
+> SDK gRPC/HTTP 契约测试全过（含新断言）、D2/D-STATUS 运行时实测、Admin UI 浏览器全流程实测。
+
+| 项 | 状态 | 实施要点 |
+|----|------|----------|
+| D-CSP（F12） | ✅ | Admin 内联脚本外置为 `admin/app.js`（rust-embed 多文件 + content-type 按扩展名）；全部 onclick/onchange/onkeydown 改 `data-act` 事件委托（g/k 经 dataset 传递，无 JS 字符串注入面）；CSP `script-src 'self'` 移除 unsafe-inline；浏览器实测登录/建项目/切 tab 零 JS 错误 |
+| D2 HTTP 数据面 token | ✅ | ApiState 增 `data_plane_token`；auth_middleware 对 /v1/* 校验 Bearer 或 `?token=`（兼容 SSE EventSource）；复用 `--data-plane-token`；SDK 对齐（Go authHeaders、TS watchHttp headers、Python _watch_http headers）；实测 401/200/200/401 全对 |
+| D-STATUS（F11） | ✅ | LeaderRedirect 状态码 409→**428**（Precondition Required）；body 不变（ERR_LEADER_REDIRECT + leader_hint）；实测非 leader 写返回 428 |
+| F10 openapi | ✅ | 补 `/api/v1/projects/{p}/admins`（GET/POST）与 `/admins/{u}`（PUT/DELETE）+ ProjectAdminAccount/PAUpsertRequest schema；check-contracts 39 paths OK |
+| F13 expect 收敛 | ✅ | 29 处 `expect("sm lock")` 全收敛：lib.rs handler 统一 `lock_err` helper（500 不 panic）、watch_branch 锁中毒取内部值、publish.rs map_err、observability 告警/into_inner |
+| D-TEST | ✅ | 三语言 grpc-test ListMembers 真断言（dev-single → FailedPrecondition）；契约脚本加 after_version 重放断言 + 事件字段断言（ty/request_id/structure_version）；dsh-watch 新增慢消费者（Lagged→流结束）与 force_snapshot（snapshot_required→结束）Rust 测试；force_snapshot 语义修正：补发后结束流（不接 live） |
+| UI 功能面 | ✅ | reveal 入口（viewConfig + 明文审计开关）、集群管理 tab（members/promote/remove，PA 403 提示、dev-single 404 提示）、EventSource 带 after_version 续传 + 事件面板截断 200 条 |
+| O2 compose 非 root | ✅ | Dockerfile 加 dsh 用户 + su-exec；`docker-entrypoint.sh` root 启动 chown /data 后降权 dsh；compose 无需改 |
