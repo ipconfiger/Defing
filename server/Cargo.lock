@@ -574,7 +574,6 @@ dependencies = [
  "dsh-storage",
  "dsh-watch",
  "rand",
- "redb",
  "reqwest",
  "serde",
  "serde_json",

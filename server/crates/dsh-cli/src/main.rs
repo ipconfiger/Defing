@@ -445,25 +445,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let storage = RedbStorage::open(&data_dir)?;
     let db = storage.raw_db();
+    let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage))));
+    let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone()));
     // 重启恢复：raft-meta 非空说明该节点已有持久化状态 → 无需 --bootstrap/--join，自动 resume
-    let has_state = {
-        use redb::ReadableDatabase;
-        let txn = db
-            .begin_read()
-            .map_err(|e| format!("读取 raft-meta 失败: {e}"))?;
-        match txn.open_table::<&[u8], &[u8]>(dsh_storage::TBL_RAFT_META) {
-            Ok(tbl) => tbl
-                .range::<&[u8]>(..)
-                .map(|mut it| it.next().is_some())
-                .unwrap_or(false),
-            Err(_) => false,
-        }
-    };
+    let has_state = sm_store.has_persisted_state();
     if !cli.bootstrap && cli.join.is_none() && !has_state {
         return Err("集群模式需要 --bootstrap、--join 或已有数据目录".into());
     }
-    let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage))));
-    let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone()));
     // 集群 watch：raft apply 事件 → hub（SSE）
     hub.spawn_raft_forward(sm_store.clone());
     let log_store = LogStore::new(db.clone());
