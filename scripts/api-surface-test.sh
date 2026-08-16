@@ -4,8 +4,8 @@
 #   （cluster/remove 由 cluster-demo 扩展覆盖，本脚本 dev-single 无 raft）
 set -euo pipefail
 BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/dsh}
-BASE=${BASE:-http://127.0.0.1:8384}
 PORT=${PORT:-8384}
+BASE=${BASE:-http://127.0.0.1:$PORT}
 
 cleanup() { [ -n "${PID:-}" ] && kill $PID 2>/dev/null || true; }
 trap cleanup EXIT
@@ -15,7 +15,10 @@ head -c 32 /dev/urandom > /tmp/dsh-api-surface.key
 $BIN --dev-single --admin-password admin123 --http-addr 127.0.0.1:$PORT \
   --master-key-file /tmp/dsh-api-surface.key >/tmp/dsh-api-surface.log 2>&1 &
 PID=$!
-sleep 1
+for i in $(seq 1 20); do
+  curl -sf $BASE/healthz >/dev/null && break
+  sleep 0.5
+done
 curl -sf $BASE/healthz >/dev/null || { echo "  healthz FAIL"; cat /tmp/dsh-api-surface.log; exit 1; }
 
 AUTH="Authorization: Bearer $(curl -sf -X POST $BASE/api/v1/login -H 'Content-Type: application/json' -d '{"password":"admin123"}' | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")"
@@ -127,3 +130,47 @@ echo "$R" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['db'][
 
 echo
 echo "======== P0 API surface 全部通过 ========"
+
+echo "== 12. 灰度管理面全链路（G4：4 端点 + 审计 + 数据面联动）=="
+J -X POST $BASE/api/v1/projects -d '{"name":"gray-test"}' >/dev/null
+J -X PUT $BASE/api/v1/projects/gray-test/structure-draft -d '{"base_version":1,"groups":[{"name":"app","items":[{"key":"feature","type":"string","required":true}]}]}' >/dev/null
+J -X POST $BASE/api/v1/projects/gray-test/structure-draft/publish -d '{"comment":"s","request_id":"g-s1"}' >/dev/null
+J -X PUT $BASE/api/v1/projects/gray-test/branches/dev/draft -d '{"updates":[{"group":"app","key":"feature","value":{"type":"string","str_value":"stable"}}]}' >/dev/null
+J -X POST $BASE/api/v1/projects/gray-test/branches/dev/publish -d '{"comment":"stable v2","request_id":"g-p1"}' >/dev/null
+
+# 无草稿 → 灰度发布 409（NoDraft）
+CODE=$(curl -s -H "$AUTH" -o /dev/null -w '%{http_code}' -X POST $BASE/api/v1/projects/gray-test/branches/dev/gray-publish -H 'Content-Type: application/json' -d '{"rule":{"match_labels":[{"key":"zone","value":"cn-north-1"}]},"comment":"x","request_id":"g-e1"}')
+[ "$CODE" = "409" ] && echo "  gray-publish 无草稿 → 409 OK" || { echo "  gray-publish guard FAIL $CODE"; exit 1; }
+
+# 编辑草稿（灰度内容）→ 灰度发布
+J -X PUT $BASE/api/v1/projects/gray-test/branches/dev/draft -d '{"updates":[{"group":"app","key":"feature","value":{"type":"string","str_value":"gray-feature"}}]}' >/dev/null
+R=$(J -X POST $BASE/api/v1/projects/gray-test/branches/dev/gray-publish -d '{"rule":{"match_labels":[{"key":"zone","value":"cn-north-1"}]},"comment":"gray","request_id":"g-g1"}')
+echo "$R" | python3 -c "import json,sys; r=json.load(sys.stdin); assert r['gray_seq']==1 and r['event_gray']==True, r" && echo "  gray-publish OK (gray_seq=1)"
+
+# gray-status
+S=$(J $BASE/api/v1/projects/gray-test/branches/dev/gray-status)
+echo "$S" | python3 -c "import json,sys; s=json.load(sys.stdin); assert s['gray_active'] and s['gray_seq']==1 and s['gray_rule']['match_labels'][0]['value']=='cn-north-1', s" && echo "  gray-status OK"
+
+# 数据面联动：命中 → gray=true + resolved_version=gray_seq；未命中 → gray=false
+N=$(curl -sf $BASE/v1/projects/gray-test/branches/dev/snapshot -H 'X-Dsh-Instance: web-1' -H 'X-Dsh-Labels: zone=cn-north-1')
+echo "$N" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['gray']==True and d['resolved_version']==1 and d['groups']['app']['feature']=='gray-feature', d" && echo "  数据面命中 → gray=true OK"
+S2=$(curl -sf $BASE/v1/projects/gray-test/branches/dev/snapshot -H 'X-Dsh-Instance: web-2' -H 'X-Dsh-Labels: zone=cn-south-1')
+echo "$S2" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['gray']==False and d['resolved_version']==2 and d['groups']['app']['feature']=='stable', d" && echo "  数据面未命中 → gray=false OK"
+
+# 转正 → active 推进 + 状态清空
+J -X POST $BASE/api/v1/projects/gray-test/branches/dev/gray-promote -d '{"comment":"promote","request_id":"g-pr1"}' >/dev/null
+S=$(J $BASE/api/v1/projects/gray-test/branches/dev/gray-status)
+echo "$S" | python3 -c "import json,sys; s=json.load(sys.stdin); assert s['active_version']==3 and not s['gray_active'], s" && echo "  gray-promote OK (active=3)"
+
+# 再次灰度 + 下量 → 回落 + 状态清空
+J -X PUT $BASE/api/v1/projects/gray-test/branches/dev/draft -d '{"updates":[{"group":"app","key":"feature","value":{"type":"string","str_value":"gray2"}}]}' >/dev/null
+J -X POST $BASE/api/v1/projects/gray-test/branches/dev/gray-publish -d '{"rule":{"percentage":100},"comment":"g2","request_id":"g-g2"}' >/dev/null
+R=$(J -X POST $BASE/api/v1/projects/gray-test/branches/dev/gray-abort -d '{"comment":"abort","request_id":"g-ab1"}')
+echo "$R" | python3 -c "import json,sys; r=json.load(sys.stdin); assert r['fallback_version']==3, r" && echo "  gray-abort OK (fallback=3)"
+S=$(J $BASE/api/v1/projects/gray-test/branches/dev/gray-status)
+echo "$S" | python3 -c "import json,sys; s=json.load(sys.stdin); assert not s['gray_active'] and s['gray_seq']==0, s" && echo "  gray-status 清空 OK"
+
+# 审计 action 覆盖
+J "$BASE/api/v1/audit?action=gray_publish" | python3 -c "import json,sys; a=json.load(sys.stdin); assert len(a)>=2, a" && echo "  audit gray_publish OK"
+J "$BASE/api/v1/audit?action=gray_promote" | python3 -c "import json,sys; a=json.load(sys.stdin); assert len(a)>=1, a" && echo "  audit gray_promote OK"
+J "$BASE/api/v1/audit?action=gray_abort" | python3 -c "import json,sys; a=json.load(sys.stdin); assert len(a)>=1, a" && echo "  audit gray_abort OK"

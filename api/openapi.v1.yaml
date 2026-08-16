@@ -313,6 +313,82 @@ paths:
                 properties:
                   new_version: { type: integer, format: int64 }
         '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/projects/{p}/branches/{b}/gray-publish:
+    post:
+      summary: 灰度发布（固化草稿 → 灰度快照 + 灰度规则；稳定版不动）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { $ref: '#/components/parameters/BranchPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GrayPublishRequest' }
+      responses:
+        '200':
+          description: 已发布灰度
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GrayPublishResult' }
+        '409': { $ref: '#/components/responses/NoDraft' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /api/v1/projects/{p}/branches/{b}/gray-promote:
+    post:
+      summary: 灰度转正（灰度内容 → 新稳定版；清灰度）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { $ref: '#/components/parameters/BranchPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GrayCommentRequest' }
+      responses:
+        '200':
+          description: 已转正
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [active_version]
+                properties:
+                  active_version: { type: integer, format: int64 }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /api/v1/projects/{p}/branches/{b}/gray-abort:
+    post:
+      summary: 灰度下量/回滚（摘灰度指针，客户端回落稳定版）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { $ref: '#/components/parameters/BranchPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GrayCommentRequest' }
+      responses:
+        '200':
+          description: 已下量
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [fallback_version]
+                properties:
+                  fallback_version: { type: integer, format: int64 }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /api/v1/projects/{p}/branches/{b}/gray-status:
+    get:
+      summary: 灰度状态（gray_active/gray_seq/gray_rule/active_version）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { $ref: '#/components/parameters/BranchPath' }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GrayStatus' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /api/v1/projects/{p}/diff:
     get:
       summary: 分支间值对比（同结构按 key）
@@ -807,6 +883,10 @@ components:
         project: { type: string }
         branch: { type: string }
         version: { type: integer, format: int64 }
+        # G3/D27+R1：数据面按身份 resolve 的结果——灰度命中时 version=active（v/ 空间）、
+        # resolved_version=gray_seq、gray=true；稳定路径 resolved_version=version。
+        resolved_version: { type: integer, format: int64 }
+        gray: { type: boolean, default: false }
         structure_version: { type: integer, format: int64 }
         groups:
           type: object
@@ -916,6 +996,57 @@ components:
         to_version: { type: integer, format: int64 }
         comment: { type: string, maxLength: 500 }
         request_id: { type: string }
+    GrayRule:
+      type: object
+      description: 灰度规则（G2：状态机数据；求值次序 labels→IP→percent，任一命中即命中；无身份永不进灰度）
+      properties:
+        match_labels:
+          type: array
+          description: 标签匹配（OR：任一 key=value 命中）
+          items:
+            type: object
+            required: [key, value]
+            properties:
+              key: { type: string }
+              value: { type: string }
+        ip_cidrs:
+          type: array
+          description: IP 段（CIDR，如 10.0.0.0/8）
+          items: { type: string }
+        percentage:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: 百分比放量（fnv1a(instance_id) % 100 < pct）
+    GrayPublishRequest:
+      type: object
+      required: [rule, comment]
+      properties:
+        rule: { $ref: '#/components/schemas/GrayRule' }
+        comment: { type: string, maxLength: 500 }
+        request_id: { type: string }
+    GrayCommentRequest:
+      type: object
+      required: [comment]
+      properties:
+        comment: { type: string, maxLength: 500 }
+        request_id: { type: string }
+    GrayPublishResult:
+      type: object
+      properties:
+        gray_seq: { type: integer, format: int64 }
+        gray_rule: { $ref: '#/components/schemas/GrayRule' }
+        active_version: { type: integer, format: int64 }
+        event_gray: { type: boolean }
+        request_id: { type: string }
+    GrayStatus:
+      type: object
+      properties:
+        active_version: { type: integer, format: int64 }
+        structure_version: { type: integer, format: int64 }
+        gray_active: { type: boolean }
+        gray_seq: { type: integer, format: int64 }
+        gray_rule: { $ref: '#/components/schemas/GrayRule' }
     DiffResult:
       type: object
       properties:

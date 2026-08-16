@@ -162,8 +162,59 @@ function loadBranch() {
   if (!curBranch) return;
   $('branch-title').textContent = '分支草稿编辑：' + curBranch;
   Promise.all([j('GET', `/api/v1/projects/${curProject}/branches/${curBranch}`), loadVersions()])
-    .then(([b]) => { curVersion = b.active_version || 0; renderDraftEditor(b); })
+    .then(([b]) => { curVersion = b.active_version || 0; renderDraftEditor(b); loadGrayStatus(); })
     .catch((e) => msg(e.message, false));
+}
+
+// ---------- 灰度发布（G4：G2/G3 端点 + 状态面板；D-CSP：esc 转义 + data-act） ----------
+function loadGrayStatus() {
+  if (!curProject || !curBranch) return;
+  j('GET', `/api/v1/projects/${curProject}/branches/${curBranch}/gray-status`)
+    .then((g) => {
+      const box = $('gray-status');
+      if (!box) return;
+      box.innerHTML = g.gray_active
+        ? `<div class="row"><span class="badge" style="background:#7c2d12;color:#fdba74">灰度活跃</span>
+           <span class="mono">gray_seq=${g.gray_seq}</span>
+           <span class="muted">稳定版 v${g.active_version} · 结构 sv${g.structure_version}</span></div>
+           <pre class="muted" style="margin:6px 0 0">${esc(JSON.stringify(g.gray_rule || {}, null, 2))}</pre>`
+        : `<span class="muted">无灰度（稳定版 v${g.active_version} · 结构 sv${g.structure_version}）</span>`;
+    })
+    .catch((e) => {
+      const box = $('gray-status');
+      if (box) box.innerHTML = '<span class="muted">灰度状态不可用：' + esc(e.message) + '</span>';
+    });
+}
+function loadGrayRule() {
+  if (!curProject || !curBranch) return msg('请先选择项目/分支', false);
+  j('GET', `/api/v1/projects/${curProject}/branches/${curBranch}/gray-status`)
+    .then((g) => { $('gray-rule').value = JSON.stringify(g.gray_rule || { match_labels: [], ip_cidrs: [], percentage: null }, null, 2); })
+    .catch((e) => msg(e.message, false));
+}
+function doGrayPublish() {
+  let rule;
+  try { rule = JSON.parse($('gray-rule').value); } catch (e) { return msg('灰度规则 JSON 非法: ' + e.message, false); }
+  askModal('灰度发布备注（固化当前草稿 → 灰度快照；稳定版不动）', '', (comment) => {
+    j('POST', `/api/v1/projects/${curProject}/branches/${curBranch}/gray-publish`, { rule, comment, request_id: rid() })
+      .then((r) => { msg('灰度已发布 gray_seq=' + r.gray_seq, true); loadGrayStatus(); loadProject(); })
+      .catch((e) => msg(e.message, false));
+  });
+}
+function doGrayPromote() {
+  if (!curProject || !curBranch) return msg('请先选择项目/分支', false);
+  askModal('灰度转正备注（灰度内容 → 新稳定版，全量客户端切换）', '', (comment) => {
+    j('POST', `/api/v1/projects/${curProject}/branches/${curBranch}/gray-promote`, { comment, request_id: rid() })
+      .then((r) => { msg('已转正 active_version=' + r.active_version, true); loadGrayStatus(); loadProject(); })
+      .catch((e) => msg(e.message, false));
+  });
+}
+function doGrayAbort() {
+  if (!curProject || !curBranch) return msg('请先选择项目/分支', false);
+  askModal('灰度下量/回滚备注（摘灰度指针，灰度客户端回落稳定版）', '', (comment) => {
+    j('POST', `/api/v1/projects/${curProject}/branches/${curBranch}/gray-abort`, { comment, request_id: rid() })
+      .then((r) => { msg('已下量 fallback_version=' + r.fallback_version, true); loadGrayStatus(); loadProject(); })
+      .catch((e) => msg(e.message, false));
+  });
 }
 function renderDraftEditor(b) {
   const box = $('draft-editor');

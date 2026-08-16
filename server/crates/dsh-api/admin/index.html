@@ -116,6 +116,21 @@ code { background:#0f172a; padding:1px 5px; border-radius:4px; }
         </div>
 
         <div class="card">
+          <h3>灰度发布（分支级：稳定版 + 灰度版双版本，规则定向，G2/G3）</h3>
+          <div id="gray-status" class="muted">（选择分支后加载）</div>
+          <div style="margin-top:8px">
+            <textarea id="gray-rule" placeholder='{"match_labels":[{"key":"zone","value":"cn-north-1"}],"ip_cidrs":[],"percentage":null}'></textarea>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <button data-act="loadGrayRule">载入当前规则</button>
+            <button class="primary" data-act="doGrayPublish">灰度发布</button>
+            <button data-act="doGrayPromote">一键转正</button>
+            <button class="danger" data-act="doGrayAbort">一键下量(回滚)</button>
+            <span class="muted">发布前先编辑分支草稿；命中规则的客户端读灰度快照，其余读稳定版</span>
+          </div>
+        </div>
+
+        <div class="card">
           <h3>版本历史 / 回滚 / 对比 / 提升</h3>
           <div class="row">
             <select id="diff-a"></select> vs <select id="diff-b"></select>
