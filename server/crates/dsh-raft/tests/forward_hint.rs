@@ -57,6 +57,7 @@ async fn learner_forward_hint() {
         Command::ProjectCreate {
             name: "x".into(),
             operator: String::new(),
+            ts: 0,
         },
     )
     .await;

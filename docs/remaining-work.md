@@ -33,12 +33,11 @@
 | D2 | HTTP 数据面无 token 鉴权 | /v1 snapshot/watch 未接 --data-plane-token（仅 gRPC 有）；secret 已掩码输出，明文需走 reveal（会话+审计）。SDK 直连生产建议 TLS 前置 |
 | D3 | SDK 未实现 leader redirect 跟随 | 数据面读请求任意节点本地可服务（无需转发）；管理面写请求的 ERR_LEADER_REDIRECT 跟随属于未来 SDK 管理能力 |
 | D4 | 具名用例未全覆盖 | design-v3 §5 的 RAFT-002（网络分区）、WCH-002（慢消费者自动化）、SDK-002（幂等重试契约）未自动化；SHR-002 级联原子性由单 apply 语义保证（core 测试覆盖级联） |
-| D5 | 登录失败限次/设备绑定 | design §11 的登录限次（5 次/10min 锁定）与 device_id 绑定未实现（单会话已从机制上收敛并发） |
+| D5 | 登录失败限次/设备绑定 | 登录限次已实现（2025-08：进程内固定窗口 5 次/10min → 429，按 X-Forwarded-For 首值，集群各节点独立）；device_id 绑定仍未实现（单会话已从机制上收敛并发）；另密码哈希已升级 argon2（旧 sha256 兼容） |
 
 ## 4. 环境备忘
 
-- macOS 本机构建：`source scripts/build-env.sh` 之外需
-  `BINDGEN_EXTRA_CLANG_ARGS="-isysroot $(xcrun --show-sdk-path)"`（RocksDB bindgen 缺 sysroot）
+- macOS 本机构建：`source scripts/build-env.sh`（已自动适配：CI /home 布局或 ~/.cargo 不可写时回退工作区目录；普通机器不覆盖）。存储层已迁纯 Rust redb，无需 RocksDB 时代的 BINDGEN/CXXFLAGS 注入
 - Go SDK 需 go ≥1.21（本地可用 .go-toolchain/ 内 go1.22）；grpc 依赖 `go mod tidy`
 - TS SDK：`cd sdk/ts && npm install`（@grpc/grpc-js + proto-loader）；Python：`pip install grpcio`
 - 端口约定：dev-single 8384/8383；cluster 演示 860x/870x/88xx；api-surface 用 8399

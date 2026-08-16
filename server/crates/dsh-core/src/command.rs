@@ -21,6 +21,9 @@ pub enum Command {
         name: String,
         #[serde(default)]
         operator: String,
+        /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）
+        #[serde(default)]
+        ts: i64,
     },
     ProjectDelete {
         id: ProjectId,
@@ -34,6 +37,9 @@ pub enum Command {
         source: Option<BranchName>,
         #[serde(default)]
         operator: String,
+        /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）
+        #[serde(default)]
+        ts: i64,
     },
     BranchDelete {
         project: ProjectId,
@@ -56,6 +62,9 @@ pub enum Command {
         request_id: String,
         #[serde(default)]
         operator: String,
+        /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）
+        #[serde(default)]
+        ts: i64,
     },
     /// 更新分支值草稿（不生效，I4）。
     DraftUpdate {
@@ -66,6 +75,9 @@ pub enum Command {
         deletes: Vec<(String, String)>,
         #[serde(default)]
         operator: String,
+        /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）
+        #[serde(default)]
+        ts: i64,
     },
     /// 发布分支版本（原子：固化草稿→版本→指针→diff→事件；幂等 I10）。
     Publish {
@@ -75,6 +87,9 @@ pub enum Command {
         request_id: String,
         #[serde(default)]
         operator: String,
+        /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）
+        #[serde(default)]
+        ts: i64,
     },
     /// 回滚：基于历史版本内容创建新版本（历史不可变，I6/I9）。
     Rollback {
@@ -85,6 +100,9 @@ pub enum Command {
         request_id: String,
         #[serde(default)]
         operator: String,
+        /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）
+        #[serde(default)]
+        ts: i64,
     },
     /// 更新共享项草稿（写共享草稿，发布后生效）。
     SharedDraftUpdate {
@@ -98,6 +116,9 @@ pub enum Command {
         request_id: String,
         #[serde(default)]
         operator: String,
+        /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）
+        #[serde(default)]
+        ts: i64,
     },
     /// 绑定项目 item → 共享项。
     RefBind {
@@ -132,6 +153,9 @@ pub enum Command {
         username: String,
         salt: String,
         password_hash: String,
+        /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）
+        #[serde(default)]
+        ts: i64,
     },
     /// 删除项目管理员账号（级联删除其会话）。
     ProjectAdminDelete { username: String },
@@ -161,4 +185,9 @@ pub enum Command {
     AdminSetPassword { password_hash: String },
     /// 审计落库（seq 由状态机单调分配并覆写；经 Raft 复制，集群一致）。
     AuditAppend { entry: crate::model::AuditEntry },
+    /// 主密钥轮换（集群一致）：新 KEK 经 Raft 复制到全部节点；各节点 apply 时更新本地 keyring 并持久化 ring 文件。
+    RotateMasterKey {
+        /// 新 KEK（32 字节原样）
+        kek: Vec<u8>,
+    },
 }

@@ -60,7 +60,23 @@ pub fn validate_publish(
     errs
 }
 
-/// 结构约束：分组/item 名唯一、key 长度、分组数/item 数限额。
+/// 键名/分组名字符集校验（结构定义、共享项 group/key、引用绑定共享地址共用）。
+///
+/// 规则：非空、`len() <= 128`、全部字符 ∈ `[A-Za-z0-9._-]`。
+/// - 禁止 `/`：`keys.rs` 以 `/` 拼接 `sh/{group}/{key}` 与
+///   `idx/ref/{shared_group}/{shared_key}/{project}/{group}/{item_key}`，`/` 会使索引错位、
+///   发布级联在 `parts.len() != 3` 处静默跳过（无任何报错）；
+/// - 禁止 HTML 特殊字符 `<>&"'`、空白与非 ASCII：Admin UI 渲染安全（XSS 从源头封死）；
+/// - 允许点号：常见于 `db.host` 类配置键。
+pub fn valid_key_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+/// 结构约束：分组/item 名唯一、key 长度、字符集、分组数/item 数限额。
 pub fn validate_structure(structure: &Structure) -> Vec<String> {
     let mut errs = Vec::new();
     if structure.groups.len() > MAX_GROUPS_PER_PROJECT {
@@ -72,6 +88,12 @@ pub fn validate_structure(structure: &Structure) -> Vec<String> {
         if g.name.len() > MAX_GROUP_NAME_BYTES || g.name.is_empty() {
             errs.push("invalid group name length".into());
         }
+        if !valid_key_name(&g.name) {
+            errs.push(format!(
+                "invalid group name {:?}: only [A-Za-z0-9._-] allowed",
+                g.name
+            ));
+        }
         if !seen_groups.insert(g.name.clone()) {
             errs.push(format!("duplicate group: {}", g.name));
         }
@@ -79,6 +101,12 @@ pub fn validate_structure(structure: &Structure) -> Vec<String> {
         for item in &g.items {
             if item.key.len() > MAX_KEY_BYTES || item.key.is_empty() {
                 errs.push(format!("{}: invalid key length", item.key));
+            }
+            if !valid_key_name(&item.key) {
+                errs.push(format!(
+                    "{}: invalid key name: only [A-Za-z0-9._-] allowed",
+                    item.key
+                ));
             }
             if !seen.insert(item.key.clone()) {
                 errs.push(format!("{}/{}: duplicate item key", g.name, item.key));
@@ -199,5 +227,50 @@ mod tests {
             }],
         };
         assert!(!validate_structure(&structure).is_empty());
+    }
+
+    #[test]
+    fn key_name_accepts_safe_charset() {
+        // 字母数字 + . _ - 均允许（点号常见于 db.host 类配置键）
+        for ok in ["db.host", "max_conns", "A-Z0_9.a", "x-1.y_2"] {
+            assert!(valid_key_name(ok), "{ok:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn key_name_rejects_dangerous_charset() {
+        // /（索引分隔符冲突）、HTML/XSS 特殊字符、空白、非 ASCII、引号
+        for bad in [
+            "a/b", "<img>", "a b", "中文", "a'b", "", "x&y", "x\"y", "a<b>c",
+        ] {
+            assert!(!valid_key_name(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn structure_rejects_dangerous_names() {
+        // C3：分组名与 item 键的字符集在结构入口封死
+        let structure = Structure {
+            version: 1,
+            groups: vec![
+                GroupDef {
+                    name: "<img onerror=alert(1)>".into(),
+                    items: vec![str_def("k", false)],
+                },
+                GroupDef {
+                    name: "g".into(),
+                    items: vec![str_def("a/b", false)],
+                },
+            ],
+        };
+        let errs = validate_structure(&structure);
+        assert!(
+            errs.iter().any(|e| e.contains("<img onerror")),
+            "group XSS name must be rejected: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("a/b")),
+            "item key with '/' must be rejected: {errs:?}"
+        );
     }
 }

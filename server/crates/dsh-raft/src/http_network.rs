@@ -4,6 +4,7 @@
 //! 快照分块由 openraft 默认 full_snapshot 按 chunk 调用 install_snapshot。
 
 use std::io;
+use std::time::Duration;
 
 use openraft::error::{NetworkError, RPCError};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
@@ -21,6 +22,8 @@ pub type RaftHandle = openraft::Raft<TypeConfig>;
 pub struct HttpNetwork {
     base: String,
     client: reqwest::Client,
+    /// 可选 token：Some 时每个 RPC 请求携带 `Authorization: Bearer <token>` 头。
+    token: Option<String>,
 }
 
 impl HttpNetwork {
@@ -30,9 +33,11 @@ impl HttpNetwork {
         body: &T,
     ) -> Result<R, RPCError<NodeId, NodeInfo, RaftErrorPlaceholder>> {
         let url = format!("{}{path}", self.base);
-        let resp = self
-            .client
-            .post(&url)
+        let mut req = self.client.post(&url);
+        if let Some(token) = &self.token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
             .json(body)
             .send()
             .await
@@ -95,13 +100,31 @@ impl RaftNetwork<TypeConfig> for HttpNetwork {
 #[derive(Clone, Default)]
 pub struct HttpNetworkFactory {
     client: reqwest::Client,
+    /// 可选 token：Some 时 new_client 产出的 HttpNetwork 携带该 token。
+    token: Option<String>,
 }
 
 impl HttpNetworkFactory {
     pub fn new() -> Self {
+        // 超时选择依据：connect_timeout 3s——对端黑洞/不可达时快速失败，
+        // 避免 Raft 复制挂起至 OS 级 TCP 超时（可达数分钟）；timeout 60s——
+        // 总请求超时，覆盖大快照（install_snapshot 分块传输）等长请求。
+        // client 为固定配置构建，无 TLS 后端切换等可失败路径，expect 不会触发。
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("reqwest client 构建失败");
         Self {
-            client: reqwest::Client::new(),
+            client,
+            token: None,
         }
+    }
+
+    pub fn with_token(token: Option<String>) -> Self {
+        let mut f = Self::new();
+        f.token = token;
+        f
     }
 }
 
@@ -113,6 +136,7 @@ impl RaftNetworkFactory<TypeConfig> for HttpNetworkFactory {
         HttpNetwork {
             base: format!("http://{}", node.raft_addr),
             client: self.client.clone(),
+            token: self.token.clone(),
         }
     }
 }

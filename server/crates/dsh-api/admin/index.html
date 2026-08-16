@@ -324,13 +324,13 @@ function renderDraftEditor(b) {
   let html = '';
   if (!groups.length) html = '<span class="muted">当前分支无草稿项（先改结构发布，或直接添加下方值）</span><br>';
   for (const g of groups) {
-    html += `<b>${g}</b><table><thead><tr><th>key</th><th>值</th><th>删除</th></tr></thead><tbody>`;
+    html += `<b>${esc(g)}</b><table><thead><tr><th>key</th><th>值</th><th>删除</th></tr></thead><tbody>`;
     for (const [k, dv] of Object.entries(b.draft[g] || {})) {
       const v = dv.value; const type = v && v.type ? v.type : typeof v;
       const input = type === 'bool'
-        ? `<input type="checkbox" data-g="${g}" data-k="${k}" ${v === true || v === 'true' ? 'checked' : ''}>`
-        : `<input data-g="${g}" data-k="${k}" data-ty="${type}" value="${esc(v && v.str_value !== undefined ? v.str_value : v)}">`;
-      html += `<tr><td class="mono">${k}</td><td>${input}</td><td><button class="danger" onclick="delDraftItem('${g}','${k}')">删</button></td></tr>`;
+        ? `<input type="checkbox" data-g="${esc(g)}" data-k="${esc(k)}" ${v === true || v === 'true' ? 'checked' : ''}>`
+        : `<input data-g="${esc(g)}" data-k="${esc(k)}" data-ty="${esc(type)}" value="${esc(v && v.str_value !== undefined ? v.str_value : v)}">`;
+      html += `<tr><td class="mono">${esc(k)}</td><td>${input}</td><td><button class="danger" onclick="delDraftItem('${esc(g)}','${esc(k)}')">删</button></td></tr>`;
     }
     html += '</tbody></table>';
   }
@@ -346,7 +346,7 @@ function renderDraftEditor(b) {
     <span class="muted">发布后 SDK watch 收到事件</span></div>`;
   box.innerHTML = html;
 }
-function esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
+function esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/'/g,'&#39;'); }
 function addDraftItem() {
   const g = $('new-item-group').value.trim(), k = $('new-item-key').value.trim(), ty = $('new-item-type').value, raw = $('new-item-val').value;
   if (!g || !k) return msg('组和 key 必填', false);
@@ -412,9 +412,9 @@ function showDiff() {
   const a = $('diff-a').value, b = $('diff-b').value;
   if (!a || !b) return msg('请选择对比分支', false);
   j('GET', `/api/v1/projects/${curProject}/diff?branch_a=${a}&branch_b=${b}`).then((d) => {
-    let html = '<table><thead><tr><th>key</th><th>' + a + '</th><th>' + b + '</th></tr></thead><tbody>';
-    for (const x of d.diffs || []) html += `<tr><td class="mono">${x.group}/${x.key}</td><td>${esc(JSON.stringify(x.branch_a))}</td><td>${esc(JSON.stringify(x.branch_b))}</td></tr>`;
-    for (const m of d.missing || []) html += `<tr><td class="mono">${m}</td><td colspan="2" class="muted">仅一侧有值</td></tr>`;
+    let html = '<table><thead><tr><th>key</th><th>' + esc(a) + '</th><th>' + esc(b) + '</th></tr></thead><tbody>';
+    for (const x of d.diffs || []) html += `<tr><td class="mono">${esc(x.group)}/${esc(x.key)}</td><td>${esc(JSON.stringify(x.branch_a))}</td><td>${esc(JSON.stringify(x.branch_b))}</td></tr>`;
+    for (const m of d.missing || []) html += `<tr><td class="mono">${esc(m)}</td><td colspan="2" class="muted">仅一侧有值</td></tr>`;
     html += '</tbody></table>';
     if (!(d.diffs || []).length && !(d.missing || []).length) html = '<span class="muted">两个分支完全一致</span>';
     $('diff-out').innerHTML = html;
@@ -447,7 +447,7 @@ function loadShared() {
     if (!tb) return;
     const rows = (draft.map((s) => ({ ...s, __draft: true }))).concat(pub.map((s) => ({ ...s, __draft: false })));
     tb.innerHTML = rows.map((s) => `<tr>
-      <td class="mono">${s.group}</td><td class="mono">${s.key}</td><td>${s.type}</td>
+      <td class="mono">${esc(s.group)}</td><td class="mono">${esc(s.key)}</td><td>${esc(s.type)}</td>
       <td>${s.__draft ? '<span class="badge">草稿</span>' : 'v' + s.version}</td>
       <td class="mono">${esc(JSON.stringify(s.value))}</td><td>${s.secret ? '🔒' : ''}</td></tr>`).join('');
   }).catch(() => {});
@@ -482,9 +482,9 @@ function loadAudit() {
     const tb = document.querySelector('#audit tbody');
     if (!tb) return;
     tb.innerHTML = es.map((e) => `<tr>
-      <td>${e.seq}</td><td class="muted">${new Date(e.ts).toLocaleString()}</td><td>${e.action}</td>
-      <td class="mono">${e.project || ''}${e.branch ? '/' + e.branch : ''}</td><td>${e.version ?? ''}</td>
-      <td class="mono">${e.request_id || ''}</td><td class="mono">${esc(JSON.stringify(e.detail || {}))}</td></tr>`).join('');
+      <td>${e.seq}</td><td class="muted">${new Date(e.ts).toLocaleString()}</td><td>${esc(e.action)}</td>
+      <td class="mono">${esc(e.project || '')}${e.branch ? '/' + esc(e.branch) : ''}</td><td>${esc(e.version ?? '')}</td>
+      <td class="mono">${esc(e.request_id || '')}</td><td class="mono">${esc(JSON.stringify(e.detail || {}))}</td></tr>`).join('');
   }).catch((e) => msg(e.message, false));
 }
 

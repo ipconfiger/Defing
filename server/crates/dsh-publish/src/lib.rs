@@ -111,7 +111,7 @@ impl PublishService {
         branch: &BranchName,
         mut updates: Vec<DraftUpdateItem>,
         deletes: Vec<(String, String)>,
-        _operator: &str,
+        operator: &str,
     ) -> Result<(), Error> {
         self.encrypt_secret_updates(project, &mut updates)?;
         self.write(
@@ -121,7 +121,8 @@ impl PublishService {
                 updates,
                 deletes,
 
-                operator: "test".to_string(),
+                operator: operator.to_string(),
+                ts: now_ms(),
             },
             now_ms(),
         )
@@ -136,7 +137,7 @@ impl PublishService {
         branch: &BranchName,
         comment: &str,
         request_id: &str,
-        _operator: &str,
+        operator: &str,
     ) -> Result<PublishOutcome, Error> {
         let wr = self
             .write(
@@ -146,7 +147,8 @@ impl PublishService {
                     comment: comment.to_string(),
                     request_id: request_id.to_string(),
 
-                    operator: "test".to_string(),
+                    operator: operator.to_string(),
+                    ts: now_ms(),
                 },
                 now_ms(),
             )
@@ -175,7 +177,7 @@ impl PublishService {
         to_version: u64,
         comment: &str,
         request_id: &str,
-        _operator: &str,
+        operator: &str,
     ) -> Result<u64, Error> {
         let wr = self
             .write(
@@ -186,7 +188,8 @@ impl PublishService {
                     comment: comment.to_string(),
                     request_id: request_id.to_string(),
 
-                    operator: "test".to_string(),
+                    operator: operator.to_string(),
+                    ts: now_ms(),
                 },
                 now_ms(),
             )
@@ -207,7 +210,7 @@ impl PublishService {
         project: &ProjectId,
         comment: &str,
         request_id: &str,
-        _operator: &str,
+        operator: &str,
     ) -> Result<StructurePublishOutcome, Error> {
         let wr = self
             .write(
@@ -216,7 +219,8 @@ impl PublishService {
                     comment: comment.to_string(),
                     request_id: request_id.to_string(),
 
-                    operator: "test".to_string(),
+                    operator: operator.to_string(),
+                    ts: now_ms(),
                 },
                 now_ms(),
             )
@@ -243,6 +247,7 @@ mod tests {
             &Command::ProjectCreate {
                 name: "p".into(),
                 operator: "test".to_string(),
+                ts: 0,
             },
             1,
         )
@@ -282,6 +287,7 @@ mod tests {
                 comment: "s".into(),
                 request_id: "s1".into(),
                 operator: "test".to_string(),
+                ts: 0,
             },
             3,
         )

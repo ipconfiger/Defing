@@ -43,6 +43,7 @@ fn setup(s: &mut StateMachine) -> (ProjectId, Vec<BranchName>) {
             &Command::ProjectCreate {
                 name: "order-service".into(),
                 operator: String::new(),
+                ts: 0,
             },
             1
         )
@@ -70,6 +71,7 @@ fn setup(s: &mut StateMachine) -> (ProjectId, Vec<BranchName>) {
                 comment: "init".into(),
                 request_id: "s1".into(),
                 operator: String::new(),
+                ts: 0,
             },
             3,
         )
@@ -103,6 +105,7 @@ fn full_flow_dev_publish() {
                 ],
                 deletes: vec![],
                 operator: String::new(),
+                ts: 0,
             },
             4,
         )
@@ -122,6 +125,7 @@ fn full_flow_dev_publish() {
                 comment: "dev host".into(),
                 request_id: "r1".into(),
                 operator: String::new(),
+                ts: 0,
             },
             5,
         )
@@ -163,6 +167,7 @@ fn publish_is_idempotent_by_request_id() {
             deletes: vec![],
 
             operator: String::new(),
+            ts: 0,
         },
         4,
     )
@@ -174,6 +179,7 @@ fn publish_is_idempotent_by_request_id() {
         request_id: "r9".into(),
 
         operator: String::new(),
+        ts: 0,
     };
     let first = s.apply(&cmd, 5).unwrap();
     assert_eq!(first.len(), 1);
@@ -201,6 +207,7 @@ fn required_unset_blocks_publish() {
             deletes: vec![],
 
             operator: String::new(),
+            ts: 0,
         },
         4,
     )
@@ -213,6 +220,7 @@ fn required_unset_blocks_publish() {
                 comment: "c".into(),
                 request_id: "r2".into(),
                 operator: String::new(),
+                ts: 0,
             },
             5,
         )
@@ -234,6 +242,7 @@ fn no_draft_publish_errors() {
                 comment: "c".into(),
                 request_id: "r3".into(),
                 operator: String::new(),
+                ts: 0,
             },
             5,
         )
@@ -258,6 +267,7 @@ fn branch_inherits_structure_and_values() {
             deletes: vec![],
 
             operator: String::new(),
+            ts: 0,
         },
         4,
     )
@@ -270,6 +280,7 @@ fn branch_inherits_structure_and_values() {
             request_id: "r4".into(),
 
             operator: String::new(),
+            ts: 0,
         },
         5,
     )
@@ -282,6 +293,7 @@ fn branch_inherits_structure_and_values() {
                 name: "gray".into(),
                 source: Some(BranchName("dev".into())),
                 operator: String::new(),
+                ts: 0,
             },
             6
         )
@@ -314,6 +326,7 @@ fn draft_update_validates_unknown_item_and_type() {
                 }],
                 deletes: vec![],
                 operator: String::new(),
+                ts: 0,
             },
             4,
         )
@@ -332,6 +345,7 @@ fn draft_update_validates_unknown_item_and_type() {
                 }],
                 deletes: vec![],
                 operator: String::new(),
+                ts: 0,
             },
             4,
         )
@@ -346,6 +360,7 @@ fn duplicate_project_conflicts() {
         &Command::ProjectCreate {
             name: "p1".into(),
             operator: String::new(),
+            ts: 0,
         },
         1,
     )
@@ -355,6 +370,7 @@ fn duplicate_project_conflicts() {
             &Command::ProjectCreate {
                 name: "p1".into(),
                 operator: String::new(),
+                ts: 0,
             },
             2,
         )
@@ -418,6 +434,7 @@ fn rollback_creates_new_version_with_old_content() {
             deletes: vec![],
 
             operator: String::new(),
+            ts: 0,
         },
         4,
     )
@@ -430,6 +447,7 @@ fn rollback_creates_new_version_with_old_content() {
             request_id: "r1".into(),
 
             operator: String::new(),
+            ts: 0,
         },
         5,
     )
@@ -446,6 +464,7 @@ fn rollback_creates_new_version_with_old_content() {
                 comment: "rollback".into(),
                 request_id: "rb1".into(),
                 operator: String::new(),
+                ts: 0,
             },
             6,
         )
@@ -473,6 +492,7 @@ fn rollback_creates_new_version_with_old_content() {
                 comment: "x".into(),
                 request_id: "rb1".into(),
                 operator: String::new(),
+                ts: 0,
             },
             7,
         )
@@ -495,6 +515,7 @@ fn rollback_invalid_version_rejected() {
                 comment: "x".into(),
                 request_id: "r".into(),
                 operator: String::new(),
+                ts: 0,
             },
             5,
         )
@@ -509,6 +530,7 @@ fn rollback_invalid_version_rejected() {
                 comment: "x".into(),
                 request_id: "r".into(),
                 operator: String::new(),
+                ts: 0,
             },
             5,
         )
@@ -542,6 +564,7 @@ fn publish_shared(s: &mut StateMachine, group: &str, key: &str, value: Value, re
             request_id: request_id.into(),
 
             operator: String::new(),
+            ts: 0,
         },
         11,
     )
@@ -618,6 +641,7 @@ fn shared_cascade_updates_referencing_branches() {
             request_id: "s2".into(),
 
             operator: String::new(),
+            ts: 0,
         },
         13,
     )
@@ -653,6 +677,7 @@ fn shared_cascade_updates_referencing_branches() {
             deletes: vec![],
 
             operator: String::new(),
+            ts: 0,
         },
         15,
     )
@@ -670,6 +695,7 @@ fn shared_cascade_updates_referencing_branches() {
             request_id: "r1".into(),
 
             operator: String::new(),
+            ts: 0,
         },
         16,
     )
@@ -943,6 +969,7 @@ fn group_ref_materializes_matching_items_at_publish() {
             deletes: vec![],
 
             operator: String::new(),
+            ts: 0,
         },
         31,
     )
@@ -955,6 +982,7 @@ fn group_ref_materializes_matching_items_at_publish() {
             request_id: "gr1".into(),
 
             operator: String::new(),
+            ts: 0,
         },
         32,
     )
@@ -1057,6 +1085,7 @@ fn group_ref_unbind_stops_materialization() {
             deletes: vec![],
 
             operator: String::new(),
+            ts: 0,
         },
         52,
     )
@@ -1069,6 +1098,7 @@ fn group_ref_unbind_stops_materialization() {
             request_id: "gr2".into(),
 
             operator: String::new(),
+            ts: 0,
         },
         53,
     )
@@ -1122,6 +1152,7 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
             request_id: "rw1".into(),
 
             operator: String::new(),
+            ts: 0,
         },
         61,
     )
@@ -1146,6 +1177,7 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
             deletes: vec![],
 
             operator: String::new(),
+            ts: 0,
         },
         62,
     )
@@ -1158,6 +1190,7 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
             request_id: "rw2".into(),
 
             operator: String::new(),
+            ts: 0,
         },
         63,
     )
@@ -1208,6 +1241,7 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
             deletes: vec![],
 
             operator: String::new(),
+            ts: 0,
         },
         64,
     )

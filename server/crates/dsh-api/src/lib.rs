@@ -53,6 +53,10 @@ pub struct ApiState {
     pub version_retention: u64,
     /// 审计保留条数（0=不裁剪）
     pub audit_retention: u64,
+    /// 集群 join 引导令牌（/api/v1/cluster/join 需 Bearer 匹配；None=不校验）
+    pub join_token: Option<std::sync::Arc<str>>,
+    /// 登录失败节流（S6：进程内、按节点独立；集群需前置 LB 层限流）
+    login_throttle: std::sync::Arc<LoginThrottle>,
 }
 
 impl ApiState {
@@ -78,6 +82,7 @@ impl ApiState {
             ring_path,
             0,
             0,
+            None,
         )
     }
 
@@ -93,6 +98,7 @@ impl ApiState {
         ring_path: Option<std::path::PathBuf>,
         version_retention: u64,
         audit_retention: u64,
+        join_token: Option<std::sync::Arc<str>>,
     ) -> Self {
         let publish = PublishService::new(
             sm.clone(),
@@ -114,6 +120,8 @@ impl ApiState {
             ring_path,
             version_retention,
             audit_retention,
+            join_token,
+            login_throttle: std::sync::Arc::new(LoginThrottle::new()),
         }
     }
 
@@ -419,7 +427,8 @@ async fn auth_middleware(
 ) -> Result<axum::response::Response, (StatusCode, Json<ApiErrorBody>)> {
     let path = req.uri().path().to_string();
     let method = req.method().as_str().to_string();
-    // cluster/join 是节点加入前的引导调用（尚无管理员会话），豁免鉴权
+    // cluster/join 是节点加入前的引导调用（尚无管理员会话），豁免会话鉴权；
+    // 引导令牌（--join-token）校验在 handler 内完成（join_token_ok）
     if path == "/api/v1/login"
         || path == "/healthz"
         || path == "/readyz"
@@ -472,6 +481,7 @@ async fn create_project(
         &Command::ProjectCreate {
             name: req.name.clone(),
             operator: "admin".to_string(),
+            ts: now_ms(),
         },
         now_ms(),
     )
@@ -545,6 +555,7 @@ async fn create_branch(
             source,
 
             operator: principal_op(&principal),
+            ts: now_ms(),
         },
         now_ms(),
     )
@@ -1192,6 +1203,7 @@ async fn publish_shared(
                 request_id: rid.clone(),
 
                 operator: principal_op(&principal),
+                ts: now_ms(),
             },
             now_ms(),
         )
@@ -1436,17 +1448,38 @@ struct ProjectAdminResp {
     created_at: i64,
 }
 
-/// 生成盐 + 加盐哈希（sha256(salt || password)，§2）。
-fn salted_password_hash(password: &str) -> (String, String) {
-    use rand::RngCore;
-    let mut salt_bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut salt_bytes);
-    let salt = salt_bytes
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    let hash = dsh_core::token_hash(&format!("{salt}{password}"));
-    (salt, hash)
+/// argon2id 哈希密码 → PHC 字符串（盐内嵌；新格式）。
+fn hash_password(password: &str) -> Result<String, dsh_core::Error> {
+    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+    let salt = SaltString::generate(&mut OsRng);
+    argon2::Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| dsh_core::Error::internal(format!("password hash: {e}")))
+}
+
+/// 校验密码：stored 以 "$argon2" 开头 → argon2 验证（盐在 PHC 内）；
+/// 否则 legacy：sha256(legacy_salt || password) == stored（旧数据兼容，改密后自动升级）。
+fn verify_password(password: &str, stored: &str, legacy_salt: &str) -> bool {
+    if stored.starts_with("$argon2") {
+        use argon2::password_hash::{PasswordHash, PasswordVerifier};
+        match PasswordHash::new(stored) {
+            Ok(phc) => argon2::Argon2::default()
+                .verify_password(password.as_bytes(), &phc)
+                .is_ok(),
+            Err(_) => false,
+        }
+    } else {
+        dsh_core::token_hash(&format!("{legacy_salt}{password}")) == stored
+    }
+}
+
+/// 生成盐 + 密码哈希（§2）。
+/// 新格式：PHC 字符串（盐内嵌，salt 字段置空）；旧数据仍为 sha256(salt||pw)，
+/// 校验走 verify_password legacy 分支（改密后自动升级到 argon2）。
+fn salted_password_hash(password: &str) -> Result<(String, String), dsh_core::Error> {
+    let hash = hash_password(password)?;
+    Ok((String::new(), hash))
 }
 
 async fn create_project_admin(
@@ -1455,12 +1488,13 @@ async fn create_project_admin(
     Json(req): Json<ProjectAdminCreateReq>,
 ) -> Result<(StatusCode, Json<ProjectAdminResp>), (StatusCode, Json<ApiErrorBody>)> {
     let now = now_ms();
-    let (salt, hash) = salted_password_hash(&req.password);
+    let (salt, hash) = salted_password_hash(&req.password).map_err(ApiError::from)?;
     let cmd = Command::ProjectAdminCreate {
         project: ProjectId(pid.clone()),
         username: req.username.clone(),
         salt,
         password_hash: hash,
+        ts: now_ms(),
     };
     match app.write(&cmd, now).await {
         Ok(_) => {
@@ -1560,7 +1594,7 @@ async fn set_project_admin_password(
     AxumPath((pid, username)): AxumPath<(String, String)>,
     Json(req): Json<ProjectAdminSetPasswordReq>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiErrorBody>)> {
-    let (salt, hash) = salted_password_hash(&req.password);
+    let (salt, hash) = salted_password_hash(&req.password).map_err(ApiError::from)?;
     match app
         .write(
             &Command::ProjectAdminSetPassword {
@@ -1804,8 +1838,29 @@ fn new_pa_token(username: &str) -> String {
 
 async fn login(
     State(app): State<ApiState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> Result<Json<LoginResp>, (StatusCode, Json<ApiErrorBody>)> {
+    // 登录节流（S6）：按来源 IP（X-Forwarded-For 首值，缺省 "direct"）固定窗口限次。
+    // 进程内、按节点独立计数（集群需前置 LB 层限流）；窗口 600s、窗口内失败 ≥5 即 429。
+    let ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("direct")
+        .to_string();
+    if app.login_throttle.blocked(&ip) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ApiErrorBody {
+                code: "ERR_TOO_MANY_ATTEMPTS".into(),
+                message: "登录尝试过多，请稍后再试".into(),
+                detail: None,
+            }),
+        ));
+    }
     // 项目管理员登录分支（§3）：username 非空 → 校验 adm/pa/{username}。
     let pa_username = req
         .username
@@ -1814,17 +1869,18 @@ async fn login(
         .filter(|u| !u.is_empty())
         .map(str::to_string);
     if let Some(username) = pa_username {
-        return pa_login(app, req, username).await;
+        return pa_login(app, req, username, &ip).await;
     }
     // 密码校验：set-password 落状态机后优先；未设置时回退节点配置（--admin-password）。
     let sm_pw_ok = {
         let sm = app.sm.lock().expect("sm lock");
         match sm.get_admin_password_hash().ok().flatten() {
-            Some(hash) => dsh_core::token_hash(&req.password) == hash,
+            Some(hash) => verify_password(&req.password, &hash, ""),
             None => req.password == app.admin_password.as_ref(),
         }
     };
     if !sm_pw_ok {
+        app.login_throttle.record_failure(&ip);
         app.audit
             .append(
                 "login_failed",
@@ -1866,6 +1922,7 @@ async fn login(
             .await;
         match res {
             Ok(_) => {
+                app.login_throttle.reset(&ip);
                 app.audit
                     .append(
                         "login",
@@ -1909,6 +1966,7 @@ async fn login(
                             let body: serde_json::Value =
                                 resp.json().await.unwrap_or(serde_json::json!({}));
                             if status.is_success() {
+                                app.login_throttle.reset(&ip);
                                 let token = body
                                     .get("token")
                                     .and_then(|t| t.as_str())
@@ -1975,6 +2033,7 @@ async fn pa_login(
     app: ApiState,
     req: LoginReq,
     username: String,
+    ip: &str,
 ) -> Result<Json<LoginResp>, (StatusCode, Json<ApiErrorBody>)> {
     // 校验账号与密码（统一 401，防枚举）
     let account = {
@@ -1983,12 +2042,10 @@ async fn pa_login(
     };
     let ok = account
         .as_ref()
-        .map(|acct| {
-            let salted = format!("{}{}", acct.salt, req.password);
-            dsh_core::token_hash(&salted) == acct.password_hash
-        })
+        .map(|acct| verify_password(&req.password, &acct.password_hash, &acct.salt))
         .unwrap_or(false);
     if !ok {
+        app.login_throttle.record_failure(ip);
         app.audit
             .append(
                 "login_failed",
@@ -2032,6 +2089,7 @@ async fn pa_login(
             .await;
         match res {
             Ok(_) => {
+                app.login_throttle.reset(ip);
                 app.audit
                     .append(
                         "login",
@@ -2105,6 +2163,7 @@ async fn pa_login(
                         let body: serde_json::Value =
                             resp.json().await.unwrap_or(serde_json::json!({}));
                         if status.is_success() {
+                            app.login_throttle.reset(ip);
                             return Ok(Json(LoginResp {
                                 token: body
                                     .get("token")
@@ -2234,23 +2293,7 @@ async fn heartbeat(
 // ---------------- 可观测性（模块 10） ----------------
 
 async fn metrics(State(app): State<ApiState>) -> String {
-    // 聚合判定：全局管理员或任一项目管理员会话活动即 1（N7）
-    let session_active = {
-        let sm = app.sm.lock().expect("sm lock");
-        let admin_active = sm
-            .get_session()
-            .ok()
-            .flatten()
-            .map(|s| s.expires_at.map(|e| now_ms() < e).unwrap_or(true))
-            .unwrap_or(false);
-        admin_active || sm.any_pa_session_active(now_ms())
-    };
-    metrics_text(
-        &app.sm,
-        app.raft.as_ref(),
-        session_active,
-        app.cipher.is_some(),
-    )
+    metrics_text(&app.sm, app.raft.as_ref(), app.cipher.is_some())
 }
 
 async fn readyz(State(app): State<ApiState>) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -2311,10 +2354,34 @@ async fn cluster_members(State(app): State<ApiState>) -> ApiResult<serde_json::V
     Ok(Json(cluster_members_json(app.raft.as_ref(), app.node_id)))
 }
 
+/// join 引导调用鉴权：未配置 token 放行；配置后要求 Authorization: Bearer <token> 完全相等。
+fn join_token_ok(app: &ApiState, headers: &axum::http::HeaderMap) -> bool {
+    match &app.join_token {
+        None => true,
+        Some(expected) => headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|a| a.strip_prefix("Bearer "))
+            .map(|t| t == expected.as_ref())
+            .unwrap_or(false),
+    }
+}
+
 async fn cluster_join(
     State(app): State<ApiState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<JoinReq>,
 ) -> ApiResult<serde_json::Value> {
+    if !join_token_ok(&app, &headers) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorBody {
+                code: "ERR_UNAUTHORIZED".into(),
+                message: "join token required".into(),
+                detail: None,
+            }),
+        ));
+    }
     let raft = app
         .raft
         .as_ref()
@@ -2432,7 +2499,13 @@ struct RotateKeyReq {
     new_key: String,
 }
 
-/// 轮换主密钥：新 KEK 成为当前（旧 KEK 保留，可解旧数据 CRY-002）；持久化环文件；触发审计。
+/// 轮换主密钥：新 KEK 成为当前（旧 KEK 保留，可解旧数据 CRY-002）；触发审计。
+/// - 集群模式：命令经 Raft 复制到全部节点（各节点 apply 时经 dsh-raft 的 rotation hook
+///   更新本地 keyring 并持久化 ring 文件，最终一致）；非 leader 节点按 login 模式转发到 leader。
+/// - dev-single：本地轮换，先持久化 ring 文件、成功后才切换内存（避免文件写失败时内存已切换，
+///   导致重启后新密文不可解）。
+/// - N4：两种模式都要求 --master-key-file（ring 文件持久化）——仅用 DSH_MASTER_KEY 环境变量
+///   时拒绝轮换，避免"内存轮换、重启丢失新 KEK、新密文永久不可解"。
 async fn rotate_master_key(
     State(app): State<ApiState>,
     Json(req): Json<RotateKeyReq>,
@@ -2441,6 +2514,14 @@ async fn rotate_master_key(
         .cipher
         .as_ref()
         .ok_or_else(|| ApiError(dsh_core::Error::validation("master key not configured")))?;
+    // N4：轮换必须能持久化 ring 文件（--master-key-file）；仅环境变量密钥时拒绝，
+    // 避免"内存轮换、重启丢失新 KEK、新密文不可解"。
+    if app.ring_path.is_none() {
+        return Err(ApiError(dsh_core::Error::validation(
+            "主密钥轮换需要 --master-key-file（ring 文件持久化）",
+        ))
+        .into());
+    }
     let raw = base64::engine::general_purpose::STANDARD
         .decode(&req.new_key)
         .map_err(|e| ApiError(dsh_core::Error::validation(format!("new_key base64: {e}"))))?;
@@ -2449,11 +2530,124 @@ async fn rotate_master_key(
     }
     let mut kek = [0u8; 32];
     kek.copy_from_slice(&raw);
-    cipher.rotate_master_key(kek);
-    // 持久化主密钥环（重启后可解旧数据）
-    if let Some(path) = &app.ring_path {
-        dsh_crypto::save_ring(path, &cipher.keyring())
-            .map_err(|e| ApiError(dsh_core::Error::internal(e.to_string())))?;
+
+    // ---------------- 集群模式：经 Raft 复制（各节点 apply 时更新本地 keyring + ring 文件） ----------------
+    if app.raft.is_some() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let res = app
+                .write(&Command::RotateMasterKey { kek: kek.to_vec() }, now_ms())
+                .await;
+            match res {
+                Ok(_) => break,
+                Err(ApiError(e)) if e.kind == ErrorKind::LeaderRedirect => {
+                    let hint = e.leader_hint.unwrap_or_default();
+                    if !hint.is_empty() {
+                        // NodeInfo.http_addr 无 scheme（如 127.0.0.1:8601）→ 转发前补 http://
+                        let base = if hint.starts_with("http://") || hint.starts_with("https://") {
+                            hint
+                        } else {
+                            format!("http://{hint}")
+                        };
+                        let client = reqwest::Client::new();
+                        // 转发体原样：{"new_key": ...}（leader 侧完成校验/轮换/审计）
+                        match client
+                            .post(format!("{base}/api/v1/admin/rotate-master-key"))
+                            .json(&serde_json::json!({ "new_key": req.new_key.clone() }))
+                            .send()
+                            .await
+                        {
+                            Ok(resp) => {
+                                let status = resp.status();
+                                let body: serde_json::Value =
+                                    resp.json().await.unwrap_or(serde_json::json!({}));
+                                if status.is_success() {
+                                    return Ok(Json(body));
+                                }
+                                // 原样转发 leader 的错误体
+                                let code = body
+                                    .get("code")
+                                    .and_then(|c| c.as_str())
+                                    .unwrap_or("ERR_INTERNAL")
+                                    .to_string();
+                                let message = body
+                                    .get("message")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("rotate failed")
+                                    .to_string();
+                                let detail = body.get("detail").cloned();
+                                return Err((
+                                    status,
+                                    Json(ApiErrorBody {
+                                        code,
+                                        message,
+                                        detail,
+                                    }),
+                                ));
+                            }
+                            Err(_) => { /* leader 转发失败 → 重试 */ }
+                        }
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(ApiErrorBody {
+                        code: "ERR_LEADER_REDIRECT".into(),
+                        message: "rotate-master-key forwarding to leader timed out".into(),
+                        detail: None,
+                    }),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        // 提交成功：等待本地钩子生效（各节点最终一致；超时也返回 ok + 当前 generation）
+        let hook_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(3000);
+        loop {
+            let applied = app
+                .cipher
+                .as_ref()
+                .map(|c| c.keyring().entries().contains(&kek))
+                .unwrap_or(false);
+            if applied || tokio::time::Instant::now() >= hook_deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let generation = app
+            .cipher
+            .as_ref()
+            .map(|c| c.keyring().generation())
+            .unwrap_or(0);
+        app.audit
+            .append(
+                "rotate_master_key",
+                None,
+                None,
+                None,
+                None,
+                serde_json::json!({ "generation": generation }),
+                "admin",
+            )
+            .await;
+        return Ok(Json(
+            serde_json::json!({ "ok": true, "generation": generation }),
+        ));
+    }
+
+    // ---------------- dev-single：本地轮换（先持久化后切换内存） ----------------
+    let ring = cipher.keyring();
+    if !ring.entries().iter().any(|k| k == &kek) {
+        let mut new_ring = ring;
+        new_ring.push(kek);
+        // 先持久化（成功才切换内存，避免重启后新密文不可解）
+        if let Some(path) = &app.ring_path {
+            dsh_crypto::save_ring(path, &new_ring)
+                .map_err(|e| ApiError(dsh_core::Error::internal(e.to_string())))?;
+        }
+        cipher.rotate_master_key(kek);
     }
     let generation = cipher.keyring().generation();
     app.audit
@@ -2533,7 +2727,7 @@ async fn admin_set_password(
     if req.password.len() < 6 {
         return Err(ApiError(dsh_core::Error::validation("密码至少 6 位")).into());
     }
-    let hash = dsh_core::token_hash(&req.password);
+    let hash = hash_password(&req.password).map_err(ApiError::from)?;
     app.write(
         &Command::AdminSetPassword {
             password_hash: hash,
@@ -2678,6 +2872,65 @@ async fn watch_branch(
 
 // ---------------- 工具 ----------------
 
+/// 登录失败节流（进程内；集群各节点独立计数，MVP 足够）。固定窗口：窗口内失败 ≥ max 即 429。
+/// 窗口 600s、上限 5 次；成功登录 reset。集群多节点需前置 LB 层限流（各节点计数独立）。
+struct LoginThrottle {
+    inner: std::sync::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>,
+    window: std::time::Duration,
+    max_failures: u32,
+}
+
+impl LoginThrottle {
+    fn new() -> Self {
+        Self {
+            inner: Default::default(),
+            window: std::time::Duration::from_secs(600),
+            max_failures: 5,
+        }
+    }
+
+    /// 已锁定时返回 true（读时顺带清理过期条目：now - last >= window 视为过期清除）。
+    fn blocked(&self, key: &str) -> bool {
+        let mut map = self.inner.lock().expect("login throttle lock");
+        let now = std::time::Instant::now();
+        match map.get(key) {
+            Some((count, last)) => {
+                if now.duration_since(*last) >= self.window {
+                    map.remove(key);
+                    false
+                } else {
+                    *count >= self.max_failures
+                }
+            }
+            None => false,
+        }
+    }
+
+    /// 记录一次失败（写时同样按窗口过期判定：过期则重置计数）。
+    fn record_failure(&self, key: &str) {
+        let mut map = self.inner.lock().expect("login throttle lock");
+        let now = std::time::Instant::now();
+        match map.get_mut(key) {
+            Some((count, last)) => {
+                if now.duration_since(*last) >= self.window {
+                    *count = 1;
+                    *last = now;
+                } else {
+                    *count += 1;
+                }
+            }
+            None => {
+                map.insert(key.to_string(), (1, now));
+            }
+        }
+    }
+
+    /// 成功登录后清空。
+    fn reset(&self, key: &str) {
+        self.inner.lock().expect("login throttle lock").remove(key);
+    }
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2791,4 +3044,164 @@ pub fn build_router(app: ApiState) -> Router {
     ));
     router = router.layer(axum::middleware::from_fn(security_headers));
     router.with_state(app)
+}
+
+// ---------------- join token 单元测试（S2） ----------------
+
+#[cfg(test)]
+mod join_token_tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::http::{HeaderMap, HeaderValue};
+
+    use dsh_core::{InMemoryStore, StateMachine};
+    use dsh_watch::WatchHub;
+
+    use super::{join_token_ok, ApiState};
+
+    /// 用内存态构造 ApiState（仿照 ApiState::new 传参，经 with_retention 注入 join_token）。
+    fn state_with_join_token(token: Option<Arc<str>>) -> ApiState {
+        ApiState::with_retention(
+            Arc::new(Mutex::new(StateMachine::new(
+                Box::new(InMemoryStore::new()),
+            ))),
+            WatchHub::new(),
+            None,
+            None,
+            None,
+            std::time::Duration::from_secs(86400),
+            "admin-pw".into(),
+            None,
+            0,
+            0,
+            token,
+        )
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (_k, v) in pairs {
+            h.insert(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn configured_token_accepts_exact_bearer() {
+        let app = state_with_join_token(Some(Arc::from("s3cret")));
+        assert!(join_token_ok(
+            &app,
+            &headers(&[("authorization", "Bearer s3cret")])
+        ));
+    }
+
+    #[test]
+    fn configured_token_rejects_wrong_missing_or_non_bearer() {
+        let app = state_with_join_token(Some(Arc::from("s3cret")));
+        // 错误 token
+        assert!(!join_token_ok(
+            &app,
+            &headers(&[("authorization", "Bearer wrong")])
+        ));
+        // 缺头
+        assert!(!join_token_ok(&app, &headers(&[])));
+        // 非 Bearer 前缀（Basic / 无前缀）
+        assert!(!join_token_ok(
+            &app,
+            &headers(&[("authorization", "Basic s3cret")])
+        ));
+        assert!(!join_token_ok(
+            &app,
+            &headers(&[("authorization", "s3cret")])
+        ));
+    }
+
+    #[test]
+    fn no_token_allows_any_header() {
+        let app = state_with_join_token(None);
+        assert!(join_token_ok(&app, &headers(&[])));
+        assert!(join_token_ok(
+            &app,
+            &headers(&[("authorization", "Bearer whatever")])
+        ));
+    }
+}
+
+// ---------------- 安全加固单元测试（S6 节流 / argon2 密码哈希） ----------------
+
+#[cfg(test)]
+mod security_tests {
+    use std::time::Duration;
+
+    use super::{hash_password, verify_password, LoginThrottle};
+
+    #[test]
+    fn throttle_blocks_after_max_failures() {
+        let t = LoginThrottle::new();
+        // 默认：窗口 600s、上限 5 次
+        for _ in 0..5 {
+            assert!(!t.blocked("1.2.3.4"), "前 5 次不应被锁");
+            t.record_failure("1.2.3.4");
+        }
+        assert!(t.blocked("1.2.3.4"), "第 6 次（失败已达上限）应被锁");
+        // 其他 IP 不受影响
+        assert!(!t.blocked("5.6.7.8"));
+    }
+
+    #[test]
+    fn throttle_reset_unblocks() {
+        let t = LoginThrottle::new();
+        for _ in 0..5 {
+            t.record_failure("1.2.3.4");
+        }
+        assert!(t.blocked("1.2.3.4"));
+        t.reset("1.2.3.4");
+        assert!(!t.blocked("1.2.3.4"), "reset 后不应被锁");
+        t.record_failure("1.2.3.4");
+        assert!(!t.blocked("1.2.3.4"), "reset 后计数应从零开始");
+    }
+
+    #[test]
+    fn throttle_window_expiry_clears() {
+        // 构造小窗口实例：50ms 窗口、上限 2 次
+        let t = LoginThrottle {
+            inner: Default::default(),
+            window: Duration::from_millis(50),
+            max_failures: 2,
+        };
+        t.record_failure("1.2.3.4");
+        t.record_failure("1.2.3.4");
+        assert!(t.blocked("1.2.3.4"));
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(!t.blocked("1.2.3.4"), "窗口过期后应解锁（读时清理）");
+        // 窗口过期后写时重置计数：再失败 1 次不立即锁
+        t.record_failure("1.2.3.4");
+        assert!(!t.blocked("1.2.3.4"));
+    }
+
+    #[test]
+    fn argon2_phc_roundtrip() {
+        let stored = hash_password("s3cret-pw").expect("argon2 hash");
+        assert!(
+            stored.starts_with("$argon2"),
+            "新格式应为 PHC 字符串: {stored}"
+        );
+        assert!(verify_password("s3cret-pw", &stored, ""));
+        assert!(!verify_password("wrong-pw", &stored, ""));
+    }
+
+    #[test]
+    fn legacy_sha256_compat() {
+        // 旧数据：sha256(salt || pw)，无 "$argon2" 前缀 → 走 legacy 分支
+        let salt = "deadbeef00cafe00";
+        let stored = dsh_core::token_hash(&format!("{salt}old-pw"));
+        assert!(!stored.starts_with("$argon2"));
+        assert!(verify_password("old-pw", &stored, salt));
+        assert!(!verify_password("wrong", &stored, salt));
+        // 盐不匹配（如空盐）→ legacy 分支同样不通过
+        assert!(!verify_password("old-pw", &stored, ""));
+    }
 }

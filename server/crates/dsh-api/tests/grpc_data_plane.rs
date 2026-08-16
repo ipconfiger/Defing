@@ -40,6 +40,7 @@ fn seed_sm(sm: &Mutex<StateMachine>) {
             deletes: vec![],
 
             operator: String::new(),
+            ts: 0,
         },
         6,
     )
@@ -52,6 +53,7 @@ fn seed_sm(sm: &Mutex<StateMachine>) {
             request_id: "r2".into(),
 
             operator: String::new(),
+            ts: 0,
         },
         7,
     )

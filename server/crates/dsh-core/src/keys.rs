@@ -66,6 +66,8 @@ pub fn ref_key(id: &ProjectId, group: &str, item_key: Option<&str>) -> String {
         None => format!("{K_PROJECT}{}{K_REF}{group}", id.as_str()),
     }
 }
+/// 共享项键：sh/{group}/{key}。group/key 已由 validator::valid_key_name 约束
+/// （1-128 位 [A-Za-z0-9._-]，无 `/` 与 HTML 特殊字符），保证索引不会错位。
 pub fn shared_key(group: &str, key: &str) -> String {
     format!("{K_SHARED}{group}/{key}")
 }

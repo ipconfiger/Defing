@@ -28,6 +28,7 @@ async fn start() -> TestServer {
                 &Command::ProjectCreate {
                     name: name.to_string(),
                     operator: String::new(),
+                    ts: 0,
                 },
                 1,
             )
@@ -39,6 +40,7 @@ async fn start() -> TestServer {
                 username: "alice".into(),
                 salt: "s1".into(),
                 password_hash: token_hash("s1alicepw"),
+                ts: 0,
             },
             2,
         )

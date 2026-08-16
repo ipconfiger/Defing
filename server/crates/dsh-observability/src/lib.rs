@@ -78,11 +78,11 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Prometheus 文本指标（模块 10 §3 子集：项目/分支/版本/共享/审计/会话/主密钥/raft）。
+/// Prometheus 文本指标（模块 10 §3 子集：项目/分支/版本/共享/审计/主密钥/raft）。
+/// 注：不含会话活动指标——`dsh_session_active` 是会话存在性 oracle（S7），已移除。
 pub fn metrics_text(
     sm: &Mutex<StateMachine>,
     raft: Option<&RaftHandle>,
-    session_active: bool,
     master_key_ok: bool,
 ) -> String {
     let guard = sm.lock().expect("sm lock");
@@ -130,11 +130,6 @@ pub fn metrics_text(
     out.push_str("# TYPE dsh_audit_entries gauge\n");
     out.push_str(&format!("dsh_audit_entries {audits}\n"));
 
-    out.push_str(
-        "# HELP dsh_session_active 管理员会话是否活动（0/1，全局管理员或任一项目管理员）\n",
-    );
-    out.push_str("# TYPE dsh_session_active gauge\n");
-    out.push_str(&format!("dsh_session_active {}\n", session_active as u8));
     out.push_str("# HELP dsh_master_key_ok 主密钥是否就绪（0/1）\n");
     out.push_str("# TYPE dsh_master_key_ok gauge\n");
     out.push_str(&format!("dsh_master_key_ok {}\n", master_key_ok as u8));
@@ -230,11 +225,12 @@ mod tests {
     #[test]
     fn metrics_contains_gauges() {
         let sm = Mutex::new(StateMachine::new(Box::new(InMemoryStore::new())));
-        let text = metrics_text(&sm, None, false, true);
+        let text = metrics_text(&sm, None, true);
         assert!(text.contains("dsh_projects 0"));
-        assert!(text.contains("dsh_session_active 0"));
         assert!(text.contains("dsh_master_key_ok 1"));
         assert!(text.contains("dsh_versions 0"));
+        // S7：会话存在性指标已移除（信息泄露 oracle）
+        assert!(!text.contains("dsh_session_active"));
     }
 
     #[test]

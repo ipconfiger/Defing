@@ -207,11 +207,31 @@ pub fn ring_file_path(key_file: &str) -> std::path::PathBuf {
 }
 
 /// 持久化主密钥环（base64 列表 JSON，旧→新）。
+///
+/// 密钥环内含全部历史+当前 KEK 的明文，绝不能世界可读（S4）：
+/// - Unix 下用 OpenOptions 以 0o600 mode 直接创建/截断文件，避免「先 0644 写、
+///   再 chmod」的权限暴露窗口；
+/// - 文件已存在时 OpenOptions 的 mode 只作用于创建，因此写后再显式
+///   set_permissions 一次，顺带修复修复前以 0644 落盘的旧文件；
+/// - 两种操作的错误均经 `?` 转换为 CryptoError。
 pub fn save_ring(path: &std::path::Path, ring: &KeyRing) -> Result<(), CryptoError> {
     let list: Vec<String> = ring.entries().iter().map(|k| B64.encode(k)).collect();
     let raw =
         serde_json::to_vec(&list).map_err(|e| CryptoError::Msg(format!("serialize ring: {e}")))?;
-    std::fs::write(path, raw)?;
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o600);
+        let mut f = opts.open(path)?;
+        f.write_all(&raw)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, raw)?;
+    }
     Ok(())
 }
 
@@ -353,6 +373,13 @@ mod rotation_tests {
         let mut ring = KeyRing::new(kek(1));
         ring.push(kek(2));
         save_ring(&path, &ring).unwrap();
+        // S4：密钥环文件权限必须为 0600（仅 Unix 断言，非 Unix 平台跳过）
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "ring 文件权限必须为 0600");
+        }
         let loaded = load_ring(&path).unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0], kek(1));

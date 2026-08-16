@@ -33,6 +33,7 @@ async fn snapshot_persists_across_restart() {
                 &Command::ProjectCreate {
                     name: "p".into(),
                     operator: String::new(),
+                    ts: 0,
                 },
                 1,
             )

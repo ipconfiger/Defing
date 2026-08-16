@@ -161,6 +161,7 @@ mod tests {
             &Command::ProjectCreate {
                 name: "p".into(),
                 operator: String::new(),
+                ts: 0,
             },
             1,
         )
@@ -192,6 +193,7 @@ mod tests {
                 request_id: "s1".into(),
 
                 operator: String::new(),
+                ts: 0,
             },
             3,
         )
@@ -210,6 +212,7 @@ mod tests {
                     deletes: vec![],
 
                     operator: String::new(),
+                    ts: 0,
                 },
                 10 + i,
             )
@@ -222,6 +225,7 @@ mod tests {
                     request_id: format!("r{i}"),
 
                     operator: String::new(),
+                    ts: 0,
                 },
                 20 + i,
             )
@@ -265,6 +269,7 @@ mod rewrap_tests {
             &Command::ProjectCreate {
                 name: "p".into(),
                 operator: String::new(),
+                ts: 0,
             },
             1,
         )
@@ -305,6 +310,7 @@ mod rewrap_tests {
                 request_id: "s1".into(),
 
                 operator: String::new(),
+                ts: 0,
             },
             3,
         )
@@ -329,6 +335,7 @@ mod rewrap_tests {
                 deletes: vec![],
 
                 operator: String::new(),
+                ts: 0,
             },
             4,
         )
@@ -341,6 +348,7 @@ mod rewrap_tests {
                 request_id: "r1".into(),
 
                 operator: String::new(),
+                ts: 0,
             },
             5,
         )
@@ -369,6 +377,7 @@ mod rewrap_tests {
                 request_id: "sp".into(),
 
                 operator: String::new(),
+                ts: 0,
             },
             7,
         )

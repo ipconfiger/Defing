@@ -419,10 +419,19 @@ impl StateMachine {
 
     // ---------------- apply ----------------
 
+    /// 命令载荷墙钟（API 层注入）；0 = 回退 apply 的 now_ms 参数（旧日志重放兼容）。
+    fn eff_ts(ts: &i64, fallback: i64) -> i64 {
+        if *ts > 0 {
+            *ts
+        } else {
+            fallback
+        }
+    }
+
     pub fn apply(&mut self, cmd: &Command, now_ms: i64) -> ApplyOutcome {
         match cmd {
-            Command::ProjectCreate { name, operator } => {
-                self.apply_project_create(name, now_ms, operator)
+            Command::ProjectCreate { name, operator, ts } => {
+                self.apply_project_create(name, Self::eff_ts(ts, now_ms), operator)
             }
             Command::ProjectDelete { id, operator } => self.apply_project_delete(id, operator),
             Command::BranchCreate {
@@ -430,7 +439,14 @@ impl StateMachine {
                 name,
                 source,
                 operator,
-            } => self.apply_branch_create(project, name, source.as_ref(), now_ms, operator),
+                ts,
+            } => self.apply_branch_create(
+                project,
+                name,
+                source.as_ref(),
+                Self::eff_ts(ts, now_ms),
+                operator,
+            ),
             Command::BranchDelete {
                 project,
                 name,
@@ -447,21 +463,44 @@ impl StateMachine {
                 comment,
                 request_id,
                 operator,
-            } => self.apply_publish_structure(project, comment, request_id, now_ms, operator),
+                ts,
+            } => self.apply_publish_structure(
+                project,
+                comment,
+                request_id,
+                Self::eff_ts(ts, now_ms),
+                operator,
+            ),
             Command::DraftUpdate {
                 project,
                 branch,
                 updates,
                 deletes,
                 operator,
-            } => self.apply_draft_update(project, branch, updates, deletes, now_ms, operator),
+                ts,
+            } => self.apply_draft_update(
+                project,
+                branch,
+                updates,
+                deletes,
+                Self::eff_ts(ts, now_ms),
+                operator,
+            ),
             Command::Publish {
                 project,
                 branch,
                 comment,
                 request_id,
                 operator,
-            } => self.apply_publish(project, branch, comment, request_id, now_ms, operator),
+                ts,
+            } => self.apply_publish(
+                project,
+                branch,
+                comment,
+                request_id,
+                Self::eff_ts(ts, now_ms),
+                operator,
+            ),
             Command::Rollback {
                 project,
                 branch,
@@ -469,13 +508,14 @@ impl StateMachine {
                 comment,
                 request_id,
                 operator,
+                ts,
             } => self.apply_rollback(
                 project,
                 branch,
                 *to_version,
                 comment,
                 request_id,
-                now_ms,
+                Self::eff_ts(ts, now_ms),
                 operator,
             ),
             Command::SharedDraftUpdate { item, operator } => {
@@ -485,7 +525,8 @@ impl StateMachine {
                 comment,
                 request_id,
                 operator,
-            } => self.apply_shared_publish(comment, request_id, now_ms, operator),
+                ts,
+            } => self.apply_shared_publish(comment, request_id, Self::eff_ts(ts, now_ms), operator),
             Command::RefBind {
                 project,
                 binding,
@@ -509,7 +550,14 @@ impl StateMachine {
                 username,
                 salt,
                 password_hash,
-            } => self.apply_project_admin_create(project, username, salt, password_hash, now_ms),
+                ts,
+            } => self.apply_project_admin_create(
+                project,
+                username,
+                salt,
+                password_hash,
+                Self::eff_ts(ts, now_ms),
+            ),
             Command::ProjectAdminDelete { username } => self.apply_project_admin_delete(username),
             Command::ProjectAdminSetPassword {
                 username,
@@ -538,12 +586,17 @@ impl StateMachine {
                 self.apply_admin_set_password(password_hash)
             }
             Command::AuditAppend { entry } => self.apply_audit_append(entry),
+            Command::RotateMasterKey { kek } => self.apply_rotate_master_key(kek),
         }
     }
 
     fn apply_project_create(&mut self, name: &str, now_ms: i64, _operator: &str) -> ApplyOutcome {
         if !valid_name(name) {
             return Err(Error::validation(format!("invalid project name: {name:?}")));
+        }
+        // N2：限额表 MAX_PROJECTS 强制（此前为死常量，未实施）
+        if self.list_projects()?.len() >= MAX_PROJECTS {
+            return Err(Error::limit_exceeded("too many projects"));
         }
         let id = ProjectId(name.to_string());
         if self.get_project(&id)?.is_some() {
@@ -586,6 +639,28 @@ impl StateMachine {
                 .delete(pa_session_key(&acct.username).as_bytes())?;
             self.store
                 .delete(project_admin_key(&acct.username).as_bytes())?;
+        }
+        // N1：清理孤儿全局引用索引（共享项发布级联扫描会命中已删项目，索引脏数据需一并清除）。
+        // 共享 group/key 与项目名/组名均受 valid_key_name 字符集约束（无 `/`），按 `/` 切分可靠。
+        // idx/ref/{sg}/{sk}/{project}/{group}/{item_key} → 第 3 段（index 2）为 project
+        for (k, _) in self.store.get_prefix(K_IDX_REF.as_bytes())? {
+            let ks = String::from_utf8_lossy(&k);
+            if let Some(rest) = ks.strip_prefix(K_IDX_REF) {
+                let parts: Vec<&str> = rest.split('/').collect();
+                if parts.len() == 5 && parts[2] == id.as_str() {
+                    self.store.delete(&k)?;
+                }
+            }
+        }
+        // idx/refg/{sg}/{project}/{group} → 第 2 段（index 1）为 project
+        for (k, _) in self.store.get_prefix(K_IDX_REFG.as_bytes())? {
+            let ks = String::from_utf8_lossy(&k);
+            if let Some(rest) = ks.strip_prefix(K_IDX_REFG) {
+                let parts: Vec<&str> = rest.split('/').collect();
+                if parts.len() == 3 && parts[1] == id.as_str() {
+                    self.store.delete(&k)?;
+                }
+            }
         }
         Ok(vec![])
     }
@@ -1053,6 +1128,11 @@ impl StateMachine {
         if item.group.is_empty() || item.key.is_empty() {
             return Err(Error::validation("shared item group/key required"));
         }
+        if !validator::valid_key_name(&item.group) || !validator::valid_key_name(&item.key) {
+            return Err(Error::validation(
+                "shared group/key 须为 1-128 位 [A-Za-z0-9._-]",
+            ));
+        }
         let size = serde_json::to_vec(item)
             .map_err(|e| Error::internal(format!("serialize shared: {e}")))?
             .len();
@@ -1282,6 +1362,13 @@ impl StateMachine {
         binding: &RefBinding,
         _operator: &str,
     ) -> ApplyOutcome {
+        if !validator::valid_key_name(&binding.shared_group)
+            || !validator::valid_key_name(&binding.shared_key)
+        {
+            return Err(Error::validation(
+                "shared group/key 须为 1-128 位 [A-Za-z0-9._-]",
+            ));
+        }
         let structure = self
             .get_structure(project)?
             .ok_or_else(|| Error::not_found(format!("project {project}")))?;
@@ -1605,20 +1692,6 @@ impl StateMachine {
         Ok(out)
     }
 
-    /// 读取项目管理员会话。
-    /// 是否存在任一活动项目管理员会话（metrics 聚合用）。
-    pub fn any_pa_session_active(&self, now_ms: i64) -> bool {
-        match self.store.get_prefix(K_PA_SESSION.as_bytes()) {
-            Ok(entries) => entries.iter().any(|(_, raw)| {
-                serde_json::from_slice::<AdminSession>(raw)
-                    .ok()
-                    .map(|s| s.expires_at.map(|e| now_ms < e).unwrap_or(true))
-                    .unwrap_or(false)
-            }),
-            Err(_) => false,
-        }
-    }
-
     pub fn get_pa_session(&self, username: &str) -> Result<Option<AdminSession>, Error> {
         load(&*self.store, &pa_session_key(username))
     }
@@ -1646,6 +1719,12 @@ impl StateMachine {
         save(&*self.store, K_AUDIT_SEQ, &seq)?;
         Ok(vec![])
     }
+
+    /// 密钥轮换：副作用（更新 Cipher/写 ring 文件）由 dsh-raft 的 apply 钩子执行，
+    /// 状态机本身不落任何数据（保证确定性，跨节点重放结果一致）。
+    fn apply_rotate_master_key(&mut self, _kek: &[u8]) -> ApplyOutcome {
+        Ok(vec![])
+    }
 }
 
 /// 会话令牌哈希（SHA-256 hex；明文 token 不落库/不落日志，I7）。
@@ -1657,4 +1736,154 @@ pub fn token_hash(token: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::InMemoryStore;
+
+    fn sm() -> StateMachine {
+        StateMachine::new(Box::new(InMemoryStore::new()))
+    }
+
+    fn shared_item(group: &str, key: &str) -> SharedItem {
+        SharedItem {
+            group: group.into(),
+            key: key.into(),
+            ty: ValueType::String,
+            secret: false,
+            required: false,
+            value: Value::String("v".into()),
+            version: 0,
+        }
+    }
+
+    #[test]
+    fn shared_draft_rejects_dangerous_names() {
+        let mut s = sm();
+        // `/` 会破坏 sh/{group}/{key} 与 idx/ref 索引分隔 → 级联静默跳过（C3）
+        assert!(s
+            .apply_shared_draft_update(&shared_item("a/b", "k"), "")
+            .is_err());
+        assert!(s
+            .apply_shared_draft_update(&shared_item("g", "k/x"), "")
+            .is_err());
+        // HTML/XSS 载荷（S1）、非 ASCII、空白、引号
+        for (g, k) in [
+            ("<img onerror=alert(1)>", "k"),
+            ("g", "<img>"),
+            ("配置", "k"),
+            ("g", "a b"),
+            ("g", "a'b"),
+            ("g", "a&b"),
+        ] {
+            assert!(
+                s.apply_shared_draft_update(&shared_item(g, k), "").is_err(),
+                "{g:?}/{k:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_draft_accepts_safe_names() {
+        let mut s = sm();
+        for (g, k) in [
+            ("infra.db", "host_name-1"),
+            ("redis", "max_conns"),
+            ("g", "k"),
+        ] {
+            assert!(
+                s.apply_shared_draft_update(&shared_item(g, k), "").is_ok(),
+                "{g:?}/{k:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn ref_bind_rejects_dangerous_shared_names() {
+        let mut s = sm();
+        // 校验发生在项目结构查询之前，无需先建项目
+        for (sg, sk) in [
+            ("infra/..", "k"),
+            ("infra", "<img>"),
+            ("配置", "k"),
+            ("infra", "a b"),
+        ] {
+            let b = RefBinding {
+                group: "redis".into(),
+                item_key: Some("host".into()),
+                shared_group: sg.into(),
+                shared_key: sk.into(),
+            };
+            let e = s
+                .apply_ref_bind(&ProjectId("p".into()), &b, "")
+                .expect_err("must reject");
+            assert_eq!(e.kind, ErrorKind::Validation, "{sg:?}/{sk:?}: {e:?}");
+        }
+    }
+
+    #[test]
+    fn ref_bind_accepts_safe_shared_names() {
+        let mut s = sm();
+        let b = RefBinding {
+            group: "redis".into(),
+            item_key: Some("host".into()),
+            shared_group: "infra.db".into(),
+            shared_key: "host-1".into(),
+        };
+        // 通过字符集校验后走到项目结构查找（项目不存在 → NotFound，而非 Validation）
+        let e = s
+            .apply_ref_bind(&ProjectId("p".into()), &b, "")
+            .expect_err("project missing");
+        assert_eq!(e.kind, ErrorKind::NotFound, "{e:?}");
+    }
+
+    /// N1 回归：删除项目须清理全局引用索引（idx/ref、idx/refg）中的孤儿条目，
+    /// 否则共享项发布级联扫描会永久命中已删项目（脏数据残留）。
+    #[test]
+    fn project_delete_cleans_orphan_ref_indexes() {
+        let mut s = sm();
+        let proj = "order-service";
+        s.apply_project_create(proj, 1, "").unwrap();
+
+        // 直接构造 RefBind 已写入的全局引用索引键（item 级 5 段 + 组级 3 段），
+        // 模拟删除项目后遗留的孤儿条目。
+        let item_idx = format!("{K_IDX_REF}infra/host/{proj}/redis/host");
+        let group_idx = format!("{K_IDX_REFG}infra/{proj}/redis");
+        s.store.put(item_idx.as_bytes(), b"1").unwrap();
+        s.store.put(group_idx.as_bytes(), b"1").unwrap();
+        // 对照组：其他项目的索引必须保留。
+        let other_item = format!("{K_IDX_REF}infra/host/other-svc/redis/host");
+        let other_group = format!("{K_IDX_REFG}infra/other-svc/redis");
+        s.store.put(other_item.as_bytes(), b"1").unwrap();
+        s.store.put(other_group.as_bytes(), b"1").unwrap();
+
+        s.apply_project_delete(&ProjectId(proj.into()), "").unwrap();
+
+        // 断言：idx/ref/ 与 idx/refg/ 前缀下不存在含该项目 id 的键（与清理逻辑同构的精确匹配）。
+        for (k, _) in s.store.get_prefix(K_IDX_REF.as_bytes()).unwrap() {
+            let ks = String::from_utf8_lossy(&k);
+            if let Some(rest) = ks.strip_prefix(K_IDX_REF) {
+                let parts: Vec<&str> = rest.split('/').collect();
+                assert!(
+                    !(parts.len() == 5 && parts[2] == proj),
+                    "orphan idx/ref key survives: {ks}"
+                );
+            }
+        }
+        for (k, _) in s.store.get_prefix(K_IDX_REFG.as_bytes()).unwrap() {
+            let ks = String::from_utf8_lossy(&k);
+            if let Some(rest) = ks.strip_prefix(K_IDX_REFG) {
+                let parts: Vec<&str> = rest.split('/').collect();
+                assert!(
+                    !(parts.len() == 3 && parts[1] == proj),
+                    "orphan idx/refg key survives: {ks}"
+                );
+            }
+        }
+        // 对照组索引不受影响。
+        assert!(s.store.get(other_item.as_bytes()).unwrap().is_some());
+        assert!(s.store.get(other_group.as_bytes()).unwrap().is_some());
+    }
 }

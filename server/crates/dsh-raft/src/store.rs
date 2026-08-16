@@ -403,16 +403,29 @@ pub struct StateMachineStore {
     current_snapshot: Arc<tokio::sync::Mutex<Option<(SnapshotMeta<NodeId, NodeInfo>, Vec<u8>)>>>,
     /// 发布事件广播（集群 watch：apply 时向本地订阅者推送）
     events: tokio::sync::broadcast::Sender<PublishEvent>,
+    /// 主密钥轮换钩子：apply 到 `Command::RotateMasterKey` 成功时调用（更新本地 Cipher keyring + 持久化 ring 文件）。
+    /// 状态机本身不落数据（确定性），此钩子是集群一致的密钥轮换副作用出口。
+    rotation_hook: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
 }
 
 impl StateMachineStore {
     pub fn new(sm: Arc<Mutex<StateMachine>>, db: DbHandle) -> Self {
+        Self::new_with_rotation(sm, db, None)
+    }
+
+    /// 构造状态机存储并挂载主密钥轮换钩子（集群模式由 dsh-cli 传入；dev-single 走 handler 本地逻辑，不挂）。
+    pub fn new_with_rotation(
+        sm: Arc<Mutex<StateMachine>>,
+        db: DbHandle,
+        hook: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    ) -> Self {
         let (tx, _rx) = tokio::sync::broadcast::channel(1024);
         Self {
             sm,
             db,
             current_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
             events: tx,
+            rotation_hook: hook,
         }
     }
 
@@ -549,6 +562,13 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                         for e in &events {
                             let _ = self.events.send(e.clone());
                         }
+                        // 主密钥轮换副作用（更新本地 keyring + 持久化 ring 文件）：
+                        // 状态机 apply 成功后才触发（钩子幂等，重放/多节点安全）。
+                        if let dsh_core::command::Command::RotateMasterKey { kek } = cmd {
+                            if let Some(h) = &self.rotation_hook {
+                                h(kek.clone());
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("apply command failed (logged but state unchanged): {e}");
@@ -570,6 +590,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                 db: self.db.clone(),
                 current_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
                 events: self.events.clone(),
+                rotation_hook: self.rotation_hook.clone(),
             }),
         }
     }
@@ -781,6 +802,67 @@ mod tests {
         // apply 一条空白日志 → last_applied 落盘（per-entry 独立事务）
         store.apply([blank(1)]).await.unwrap();
         assert!(store.has_persisted_state());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rotation_hook_fires_on_rotate_command_only() {
+        let dir = tmpdir("rot");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage.clone()))));
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let hook_calls = calls.clone();
+        let hook_received = received.clone();
+        let mut store = StateMachineStore::new_with_rotation(
+            sm.clone(),
+            storage.raw_db(),
+            Some(Arc::new(move |kek: Vec<u8>| {
+                hook_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                hook_received.lock().unwrap().push(kek);
+            })),
+        );
+
+        // RotateMasterKey 条目 → 钩子被调用且收到正确 kek
+        let kek = vec![1u8; 32];
+        let rotate = Entry {
+            log_id: LogId {
+                leader_id: LeaderId::new(1, 1),
+                index: 1,
+            },
+            payload: EntryPayload::Normal(dsh_core::command::Command::RotateMasterKey {
+                kek: kek.clone(),
+            }),
+        };
+        store.apply([rotate]).await.unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "hook must fire exactly once for RotateMasterKey"
+        );
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![kek],
+            "hook must receive the exact new KEK"
+        );
+
+        // 普通命令 → 钩子不再被调用
+        let normal = Entry {
+            log_id: LogId {
+                leader_id: LeaderId::new(1, 1),
+                index: 2,
+            },
+            payload: EntryPayload::Normal(dsh_core::command::Command::SessionLogout),
+        };
+        store.apply([normal]).await.unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "hook must NOT fire for non-rotate commands"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

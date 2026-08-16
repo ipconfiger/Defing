@@ -108,6 +108,12 @@ struct Cli {
     /// 数据面 gRPC 访问令牌（metadata authorization: Bearer <token>；缺省开放，仅建议集群启用）
     #[arg(long)]
     data_plane_token: Option<String>,
+    /// 集群 join 引导令牌（/api/v1/cluster/join 需 Bearer 匹配；缺省不校验）
+    #[arg(long)]
+    join_token: Option<String>,
+    /// Raft 内部 RPC 共享令牌（缺省不校验；启用后集群内所有节点必须传相同值）
+    #[arg(long)]
+    raft_token: Option<String>,
     /// 生成新主密钥（base64 32B）并退出
     #[arg(long)]
     gen_master_key: bool,
@@ -286,17 +292,22 @@ async fn run_admin_cmd(
 }
 
 /// 加入集群：向目标端点发起 join（需命中 leader；带重试与超时）。
+/// join_token 为 Some 时请求携带 `Authorization: Bearer <token>`（与节点 --join-token 匹配）。
 async fn join_cluster(
     _raft: &dsh_raft::RaftHandle,
     node_id: u64,
     node: RaftNodeInfo,
     join_url: &str,
+    join_token: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        let resp = client
-            .post(format!("{join_url}/api/v1/cluster/join"))
+        let mut req = client.post(format!("{join_url}/api/v1/cluster/join"));
+        if let Some(token) = join_token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
             .json(&serde_json::json!({
                 "node_id": node_id,
                 "http_addr": node.http_addr,
@@ -314,6 +325,36 @@ async fn join_cluster(
             }
         }
     }
+}
+
+/// 集群轮换钩子：Raft apply 到 RotateMasterKey 时更新本节点 keyring 并持久化 ring 文件
+/// （幂等：已含该 KEK 则跳过，重放安全；持久化失败不切换内存，保持可解）。
+fn cluster_rotation_hook(
+    key_file: Option<&str>,
+    cipher: Option<Arc<Cipher>>,
+) -> Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>> {
+    let cipher = cipher?;
+    let ring_path = key_file.map(dsh_crypto::ring_file_path);
+    Some(Arc::new(move |kek: Vec<u8>| {
+        if kek.len() != 32 {
+            return;
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&kek);
+        let ring = cipher.keyring();
+        if ring.entries().iter().any(|k| k == &arr) {
+            return; // 幂等（重放/多节点）
+        }
+        let mut new_ring = ring;
+        new_ring.push(arr);
+        if let Some(p) = &ring_path {
+            if let Err(e) = dsh_crypto::save_ring(p, &new_ring) {
+                tracing::error!("rotate: persist ring file: {e}");
+                return; // 持久化失败不切换内存（保持可解）
+            }
+        }
+        cipher.rotate_master_key(arr);
+    }))
 }
 
 fn resolve_admin_password(cli: &Cli, node_label: &str) -> Arc<str> {
@@ -352,12 +393,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .master_key_file
             .as_deref()
             .map(dsh_crypto::ring_file_path);
-        let ring_entries = ring_path
-            .as_ref()
-            .and_then(|p| dsh_crypto::load_ring(p).ok())
-            .unwrap_or_default();
+        // N3：ring 文件损坏/解析失败不再静默当空处理 —— 旧密文将不可解，必须告警。
+        let ring_entries = match ring_path.as_ref() {
+            Some(p) => match dsh_crypto::load_ring(p) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("load ring {}: {e}", p.display());
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        // 去重：ring 文件首项即为文件主密钥本身（首次轮换时写入），
+        // 直接 extend 会让每次重启代际 +1 且 keyring 含重复 KEK。
         let mut entries = vec![k];
-        entries.extend(ring_entries);
+        entries.extend(ring_entries.into_iter().filter(|e| *e != k));
         Arc::new(Cipher::with_keyring(dsh_crypto::KeyRing::from_entries(
             entries,
         )))
@@ -430,6 +480,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .map(dsh_crypto::ring_file_path),
             cli.version_retention,
             cli.audit_retention,
+            cli.join_token.clone().map(Arc::from),
         );
         spawn_grpc(&cli, app.clone());
         let router = dsh_api::build_router(app);
@@ -446,7 +497,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let storage = RedbStorage::open(&data_dir)?;
     let db = storage.raw_db();
     let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage))));
-    let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone()));
+    // 集群模式挂主密钥轮换钩子：Raft apply 到 RotateMasterKey 时更新本节点 keyring 并持久化 ring 文件
+    // （dev-single 不挂——它走 handler 的本地轮换逻辑，先持久化后切换）。
+    let sm_store = Arc::new(StateMachineStore::new_with_rotation(
+        sm.clone(),
+        db.clone(),
+        cluster_rotation_hook(cli.master_key_file.as_deref(), cipher.clone()),
+    ));
     // 重启恢复：raft-meta 非空说明该节点已有持久化状态 → 无需 --bootstrap/--join，自动 resume
     let has_state = sm_store.has_persisted_state();
     if !cli.bootstrap && cli.join.is_none() && !has_state {
@@ -461,7 +518,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         http_addr: cli.http_addr.clone(),
         raft_addr: cli.raft_addr.clone(),
     };
-    let network = HttpNetworkFactory::new();
+    let network = match &cli.raft_token {
+        Some(t) => HttpNetworkFactory::with_token(Some(t.clone())),
+        None => HttpNetworkFactory::new(),
+    };
     let raft = dsh_raft::new_raft_node(
         node_id,
         node_info.clone(),
@@ -476,7 +536,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         dsh_raft::initialize_single(&raft, node_id, node_info.clone()).await?;
         eprintln!("node {node_id} bootstrap done");
     } else if let Some(join_url) = &cli.join {
-        join_cluster(&raft, node_id, node_info.clone(), join_url).await?;
+        join_cluster(
+            &raft,
+            node_id,
+            node_info.clone(),
+            join_url,
+            cli.join_token.as_deref(),
+        )
+        .await?;
         eprintln!("node {node_id} join requested -> {join_url}");
     } else if has_state {
         eprintln!("node {node_id} resuming from persisted state (auto-rejoin)");
@@ -509,7 +576,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // Raft RPC 服务（raft_addr）
-    let raft_state = RaftServerState { raft: raft.clone() };
+    let raft_state = match &cli.raft_token {
+        Some(t) => RaftServerState::with_token(raft.clone(), Some(Arc::from(t.as_str()))),
+        None => RaftServerState::new(raft.clone()),
+    };
     let raft_router = dsh_raft::raft_router(raft_state);
     let raft_addr = cli.raft_addr.clone();
     tokio::spawn(async move {
@@ -535,6 +605,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .map(dsh_crypto::ring_file_path),
         cli.version_retention,
         cli.audit_retention,
+        cli.join_token.clone().map(Arc::from),
     );
     spawn_grpc(&cli, app.clone());
     let router = dsh_api::build_router(app);

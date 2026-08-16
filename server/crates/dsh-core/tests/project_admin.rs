@@ -27,6 +27,7 @@ fn setup_project(name: &str) -> StateMachine {
         &Command::ProjectCreate {
             name: name.to_string(),
             operator: String::new(),
+            ts: 0,
         },
         1_000,
     )
@@ -42,6 +43,7 @@ fn create_pa(s: &mut StateMachine, project: &str, username: &str) {
             username: username.to_string(),
             salt: "s16bytesalt00".to_string(),
             password_hash: "hash".to_string(),
+            ts: 0,
         },
         1_000,
     )
@@ -78,6 +80,7 @@ fn pa_create_duplicate_rejected() {
                 username: "alice".to_string(),
                 salt: "x".to_string(),
                 password_hash: "h".to_string(),
+                ts: 0,
             },
             2_000,
         )
@@ -95,6 +98,7 @@ fn pa_create_missing_project_rejected() {
                 username: "bob".to_string(),
                 salt: "x".to_string(),
                 password_hash: "h".to_string(),
+                ts: 0,
             },
             1_000,
         )
@@ -112,6 +116,7 @@ fn pa_create_bad_username_rejected() {
                 username: bad.to_string(),
                 salt: "x".to_string(),
                 password_hash: "h".to_string(),
+                ts: 0,
             },
             1_000,
         );
@@ -372,6 +377,7 @@ fn project_delete_cascades_pa_accounts_and_sessions() {
             &Command::ProjectCreate {
                 name: "beta".to_string(),
                 operator: String::new(),
+                ts: 0,
             },
             1_000,
         )
@@ -444,6 +450,7 @@ fn publish_operator_recorded_in_version() {
             comment: "init".to_string(),
             request_id: "req-test".to_string(),
             operator: "pa:alice".to_string(),
+            ts: 0,
         },
         1_600,
     )
@@ -459,6 +466,7 @@ fn publish_operator_recorded_in_version() {
             }],
             deletes: vec![],
             operator: "pa:alice".to_string(),
+            ts: 0,
         },
         1_700,
     )
@@ -470,6 +478,7 @@ fn publish_operator_recorded_in_version() {
             comment: "c".to_string(),
             request_id: "req-test".to_string(),
             operator: "pa:alice".to_string(),
+            ts: 0,
         },
         1_800,
     )
@@ -513,6 +522,7 @@ fn publish_operator_defaults_to_admin() {
             comment: "init".to_string(),
             request_id: "req-test".to_string(),
             operator: String::new(),
+            ts: 0,
         },
         1_600,
     )
@@ -528,6 +538,7 @@ fn publish_operator_defaults_to_admin() {
             }],
             deletes: vec![],
             operator: String::new(),
+            ts: 0,
         },
         1_700,
     )
@@ -539,6 +550,7 @@ fn publish_operator_defaults_to_admin() {
             comment: "c".to_string(),
             request_id: "req-test".to_string(),
             operator: String::new(),
+            ts: 0,
         },
         1_800,
     )

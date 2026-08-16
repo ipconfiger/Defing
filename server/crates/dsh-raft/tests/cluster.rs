@@ -131,6 +131,7 @@ async fn three_node_bootstrap_join_failover() {
             name: "order-service".into(),
 
             operator: String::new(),
+            ts: 0,
         },
         Duration::from_secs(10),
     )
@@ -194,6 +195,7 @@ async fn three_node_bootstrap_join_failover() {
             request_id: "s1".into(),
 
             operator: String::new(),
+            ts: 0,
         },
         Duration::from_secs(10),
     )
@@ -220,6 +222,7 @@ async fn three_node_bootstrap_join_failover() {
             deletes: vec![],
 
             operator: String::new(),
+            ts: 0,
         },
         Duration::from_secs(10),
     )
@@ -235,6 +238,7 @@ async fn three_node_bootstrap_join_failover() {
             request_id: "r1".into(),
 
             operator: String::new(),
+            ts: 0,
         },
         Duration::from_secs(10),
     )
@@ -276,6 +280,7 @@ async fn three_node_bootstrap_join_failover() {
             name: "svc-b".into(),
 
             operator: String::new(),
+            ts: 0,
         },
         Duration::from_secs(10),
     )
@@ -430,6 +435,7 @@ async fn cluster_watch_events_reach_subscribers() {
             name: "watch-proj".into(),
 
             operator: String::new(),
+            ts: 0,
         },
         Duration::from_secs(10),
     )
@@ -468,6 +474,7 @@ async fn cluster_watch_events_reach_subscribers() {
             request_id: "ws1".into(),
 
             operator: String::new(),
+            ts: 0,
         },
         Duration::from_secs(10),
     )

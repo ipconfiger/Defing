@@ -67,7 +67,9 @@ services:
     init: true
     environment:
       # 开发用主密钥（仅供本机测试，勿用于生产）
-      DSH_MASTER_KEY: "q4UbfiDw6b7wRGnKepAu2Xa0msYz/hIQOGlGr2uhcy8="
+      # O3：可经宿主环境变量覆盖（生产务必注入自己的密钥，勿用默认值）；
+      # 默认值仅供本机测试，泄露即全部 secret 可解。
+      DSH_MASTER_KEY: "${DSH_MASTER_KEY:-q4UbfiDw6b7wRGnKepAu2Xa0msYz/hIQOGlGr2uhcy8=}"
     volumes:
       - ./local-bin:/app
     ports:

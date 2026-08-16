@@ -59,6 +59,7 @@ pub fn seed_demo_project(
             name: project.into(),
 
             operator: String::new(),
+            ts: 0,
         },
         1,
     )?;
@@ -79,6 +80,7 @@ pub fn seed_demo_project(
             request_id: "s1".into(),
 
             operator: String::new(),
+            ts: 0,
         },
         3,
     )?;
@@ -101,6 +103,7 @@ pub fn seed_demo_project(
             deletes: vec![],
 
             operator: String::new(),
+            ts: 0,
         },
         4,
     )?;
@@ -112,6 +115,7 @@ pub fn seed_demo_project(
             request_id: "r1".into(),
 
             operator: String::new(),
+            ts: 0,
         },
         5,
     )?;
