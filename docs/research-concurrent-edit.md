@@ -49,26 +49,32 @@ BranchState {
 ```
 
 ```rust
-// DraftUpdate 命令加字段（Raft wire 兼容：#[serde(default)]，0 = 旧语义不校验）
+// DraftUpdate 命令加字段（Raft wire 兼容：#[serde(default)]，None = 旧语义不校验）
 DraftUpdate {
     project, branch, updates, deletes, operator, ts,
-    #[serde(default)] expected_draft_rev: u64,   // 0 = 不校验（旧客户端/旧日志）
+    #[serde(default)] expected_draft_rev: Option<u64>,  // Some(rev) 严格校验；None = 不校验（旧客户端/旧日志）
 }
 ```
 
+> **为何用 `Option<u64>` 而非 `u64`**：实测发现 `u64` 的"0 = 不校验"与"首次编辑 rev=0"冲突——
+> 新客户端首次保存带 `0` 会被误判为"不校验"而绕过检测。`Option` 下新客户端显式传 `Some(0)` 也参与校验，
+> 旧客户端缺省 `None` 才不校验（兼容 last-write-wins）。
+
 **apply 校验**：
 ```rust
-if cmd.expected_draft_rev > 0 && cmd.expected_draft_rev != st.draft_rev {
-    return Err(Conflict("草稿已被他人修改，请刷新后重试"));
+if let Some(exp) = cmd.expected_draft_rev {
+    if exp != st.draft_rev {
+        return Err(Conflict("草稿已被他人修改（draft_rev {当前} != expected {exp}），请刷新后重试"));
+    }
 }
 st.draft_rev += 1;   // 无论是否带 expected，提交都推进修订号
 ```
 
 ### 3.2 API 层
 
-- `GET /branches/{b}/draft` 响应增加 `draft_rev`；
+- `GET /branches/{b}` 响应增加 `draft_rev`；
 - `PUT /branches/{b}/draft` 请求增加可选 `expected_draft_rev`；
-- 冲突 → 409 + 新 `draft_rev`（客户端刷新）。
+- 冲突 → 409 + 错误消息含当前 `draft_rev`（客户端刷新）。
 
 ### 3.3 语义
 
@@ -76,7 +82,8 @@ st.draft_rev += 1;   // 无论是否带 expected，提交都推进修订号
 |------|------|
 | A、B 同时编辑同一项，B 后提交 | B 若带旧 expected_rev → **409**（A 先提交推进了 rev），B 刷新后看到 A 的值再改 |
 | A 改 X、B 改 Y（不同项） | 若都带 expected_rev：A 提交 rev+1，B 提交时 expected 旧 → **409 误报**（B 被迫刷新）——**粒度粗** |
-| 无人并发 | 不校验（expected=0）或总是匹配，零影响 |
+| 无人并发 | 带最新 expected 总是匹配，零影响 |
+| 旧客户端（无 expected=None） | 不校验，last-write-wins（兼容） |
 
 **粒度权衡**：草稿级 rev 是"粗粒度"（不同 item 的并发编辑也冲突）。
 可选细化：

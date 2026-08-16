@@ -40,42 +40,34 @@ token 格式（session_id 内嵌，O(1) 路由）：
 
 ## 3. 设计
 
-### 3.1 dsh-core：命令扩展（Raft wire 兼容）
+### 3.1 dsh-core：命令扩展（Raft wire 兼容，纯新增）
 
-**原则**：既有命令变体加字段（`#[serde(default)]`），旧日志/旧客户端行为不变（空 session_id = 旧单会话语义）。
+**原则**：**既有命令变体保持原状不动**（旧日志 wire 兼容），多会话用**纯新增 8 个 Multi\* 变体**
+（遵循 project-admin.md §3.1/B1/N10 纪律——给既有变体加字段会导致混合版本集群旧节点静默走
+单会话语义、同一日志 apply 分叉）。旧客户端/旧日志继续走旧变体（单会话语义，不退化）。
 
 ```rust
-// command.rs —— 新增字段全部 #[serde(default)]，空串回退旧行为
-SessionLogin {
-    token_hash, issued_at, expires_at,
-    #[serde(default)] session_id: String,   // 空 → 旧单会话（写 sess/admin）；非空 → 写 sess/admin/{sid}
+// command.rs —— 纯新增变体（旧变体 SessionLogin/Logout/Heartbeat/Pa* 一字未动）
+MultiSessionLogin {
+    token_hash, issued_at, expires_at, session_id: String,   // → 写 sess/admin/{sid}，多会话并存
 }
-SessionLogout {
-    #[serde(default)] session_id: String,   // 空 → 删 sess/admin；非空 → 删 sess/admin/{sid}
-}
-SessionHeartbeat {
-    expires_at,
-    #[serde(default)] session_id: String,
-}
-PaSessionLogin {
-    username, token_hash, issued_at, expires_at, device_id,
-    #[serde(default)] session_id: String,
-}
-PaSessionLogout {
-    username,
-    #[serde(default)] session_id: String,   // 空 → 删该账号旧 key（兼容）；非空 → 删指定
-}
-PaSessionHeartbeat {
-    username, expires_at,
-    #[serde(default)] session_id: String,
-}
+MultiSessionLogout { session_id: String }                    // → 删 sess/admin/{sid}
+MultiSessionHeartbeat { session_id: String, expires_at: Option<i64> }
+MultiSessionLogoutAll                                          // → 删全部管理员会话（旧 key + 前缀）
+MultiPaSessionLogin { username, token_hash, issued_at, expires_at, device_id, session_id }
+MultiPaSessionLogout { username, session_id }
+MultiPaSessionHeartbeat { username, session_id, expires_at: Option<i64> }
+MultiPaSessionLogoutAll { username }                          // → 删该 PA 全部会话
 ```
 
 **apply 语义**：
-- `apply_session_login`：`session_id` 非空 → 写 `sess/admin/{sid}`（**不检查已存在**，多会话并存）；空 → 旧行为（`is_some()` → 409 单会话）；
-- `apply_pa_session_login`：同理按 `session_id` 分支；
-- `apply_session_logout` / `apply_session_heartbeat`：按 `session_id` 定位 key；空 → 旧 key 兼容；
-- **级联**：`ProjectAdminSetPassword` / `ProjectAdminDelete` 级联删会话 → 改为前缀扫描删 `sess/pa/{username}/` 全部（批量）；`AdminSetPassword` 级联 → 删 `sess/admin/` 全部。
+- `apply_multi_session_login`：写 `sess/admin/{sid}`（**不检查已存在**，多会话并存，不 409）；
+- `apply_multi_pa_session_login`：写 `sess/pa/{username}/{sid}`（project 归属从账号记录解析，不可伪造）；
+- `apply_multi_session_logout` / `apply_multi_session_heartbeat`：按 `session_id` 定位 `sess/admin/{sid}`（幂等）；
+- `apply_multi_pa_session_logout` / `apply_multi_pa_session_heartbeat`：按 `(username, session_id)` 定位；
+- **级联双删**（审核 Q3 必修）：`ProjectAdminSetPassword` / `ProjectAdminDelete` 级联 → `delete_all_pa_sessions`
+  （**旧格式单 key `sess/pa/{username}` + 前缀 `sess/pa/{username}/` 双删**，防旧会话残留）；
+  `AdminSetPassword`/`MultiSessionLogoutAll` → `delete_all_admin_sessions`（旧 key `sess/admin` + 前缀双删）。
 
 ### 3.2 dsh-core：keys 函数
 
@@ -112,13 +104,18 @@ fn new_session_id() -> String { new_token() }   // 随机 32B hex
 
 ### 3.4 dsh-api：login / logout / heartbeat / force-logout
 
-- **login**：`session_id` 由 API 生成并写入命令；token 带 sid；**不再处理 409**（多会话始终成功）；N13 过期重登逻辑移除（无单会话冲突）；
-- **logout**：从当前请求的 token 解析 sid（principal 已注入，可经 extensions 携带 sid）→ 命令带 sid 删自己的 key；
-- **heartbeat**：同 logout，带 sid 续期自己的 key；
-- **force-logout**：扩展请求体支持 `session_id`（可选）——指定则精确踢单个；否则按 username 前缀扫全部（新增命令 `AdminForceLogoutAll` 或复用 logout 变体批量）。
+- **login/pa_login**：`session_id` 由 API 生成（`new_session_id()`），token 带 sid
+  （`adm.{sid}.{secret}` / `pa.{username}.{sid}.{secret}`）；提交 `MultiSessionLogin`/`MultiPaSessionLogin`
+  ——**不再处理 409**（多会话始终成功）；N13 过期重登逻辑移除（无单会话冲突）；
+- **logout/heartbeat**：从 Authorization 头解析 sid（`token_session_id` helper，与 resolve_principal
+  同解析纪律 N15）→ 有 sid 走 `MultiSessionLogout`/`MultiSessionHeartbeat`（只删/续自己的 key）；
+  无 sid（旧格式 token）→ 回退旧命令（兼容）；
+- **force-logout**：请求体支持 `session_id`（可选，serde default）——四分支：
+  ① username+session_id → 踢单个 PA 会话；② 仅 session_id → 踢单个管理员会话；
+  ③ 仅 username → 踢该 PA 全部（`MultiPaSessionLogoutAll`）；④ 缺省 → 踢全部管理员（`MultiSessionLogoutAll`）。
 
-**Principal 扩展**：`axum::Extension<Principal>` 需携带 sid（写自己的会话用）。方案：扩展 `Principal::Admin { session_id }`？**不行**——Principal 序列化在会话中，改形状影响 Raft 数据兼容。
-**替代**：sid 从 Authorization 头重新解析（logout/heartbeat handler 内解析一次，与 resolve_principal 同 helper），不改 Principal。
+**Principal 不改形状**：sid 不从 `Principal` 取（改形状影响 Raft 会话数据兼容），
+而是 logout/heartbeat handler 内从 Authorization 头重解析（`token_session_id`），与 resolve_principal 共用解析逻辑。
 
 ### 3.5 会话读取 API（dsh-core 访问器）
 
@@ -132,11 +129,11 @@ pub fn list_admin_sessions(&self) -> Result<Vec<AdminSession>, Error>;          
 
 | 位置 | 改动 |
 |------|------|
-| dsh-core command.rs | 6 命令加 `session_id` 字段（serde default） |
-| dsh-core keys.rs | 4 个 key 函数 + 前缀常量 |
-| dsh-core state.rs | apply 分支（按 sid）、级联批量删、访问器 |
-| dsh-api lib.rs | token 生成、resolve_principal 路由、login/pa_login/logout/heartbeat/force-logout |
-| dsh-core tests / dsh-api tests | 会话相关用例适配 + 多会话新用例 |
+| dsh-core command.rs | **纯新增 8 个 Multi\* 变体**（既有 6 个会话变体一字未动） |
+| dsh-core keys.rs | session_key_with / pa_session_key_with / pa_session_prefix / K_SESSION_PREFIX |
+| dsh-core state.rs | 8 个 Multi apply 方法、级联双删（delete_all_admin_sessions / delete_all_pa_sessions）、访问器（get_session_with / get_pa_session_with / list_admin_sessions） |
+| dsh-api lib.rs | token 生成（new_admin_token / new_pa_token 带 sid）、resolve_principal 路由、token_session_id、login/pa_login/logout/heartbeat/force-logout |
+| dsh-core tests / dsh-api tests | 会话用例适配多会话语义 + T1-T7 新用例 |
 
 ## 5. 测试计划
 
