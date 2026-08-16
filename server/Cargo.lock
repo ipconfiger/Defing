@@ -618,6 +618,7 @@ dependencies = [
  "dsh-core",
  "dsh-crypto",
  "dsh-jobs",
+ "dsh-observability",
  "dsh-raft",
  "dsh-storage",
  "dsh-watch",
@@ -659,6 +660,9 @@ version = "0.1.0"
 dependencies = [
  "dsh-core",
  "dsh-crypto",
+ "dsh-observability",
+ "dsh-raft",
+ "serde_json",
  "tokio",
  "tracing",
 ]

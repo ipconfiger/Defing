@@ -99,6 +99,12 @@ struct Cli {
     /// 审计保留条数（0=不裁剪；默认 100k 条，design-v2）
     #[arg(long, default_value_t = 100000)]
     audit_retention: u64,
+    /// 灰度自动回滚阈值（本地 HTTP 5xx 比例 %；0=禁用，G5/D33）
+    #[arg(long, default_value_t = 0.0)]
+    gray_rollback_threshold: f64,
+    /// 灰度自动回滚检查间隔秒（测试可调小；默认 60）
+    #[arg(long, default_value_t = 60)]
+    gray_rollback_interval: u64,
     /// 管理员密码（缺省首启随机生成并打印；admin 客户端模式用于登录）
     #[arg(long, global = true)]
     admin_password: Option<String>,
@@ -507,6 +513,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
         let sm = StateMachine::new(store);
         let admin_password = resolve_admin_password(&cli, "首次启动");
+        // hub 将被移入 ApiState，先取 sender 供自动回滚广播（G5/D33）
+        let hub_sender = hub.sender().clone();
         let app = ApiState::with_retention(
             Arc::new(RwLock::new(sm)),
             hub,
@@ -524,6 +532,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             trusted_proxies.clone(),
             cli.data_plane_token.clone().map(Arc::from),
         );
+        // G5/D33：灰度自动回滚（dev-single 恒 leader；threshold 百分比 → 比例）
+        if cli.gray_rollback_threshold > 0.0 {
+            let (_leader_tx, leader_rx) = tokio::sync::watch::channel(true);
+            dsh_jobs::spawn_gray_auto_rollback(
+                app.sm.clone(),
+                None,
+                Some(hub_sender),
+                app.audit.clone(),
+                Box::new(dsh_jobs::LocalHttp5xxProbe),
+                cli.gray_rollback_threshold / 100.0,
+                std::time::Duration::from_secs(cli.gray_rollback_interval),
+                leader_rx,
+            );
+        }
         spawn_grpc(&cli, app.clone());
         let router = dsh_api::build_router(app);
         let listener = tokio::net::TcpListener::bind(&cli.http_addr).await?;
@@ -626,7 +648,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 keep: cli.audit_retention as usize,
             });
         }
-        scheduler.spawn(sm.clone(), leader_rx);
+        scheduler.spawn(sm.clone(), leader_rx.clone());
+        // G5/D33：灰度自动回滚（可选，仅 leader；threshold 为百分比 → 转比例）
+        if cli.gray_rollback_threshold > 0.0 {
+            let audit = dsh_observability::AuditLog::new(sm.clone(), Some(raft.clone()));
+            dsh_jobs::spawn_gray_auto_rollback(
+                sm.clone(),
+                Some(raft.clone()),
+                Some(hub.sender().clone()),
+                audit,
+                Box::new(dsh_jobs::LocalHttp5xxProbe),
+                cli.gray_rollback_threshold / 100.0,
+                std::time::Duration::from_secs(cli.gray_rollback_interval),
+                leader_rx,
+            );
+        }
     }
 
     // Raft RPC 服务（raft_addr）

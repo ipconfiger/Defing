@@ -320,6 +320,36 @@ WatchEvent（proto）：加 bool gray = 8（向后兼容）
 | D22 watch 语义 | 事件带 gray 标记；promote 补发全量 | 防"灰→全量"切换漏收（roadmap 风险 1） |
 | D23 结构发布 × 灰度 | 灰度版本同步 bump 不失效 | 灰度期间结构演进不中断观察 |
 
+---
+
+## 附录三：百分比分桶算法（G5 文档化，D33 配套）
+
+**语义**：`fnv1a_hash(instance_id) % 100 < percentage` 命中灰度（`GrayRule.percentage` 为 0-100）。
+
+**算法**（`StateMachine::fnv1a_hash`，32 位 FNV-1a，纯函数）：
+
+```
+h = 0x811c9dc5
+for b in instance_id.as_bytes():        // UTF-8 字节序
+    h ^= b
+    h = (h * 0x01000193) mod 2^32
+命中 ⇔ h % 100 < percentage
+```
+
+**确定性论证（跨节点同桶）**：
+1. `fnv1a_hash` 是纯函数（无墙钟/随机/IO）——同一 instance_id 恒同哈希；
+2. 规则（percentage）是**状态机数据**，经 Raft 复制到全部节点——各节点读到同一规则；
+3. `rule_matches` 求值次序固定（labels → IP → percent），percent 判据仅依赖 (hash, pct)；
+4. 结论：集群任意节点对同一 instance_id 解析结果逐位一致（G5 集群测试
+   `gray_percentage_consistent_across_nodes` 3 节点实测验证）。
+
+**边界与约束**：
+- 无身份（instance_id 空）永不进灰度（Q2 门闩在 percent 判据之前）——空串哈希恒恒定，
+  禁止参与分桶；
+- 容器重建时 instance_id 不变 → 分桶稳定；IP 漂移不影响 percent 桶（D18）；
+- 调整 percentage 会立即改变放量面（规则是活数据）；50 → 51 只多出哈希余数=50 的桶；
+- 分布式一致性无需额外共识：分桶在读取路径按同一状态机数据求值，天然一致。
+
 ## 明确不做（本期）
 
 - 流量治理/动态路由（网关职责）；

@@ -2708,6 +2708,20 @@ async fn metrics(State(app): State<ApiState>) -> String {
     metrics_text(&app.sm, app.raft.as_ref(), app.cipher.is_some())
 }
 
+/// G5/D32：HTTP 请求计数中间件（进程内 AtomicU64；5xx 为自动回滚钩子信号源）。
+/// 置于最外层（最后一个 layer）——healthz/metrics/鉴权失败等全部计入。
+async fn count_http(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    dsh_observability::HTTP_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let resp = next.run(req).await;
+    if resp.status().is_server_error() {
+        dsh_observability::HTTP_5XX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    resp
+}
+
 async fn readyz(State(app): State<ApiState>) -> Result<Json<serde_json::Value>, StatusCode> {
     if !is_ready(app.raft.as_ref()) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -3709,6 +3723,8 @@ pub fn build_router(app: ApiState) -> Router {
         auth_middleware,
     ));
     router = router.layer(axum::middleware::from_fn(security_headers));
+    // G5/D32：HTTP 计数最外层（统计全部请求含 healthz/metrics）
+    router = router.layer(axum::middleware::from_fn(count_http));
     router.with_state(app)
 }
 

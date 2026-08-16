@@ -1,12 +1,32 @@
 //! 可观测性（模块 10）：审计落库（AuditLog）、Prometheus 指标、就绪判断。
 //! 说明：审计条目经 Raft 状态机落库（audit/{seq}，集群一致）；指标为文本格式输出。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use dsh_core::command::Command;
 use dsh_core::model::PublishEvent;
 use dsh_core::StateMachine;
 use dsh_raft::RaftHandle;
+
+/// 进程内 HTTP 计数（G5/D32：API middleware 自增；节点本地视图，非状态机数据）。
+/// 自动回滚钩子（D33 LocalHttp5xxProbe）与 /metrics 均读此计数。
+pub static HTTP_REQUESTS: AtomicU64 = AtomicU64::new(0);
+pub static HTTP_5XX: AtomicU64 = AtomicU64::new(0);
+
+/// 读取 HTTP 计数 (requests, 5xx)。
+pub fn http_counters() -> (u64, u64) {
+    (
+        HTTP_REQUESTS.load(Ordering::Relaxed),
+        HTTP_5XX.load(Ordering::Relaxed),
+    )
+}
+
+/// 重置 HTTP 计数（测试用）。
+pub fn reset_http_counters() {
+    HTTP_REQUESTS.store(0, Ordering::Relaxed);
+    HTTP_5XX.store(0, Ordering::Relaxed);
+}
 
 /// 审计落库器（B4）：写入经状态机（集群经 Raft 复制，集群一致）。尽力而为。
 #[derive(Clone)]
@@ -138,6 +158,48 @@ pub fn metrics_text(
     out.push_str("# TYPE dsh_audit_entries gauge\n");
     out.push_str(&format!("dsh_audit_entries {audits}\n"));
 
+    // G5/D31：灰度指标——活跃灰度分支数（扫描）+ 灰度命令累计（审计计数，集群一致）
+    let mut gray_active = 0u64;
+    if let Ok(projects_list) = guard.list_projects() {
+        for p in projects_list {
+            if let Ok(bs) = guard.list_branches(&p.id) {
+                for b in bs {
+                    if let Ok(Some(st)) = guard.get_branch_state(&p.id, &b) {
+                        if st.gray_seq > 0 {
+                            gray_active += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.push_str("# HELP dsh_gray_active 活跃灰度分支数（gray_seq>0）\n");
+    out.push_str("# TYPE dsh_gray_active gauge\n");
+    out.push_str(&format!("dsh_gray_active {gray_active}\n"));
+    for (action, name) in [
+        ("gray_publish", "dsh_gray_publish_total"),
+        ("gray_promote", "dsh_gray_promote_total"),
+        ("gray_abort", "dsh_gray_abort_total"),
+    ] {
+        // 审计保留策略会裁剪旧条目 → counter 回落属正常（指标语义注明：当前审计窗口内累计）
+        let n = guard
+            .get_audit(Some(action), None, None, 1_000_000)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        out.push_str(&format!("# HELP {name} 灰度{action}累计（审计窗口内）\n"));
+        out.push_str(&format!("# TYPE {name} counter\n"));
+        out.push_str(&format!("{name} {n}\n"));
+    }
+
+    // G5/D31：进程内 HTTP 计数（节点本地视图；自动回滚信号源）
+    let (http_reqs, http_5xx) = http_counters();
+    out.push_str("# HELP dsh_http_requests_total HTTP 请求总数（进程内）\n");
+    out.push_str("# TYPE dsh_http_requests_total counter\n");
+    out.push_str(&format!("dsh_http_requests_total {http_reqs}\n"));
+    out.push_str("# HELP dsh_http_5xx_total HTTP 5xx 响应数（进程内）\n");
+    out.push_str("# TYPE dsh_http_5xx_total counter\n");
+    out.push_str(&format!("dsh_http_5xx_total {http_5xx}\n"));
+
     out.push_str("# HELP dsh_master_key_ok 主密钥是否就绪（0/1）\n");
     out.push_str("# TYPE dsh_master_key_ok gauge\n");
     out.push_str(&format!("dsh_master_key_ok {}\n", master_key_ok as u8));
@@ -232,13 +294,32 @@ mod tests {
 
     #[test]
     fn metrics_contains_gauges() {
+        reset_http_counters();
         let sm = RwLock::new(StateMachine::new(Box::new(InMemoryStore::new())));
         let text = metrics_text(&sm, None, true);
         assert!(text.contains("dsh_projects 0"));
         assert!(text.contains("dsh_master_key_ok 1"));
         assert!(text.contains("dsh_versions 0"));
+        // G5：灰度 + HTTP 指标存在且初始为 0
+        assert!(text.contains("dsh_gray_active 0"));
+        assert!(text.contains("dsh_gray_publish_total 0"));
+        assert!(text.contains("dsh_gray_promote_total 0"));
+        assert!(text.contains("dsh_gray_abort_total 0"));
+        assert!(text.contains("dsh_http_requests_total 0"));
+        assert!(text.contains("dsh_http_5xx_total 0"));
         // S7：会话存在性指标已移除（信息泄露 oracle）
         assert!(!text.contains("dsh_session_active"));
+    }
+
+    #[test]
+    fn http_counters_roundtrip() {
+        reset_http_counters();
+        assert_eq!(http_counters(), (0, 0));
+        HTTP_REQUESTS.fetch_add(7, Ordering::Relaxed);
+        HTTP_5XX.fetch_add(2, Ordering::Relaxed);
+        assert_eq!(http_counters(), (7, 2));
+        reset_http_counters();
+        assert_eq!(http_counters(), (0, 0));
     }
 
     #[test]

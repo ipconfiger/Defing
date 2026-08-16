@@ -16,6 +16,7 @@ dsh-storage = { path = "../dsh-storage" }
 dsh-raft = { path = "../dsh-raft" }
 dsh-crypto = { path = "../dsh-crypto" }
 dsh-jobs = { path = "../dsh-jobs" }
+dsh-observability = { path = "../dsh-observability" }
 dsh-watch = { path = "../dsh-watch" }
 clap = { workspace = true }
 axum = { workspace = true }

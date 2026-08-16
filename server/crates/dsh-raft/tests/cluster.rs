@@ -508,3 +508,229 @@ async fn cluster_watch_events_reach_subscribers() {
     let _ = std::fs::remove_dir_all(&n1.dir);
     let _ = std::fs::remove_dir_all(&n2.dir);
 }
+
+/// G5/D34：百分比灰度跨节点一致性——同一 percentage 规则经 Raft 写入 3 节点，
+/// 各节点对同一组 instance_id 的 resolve_version 逐位一致（fnv1a 纯函数 + 状态机数据复制）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gray_percentage_consistent_across_nodes() {
+    let network = NetworkFactory::new();
+
+    // bootstrap 3 节点
+    let n1 = make_node(1, "g1", &network).await;
+    initialize_single(
+        &n1.raft,
+        1,
+        NodeInfo {
+            grpc_addr: "127.0.0.1:8011".into(),
+            http_addr: "127.0.0.1:9011".into(),
+            raft_addr: "127.0.0.1:7011".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        wait_for_leader(&n1.raft, Duration::from_secs(5))
+            .await
+            .is_some(),
+        "node1 leader"
+    );
+    let leader = network.get(&1).unwrap();
+    let n2 = make_node(2, "g2", &network).await;
+    leader
+        .add_learner(
+            2,
+            NodeInfo {
+                grpc_addr: "127.0.0.1:8012".into(),
+                http_addr: "127.0.0.1:9012".into(),
+                raft_addr: "127.0.0.1:7012".into(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    leader
+        .change_membership(vec![1u64, 2], false)
+        .await
+        .unwrap();
+    let n3 = make_node(3, "g3", &network).await;
+    leader
+        .add_learner(
+            3,
+            NodeInfo {
+                grpc_addr: "127.0.0.1:8013".into(),
+                http_addr: "127.0.0.1:9013".into(),
+                raft_addr: "127.0.0.1:7013".into(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    leader
+        .change_membership(vec![1u64, 2, 3], false)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let current = n1
+        .raft
+        .current_leader()
+        .await
+        .or(n2.raft.current_leader().await)
+        .or(n3.raft.current_leader().await);
+    assert!(current.is_some(), "cluster leader elected");
+    let leader_raft = network.get(&current.unwrap()).unwrap();
+    let pid: dsh_core::model::ProjectId = "gray-cluster".into();
+    let dev = BranchName("dev".into());
+
+    // 建灰度状态：项目 + 结构 + 发布 + 草稿 + 灰度发布（percentage=40）
+    for cmd in [
+        Command::ProjectCreate {
+            name: "gray-cluster".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: 1,
+            groups: vec![dsh_core::model::GroupDef {
+                name: "app".into(),
+                items: vec![ItemDef {
+                    key: "feature".into(),
+                    ty: ValueType::String,
+                    required: true,
+                    secret: false,
+                    validate: None,
+                }],
+            }],
+            operator: String::new(),
+        },
+        Command::PublishStructure {
+            project: pid.clone(),
+            comment: "s".into(),
+            request_id: "s1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "app".into(),
+                key: "feature".into(),
+                value: Value::String("stable-v1".into()),
+            }],
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        // 值发布 → active=2（与 gray_seq=1 区分，避免数值巧合掩盖断言）
+        Command::Publish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            comment: "stable v2".into(),
+            request_id: "p1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "app".into(),
+                key: "feature".into(),
+                value: Value::String("gray-v1".into()),
+            }],
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        Command::GrayPublish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            rule: dsh_core::model::GrayRule {
+                match_labels: vec![],
+                ip_cidrs: vec![],
+                percentage: Some(40),
+            },
+            comment: "pct".into(),
+            request_id: "g1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+    ] {
+        let resp = client_write(&leader_raft, cmd, Duration::from_secs(10)).await;
+        assert!(resp.as_ref().unwrap().is_ok(), "write failed: {resp:?}");
+    }
+
+    // 等 3 节点全部复制到灰度态
+    let gray_ready = |sm: &RwLock<StateMachine>| -> bool {
+        sm.read()
+            .unwrap()
+            .get_branch_state(&pid, &dev)
+            .ok()
+            .flatten()
+            .map(|s| s.gray_seq > 0)
+            .unwrap_or(false)
+    };
+    assert!(
+        wait_until(
+            || gray_ready(&n1.sm) && gray_ready(&n2.sm) && gray_ready(&n3.sm),
+            Duration::from_secs(5),
+        )
+        .await,
+        "gray state replicate to all nodes"
+    );
+
+    // 各节点对同一组 instance_id 解析 → 逐位一致（同桶）
+    let instances = [
+        "web-a", "web-b", "web-c", "web-d", "web-e", "web-f", "web-g", "web-h",
+    ];
+    let mut rows: Vec<Vec<Option<u64>>> = Vec::new();
+    for node in [&n1, &n2, &n3] {
+        let g = node.sm.read().unwrap();
+        let row: Vec<Option<u64>> = instances
+            .iter()
+            .map(|id| {
+                g.resolve_version(
+                    &pid,
+                    &dev,
+                    &dsh_core::ClientCtx {
+                        instance_id: id.to_string(),
+                        labels: Default::default(),
+                        ip: None,
+                    },
+                )
+                .ok()
+                .map(|v| match v {
+                    dsh_core::ResolvedVersion::Stable(x) => x,
+                    dsh_core::ResolvedVersion::Gray(x) => x,
+                })
+            })
+            .collect();
+        rows.push(row);
+    }
+    assert_eq!(rows[0], rows[1], "node1 vs node2 同桶");
+    assert_eq!(rows[0], rows[2], "node1 vs node3 同桶");
+
+    // 显式分桶校验：fnv1a(instance)%100 < 40 → 灰度(gray_seq=1)；否则稳定(active=2)
+    for (i, id) in instances.iter().enumerate() {
+        let bucket = dsh_core::StateMachine::fnv1a_hash(id) % 100 < 40;
+        let got = rows[0][i].expect("resolve ok");
+        let expect = if bucket { 1 } else { 2 };
+        assert_eq!(got, expect, "instance {id} 分桶与 fnv1a 一致");
+    }
+    // 覆盖率 40% 下 8 个实例两桶都应出现（确定性验证分桶真实生效）
+    let values: std::collections::HashSet<u64> = rows[0].iter().flatten().copied().collect();
+    assert!(
+        values.contains(&1) && values.contains(&2),
+        "40% 分桶应两桶都有: {values:?}"
+    );
+
+    drop(n1.raft);
+    drop(n2.raft);
+    drop(n3.raft);
+    let _ = std::fs::remove_dir_all(&n1.dir);
+    let _ = std::fs::remove_dir_all(&n2.dir);
+    let _ = std::fs::remove_dir_all(&n3.dir);
+}

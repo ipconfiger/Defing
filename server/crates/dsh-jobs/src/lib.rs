@@ -116,7 +116,6 @@ impl Job for RewrapDeks {
 pub struct JobScheduler {
     jobs: Vec<Box<dyn Job>>,
 }
-
 impl JobScheduler {
     pub fn new() -> Self {
         Self::default()
@@ -145,6 +144,139 @@ impl JobScheduler {
             });
         }
     }
+}
+
+// ---------------- G5/D33：灰度自动回滚钩子（可选，默认禁用） ----------------
+
+/// 灰度健康探针：返回当前错误率（0.0-1.0）；None = 本轮无法获取（跳过）。
+/// 业务错误率由外部系统决定，Defing 只提供框架 + 本地探针（对接 /metrics 计数）。
+pub trait GrayHealthProbe: Send + Sync {
+    fn error_rate(&self) -> Option<f64>;
+}
+
+/// 内置探针：节点本地 /metrics 的 HTTP 5xx 比例（dsh_http_5xx_total / dsh_http_requests_total）。
+pub struct LocalHttp5xxProbe;
+
+impl GrayHealthProbe for LocalHttp5xxProbe {
+    fn error_rate(&self) -> Option<f64> {
+        let (reqs, errs) = dsh_observability::http_counters();
+        if reqs == 0 {
+            return None;
+        }
+        Some(errs as f64 / reqs as f64)
+    }
+}
+
+/// 自动回滚判定（纯函数，可测）：错误率可得且 > 阈值 → 回滚。
+fn should_rollback(rate: Option<f64>, threshold: f64) -> bool {
+    match rate {
+        Some(r) => r > threshold,
+        None => false,
+    }
+}
+
+/// 灰度自动回滚任务（仅 leader）：错误率 > 阈值 → 对全部活跃灰度分支执行 GrayAbort。
+/// - 走 dsh_raft::write_command 统一写路径（dev-single 直 apply+broadcast；集群 client_write 复制）；
+/// - 审计 action="gray_auto_abort"（与手动 gray_abort 区分，可追溯）；
+/// - 防抖：abort 后分支 gray_seq=0，不再触发；后台任务读墙钟/网络不违反 D16（仅约束 apply）。
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_gray_auto_rollback(
+    sm: Arc<RwLock<StateMachine>>,
+    raft: Option<dsh_raft::RaftHandle>,
+    events_tx: Option<tokio::sync::broadcast::Sender<dsh_core::model::PublishEvent>>,
+    audit: dsh_observability::AuditLog,
+    probe: Box<dyn GrayHealthProbe>,
+    threshold: f64,
+    interval: std::time::Duration,
+    is_leader: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if !*is_leader.borrow() {
+                continue;
+            }
+            let Some(rate) = probe.error_rate() else {
+                continue;
+            };
+            if !should_rollback(Some(rate), threshold) {
+                continue;
+            }
+            // 扫描活跃灰度分支
+            let targets: Vec<(dsh_core::model::ProjectId, dsh_core::model::BranchName)> = {
+                let Ok(guard) = sm.read() else {
+                    tracing::warn!("gray auto-rollback: sm lock poisoned");
+                    continue;
+                };
+                let Ok(projects) = guard.list_projects() else {
+                    continue;
+                };
+                let mut out = Vec::new();
+                for p in projects {
+                    if let Ok(bs) = guard.list_branches(&p.id) {
+                        for b in bs {
+                            if let Ok(Some(st)) = guard.get_branch_state(&p.id, &b) {
+                                if st.gray_seq > 0 {
+                                    out.push((p.id.clone(), b));
+                                }
+                            }
+                        }
+                    }
+                }
+                out
+            };
+            if targets.is_empty() {
+                continue;
+            }
+            for (pid, bname) in targets {
+                let ts = now_ms();
+                let cmd = dsh_core::command::Command::GrayAbort {
+                    project: pid.clone(),
+                    branch: bname.clone(),
+                    comment: format!(
+                        "auto-rollback: error rate {rate:.2} > threshold {threshold:.2}"
+                    ),
+                    request_id: format!("auto-{ts}"),
+                    operator: "auto-rollback".into(),
+                    ts: 0,
+                };
+                match dsh_raft::write_command(&sm, raft.as_ref(), &cmd, ts, events_tx.as_ref())
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::warn!(
+                            "gray auto-rollback: aborted {}/{} (error rate {rate:.2} > {threshold:.2})",
+                            pid,
+                            bname
+                        );
+                        audit
+                            .append(
+                                "gray_auto_abort",
+                                Some(pid.to_string()),
+                                Some(bname.to_string()),
+                                None,
+                                None,
+                                serde_json::json!({ "error_rate": rate, "threshold": threshold }),
+                                "auto-rollback",
+                            )
+                            .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!("gray auto-rollback: abort {}/{} failed: {e}", pid, bname)
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -304,6 +436,39 @@ mod tests {
 }
 
 #[cfg(test)]
+mod gray_rollback_tests {
+    use super::*;
+    use dsh_observability::{reset_http_counters, HTTP_5XX, HTTP_REQUESTS};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn local_probe_reads_http_counters() {
+        reset_http_counters();
+        let probe = LocalHttp5xxProbe;
+        assert_eq!(probe.error_rate(), None, "无请求 → None（跳过本轮）");
+        HTTP_REQUESTS.store(100, Ordering::Relaxed);
+        HTTP_5XX.store(10, Ordering::Relaxed);
+        assert_eq!(probe.error_rate(), Some(0.1));
+        reset_http_counters();
+    }
+
+    #[test]
+    fn rollback_decision() {
+        assert!(!should_rollback(None, 0.05), "无数据不触发");
+        assert!(!should_rollback(Some(0.03), 0.05), "低于阈值不触发");
+        assert!(should_rollback(Some(0.08), 0.05), "超过阈值触发");
+        assert!(
+            !should_rollback(Some(0.05), 0.05),
+            "等于阈值不触发（严格大于）"
+        );
+        assert!(
+            should_rollback(Some(0.01), 0.0),
+            "阈值 0 = 有任何错误即触发"
+        );
+    }
+}
+
+#[cfg(test)]
 mod rewrap_tests {
     use super::*;
     use dsh_core::command::{Command, DraftUpdateItem};
@@ -452,5 +617,180 @@ mod rewrap_tests {
             }
             _ => panic!("expected secret"),
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_rollback_tests {
+    use super::*;
+    use dsh_core::command::{Command, DraftUpdateItem};
+    use dsh_core::model::{
+        BranchName, GrayRule, GroupDef, ItemDef, LabelSelector, Value, ValueType,
+    };
+    use dsh_core::InMemoryStore;
+    use std::time::Duration;
+
+    struct FakeProbe {
+        rate: f64,
+    }
+    impl GrayHealthProbe for FakeProbe {
+        fn error_rate(&self) -> Option<f64> {
+            Some(self.rate)
+        }
+    }
+
+    /// 装配一个带活跃灰度的状态机（项目 + 结构 + 稳定发布 + 草稿 + 灰度发布）。
+    fn sm_with_active_gray() -> StateMachine {
+        let mut sm = StateMachine::new(Box::new(InMemoryStore::new()));
+        sm.apply(
+            &Command::ProjectCreate {
+                name: "p".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            1,
+        )
+        .unwrap();
+        sm.apply(
+            &Command::StructureDraftSet {
+                project: "p".into(),
+                base_version: 1,
+                groups: vec![GroupDef {
+                    name: "app".into(),
+                    items: vec![ItemDef {
+                        key: "feature".into(),
+                        ty: ValueType::String,
+                        required: true,
+                        secret: false,
+                        validate: None,
+                    }],
+                }],
+                operator: String::new(),
+            },
+            2,
+        )
+        .unwrap();
+        sm.apply(
+            &Command::PublishStructure {
+                project: "p".into(),
+                comment: "s".into(),
+                request_id: "s1".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            3,
+        )
+        .unwrap();
+        for (i, v) in ["stable-v", "gray-v"].iter().enumerate() {
+            sm.apply(
+                &Command::DraftUpdate {
+                    project: "p".into(),
+                    branch: BranchName("dev".into()),
+                    updates: vec![DraftUpdateItem {
+                        group: "app".into(),
+                        key: "feature".into(),
+                        value: Value::String(v.to_string()),
+                    }],
+                    deletes: vec![],
+                    operator: String::new(),
+                    ts: 0,
+                    expected_draft_rev: None,
+                },
+                10 + i as i64,
+            )
+            .unwrap();
+            if i == 0 {
+                sm.apply(
+                    &Command::Publish {
+                        project: "p".into(),
+                        branch: BranchName("dev".into()),
+                        comment: "stable v2".into(),
+                        request_id: "p1".into(),
+                        operator: String::new(),
+                        ts: 0,
+                    },
+                    20,
+                )
+                .unwrap();
+            }
+        }
+        sm.apply(
+            &Command::GrayPublish {
+                project: "p".into(),
+                branch: BranchName("dev".into()),
+                rule: GrayRule {
+                    match_labels: vec![LabelSelector {
+                        key: "zone".into(),
+                        value: "cn-north-1".into(),
+                    }],
+                    ip_cidrs: vec![],
+                    percentage: None,
+                },
+                comment: "g".into(),
+                request_id: "g1".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            30,
+        )
+        .unwrap();
+        sm
+    }
+
+    /// G5/D33 完整循环：错误率超阈值 → 自动 abort 活跃灰度 + 审计 gray_auto_abort。
+    #[tokio::test]
+    async fn auto_rollback_aborts_active_gray() {
+        let sm = Arc::new(RwLock::new(sm_with_active_gray()));
+        let (_leader_tx, leader_rx) = tokio::sync::watch::channel(true);
+        let audit = dsh_observability::AuditLog::new(sm.clone(), None);
+        spawn_gray_auto_rollback(
+            sm.clone(),
+            None,
+            None,
+            audit,
+            Box::new(FakeProbe { rate: 0.9 }),
+            0.05,
+            Duration::from_millis(50),
+            leader_rx,
+        );
+        // 等若干轮（50ms 间隔）→ 灰度应被清空
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let g = sm.read().unwrap();
+        let st = g
+            .get_branch_state(&"p".into(), &BranchName("dev".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(st.gray_seq, 0, "错误率超阈值 → 自动 abort");
+        assert!(st.gray_rule.is_none());
+        // 审计留痕
+        let audits = g
+            .get_audit(Some("gray_auto_abort"), None, None, 10)
+            .unwrap();
+        assert!(!audits.is_empty(), "gray_auto_abort 审计落库");
+    }
+
+    /// 负例：低错误率不误伤（灰度保持活跃）。
+    #[tokio::test]
+    async fn auto_rollback_skips_when_healthy() {
+        let sm = Arc::new(RwLock::new(sm_with_active_gray()));
+        let (_leader_tx, leader_rx) = tokio::sync::watch::channel(true);
+        let audit = dsh_observability::AuditLog::new(sm.clone(), None);
+        spawn_gray_auto_rollback(
+            sm.clone(),
+            None,
+            None,
+            audit,
+            Box::new(FakeProbe { rate: 0.001 }),
+            0.05,
+            Duration::from_millis(50),
+            leader_rx,
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let g = sm.read().unwrap();
+        let st = g
+            .get_branch_state(&"p".into(), &BranchName("dev".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(st.gray_seq, 1, "低错误率不触发回滚");
     }
 }
