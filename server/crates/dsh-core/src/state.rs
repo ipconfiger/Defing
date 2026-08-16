@@ -747,6 +747,7 @@ impl StateMachine {
                 deletes,
                 operator,
                 ts,
+                expected_draft_rev,
             } => self.apply_draft_update(
                 project,
                 branch,
@@ -754,6 +755,7 @@ impl StateMachine {
                 deletes,
                 Self::eff_ts(ts, now_ms),
                 operator,
+                expected_draft_rev.as_ref(),
             ),
             Command::Publish {
                 project,
@@ -1178,6 +1180,7 @@ impl StateMachine {
         Ok(events)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_draft_update(
         &mut self,
         id: &ProjectId,
@@ -1186,10 +1189,21 @@ impl StateMachine {
         deletes: &[(String, String)],
         now_ms: i64,
         _operator: &str,
+        expected_draft_rev: Option<&u64>,
     ) -> ApplyOutcome {
         let mut st = self
             .get_branch_state(id, branch)?
             .ok_or_else(|| Error::not_found(format!("branch {branch} of {id}")))?;
+        // 乐观锁（并发编辑冲突检测）：expected_draft_rev > 0 时校验 == 当前草稿修订号，
+        // 不匹配 → Conflict（客户端须刷新最新草稿后重试）。0 = 旧客户端/旧日志，不校验。
+        if let Some(exp) = expected_draft_rev {
+            if *exp != st.draft_rev {
+                return Err(Error::conflict(format!(
+                    "草稿已被他人修改（draft_rev {} != expected {exp}），请刷新后重试",
+                    st.draft_rev
+                )));
+            }
+        }
         let structure = self
             .get_structure(id)?
             .ok_or_else(|| Error::not_found(format!("project {id}")))?;
@@ -1246,6 +1260,8 @@ impl StateMachine {
                 },
             );
         }
+        // 乐观锁：草稿修订号 +1（无论是否校验，提交即推进；发布时保持 rev 供下次编辑锚定）
+        st.draft_rev += 1;
         self.save_pending(&branch_state_key(id, branch), &st)?;
         Ok(vec![])
     }
@@ -2467,6 +2483,7 @@ mod tests {
                 deletes: vec![],
                 operator: String::new(),
                 ts: 0,
+                expected_draft_rev: None,
             },
             5,
         )

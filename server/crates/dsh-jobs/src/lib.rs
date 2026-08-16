@@ -213,6 +213,7 @@ mod tests {
 
                     operator: String::new(),
                     ts: 0,
+                    expected_draft_rev: None,
                 },
                 10 + i,
             )
@@ -263,6 +264,7 @@ mod tests {
                     deletes: vec![],
                     operator: String::new(),
                     ts: 0,
+                    expected_draft_rev: None,
                 },
                 100 + i,
             )
@@ -383,6 +385,7 @@ mod rewrap_tests {
 
                 operator: String::new(),
                 ts: 0,
+                expected_draft_rev: None,
             },
             4,
         )

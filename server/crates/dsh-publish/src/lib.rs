@@ -108,12 +108,14 @@ impl PublishService {
     }
 
     /// 值草稿更新（secret 项自动加密）。
+    /// `expected_draft_rev`（乐观锁）：0 = 不校验（旧客户端）；>0 校验，不匹配 → Conflict。
     pub async fn update_draft(
         &self,
         project: &ProjectId,
         branch: &BranchName,
         mut updates: Vec<DraftUpdateItem>,
         deletes: Vec<(String, String)>,
+        expected_draft_rev: Option<u64>,
         operator: &str,
     ) -> Result<(), Error> {
         self.encrypt_secret_updates(project, &mut updates)?;
@@ -126,6 +128,7 @@ impl PublishService {
 
                 operator: operator.to_string(),
                 ts: now_ms(),
+                expected_draft_rev,
             },
             now_ms(),
         )

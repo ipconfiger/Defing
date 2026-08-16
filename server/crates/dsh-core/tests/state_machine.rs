@@ -106,6 +106,7 @@ fn full_flow_dev_publish() {
                 deletes: vec![],
                 operator: String::new(),
                 ts: 0,
+                expected_draft_rev: None,
             },
             4,
         )
@@ -168,6 +169,7 @@ fn publish_is_idempotent_by_request_id() {
 
             operator: String::new(),
             ts: 0,
+            expected_draft_rev: None,
         },
         4,
     )
@@ -208,6 +210,7 @@ fn required_unset_blocks_publish() {
 
             operator: String::new(),
             ts: 0,
+            expected_draft_rev: None,
         },
         4,
     )
@@ -268,6 +271,7 @@ fn branch_inherits_structure_and_values() {
 
             operator: String::new(),
             ts: 0,
+            expected_draft_rev: None,
         },
         4,
     )
@@ -327,6 +331,7 @@ fn draft_update_validates_unknown_item_and_type() {
                 deletes: vec![],
                 operator: String::new(),
                 ts: 0,
+                expected_draft_rev: None,
             },
             4,
         )
@@ -346,6 +351,7 @@ fn draft_update_validates_unknown_item_and_type() {
                 deletes: vec![],
                 operator: String::new(),
                 ts: 0,
+                expected_draft_rev: None,
             },
             4,
         )
@@ -435,6 +441,7 @@ fn rollback_creates_new_version_with_old_content() {
 
             operator: String::new(),
             ts: 0,
+            expected_draft_rev: None,
         },
         4,
     )
@@ -678,6 +685,7 @@ fn shared_cascade_updates_referencing_branches() {
 
             operator: String::new(),
             ts: 0,
+            expected_draft_rev: None,
         },
         15,
     )
@@ -970,6 +978,7 @@ fn group_ref_materializes_matching_items_at_publish() {
 
             operator: String::new(),
             ts: 0,
+            expected_draft_rev: None,
         },
         31,
     )
@@ -1086,6 +1095,7 @@ fn group_ref_unbind_stops_materialization() {
 
             operator: String::new(),
             ts: 0,
+            expected_draft_rev: None,
         },
         52,
     )
@@ -1178,6 +1188,7 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
 
             operator: String::new(),
             ts: 0,
+            expected_draft_rev: None,
         },
         62,
     )
@@ -1242,6 +1253,7 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
 
             operator: String::new(),
             ts: 0,
+            expected_draft_rev: None,
         },
         64,
     )
@@ -1339,6 +1351,7 @@ fn publish_n_versions(s: &mut StateMachine, n: u64) -> (ProjectId, BranchName) {
                 deletes: vec![],
                 operator: String::new(),
                 ts: 0,
+                expected_draft_rev: None,
             },
             100 + i as i64,
         )
@@ -1462,6 +1475,7 @@ fn rewrap_deks_covers_diff_secrets() {
             deletes: vec![],
             operator: String::new(),
             ts: 0,
+            expected_draft_rev: None,
         },
         5,
     )
@@ -1486,6 +1500,7 @@ fn rewrap_deks_covers_diff_secrets() {
             deletes: vec![],
             operator: String::new(),
             ts: 0,
+            expected_draft_rev: None,
         },
         5,
     )
@@ -1820,5 +1835,140 @@ fn multi_session_cascade_clears_all() {
     assert!(
         s.get_pa_session_with("bob", "n1").unwrap().is_none(),
         "新格式会话已清"
+    );
+}
+
+// ---------------- 草稿乐观锁（并发编辑冲突检测） ----------------
+
+/// 乐观锁：expected_draft_rev 不匹配 → Conflict；匹配 → 保存并推进 rev。
+#[test]
+fn draft_optimistic_lock_conflict_detection() {
+    let mut s = sm();
+    let (pid, _) = setup(&mut s); // 结构 v1
+    let b = BranchName("dev".into());
+    let upd = |v: &str| {
+        vec![DraftUpdateItem {
+            group: "redis".into(),
+            key: "host".into(),
+            value: Value::String(v.into()),
+        }]
+    };
+    // A 保存（expected=0 不校验，或首次 rev=0）
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: b.clone(),
+            updates: upd("A"),
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: Some(0),
+        },
+        10,
+    )
+    .unwrap();
+    let st = s.get_branch_state(&pid, &b).unwrap().unwrap();
+    assert_eq!(st.draft_rev, 1, "首次保存后 rev=1");
+
+    // A 再保存一次 → rev=2（模拟 A 持续编辑期间 B 读到 rev=1）
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: b.clone(),
+            updates: upd("A2"),
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: Some(1),
+        },
+        11,
+    )
+    .unwrap();
+    // B 基于过期 rev（1）保存 → 冲突 409
+    let e = s
+        .apply(
+            &Command::DraftUpdate {
+                project: pid.clone(),
+                branch: b.clone(),
+                updates: upd("B"),
+                deletes: vec![],
+                operator: String::new(),
+                ts: 0,
+                expected_draft_rev: Some(1), // 过期（当前 rev=2）
+            },
+            12,
+        )
+        .unwrap_err();
+    assert_eq!(e.kind, dsh_core::ErrorKind::Conflict, "基于过期 rev 应冲突");
+
+    // B 拉取最新 rev（1）后保存 → 成功，rev=2
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: b.clone(),
+            updates: upd("B2"),
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: Some(2), // 最新
+        },
+        13,
+    )
+    .unwrap();
+    let st2 = s.get_branch_state(&pid, &b).unwrap().unwrap();
+    assert_eq!(st2.draft_rev, 3, "三次成功保存后 rev=3");
+    // 值 = B2（A 的修改被 B 覆盖——但 B 已基于最新值重改，冲突提示过）
+    let snap = s.get_config(&pid, &b, 0).unwrap();
+    assert!(snap.groups.is_empty(), "草稿未发布，snapshot 仍空");
+}
+
+/// 乐观锁兼容：expected_draft_rev=0（旧客户端）不校验，last-write-wins。
+#[test]
+fn draft_optimistic_lock_legacy_no_check() {
+    let mut s = sm();
+    let (pid, _) = setup(&mut s);
+    let b = BranchName("dev".into());
+    let upd = |v: &str| {
+        vec![DraftUpdateItem {
+            group: "redis".into(),
+            key: "host".into(),
+            value: Value::String(v.into()),
+        }]
+    };
+    // 旧客户端（expected=0）：连续保存不校验，直接覆盖
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: b.clone(),
+            updates: upd("v1"),
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        10,
+    )
+    .unwrap();
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: b.clone(),
+            updates: upd("v2"),
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        11,
+    )
+    .unwrap();
+    let st = s.get_branch_state(&pid, &b).unwrap().unwrap();
+    assert_eq!(st.draft_rev, 2, "rev 仍推进（供新客户端锚定）");
+    // 草稿值 = v2
+    let g = st.value_draft.get("redis").unwrap();
+    assert_eq!(
+        g.get("host").unwrap().value,
+        Value::String("v2".into()),
+        "last-write-wins（旧客户端不校验）"
     );
 }

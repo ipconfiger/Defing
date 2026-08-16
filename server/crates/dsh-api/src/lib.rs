@@ -250,6 +250,10 @@ struct DraftUpdateReq {
     /// "group/key" 列表
     #[serde(default)]
     deletes: Vec<String>,
+    /// 乐观锁：期望的草稿修订号（缺省 None = 不校验，兼容旧客户端）。
+    /// 不匹配 → 409 Conflict（并发编辑冲突，客户端刷新最新草稿后重试）。
+    #[serde(default)]
+    expected_draft_rev: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -801,6 +805,7 @@ async fn update_draft(
             &branch_obj,
             req.updates,
             deletes,
+            req.expected_draft_rev,
             &principal_op(&principal),
         )
         .await
@@ -987,6 +992,7 @@ async fn branch_detail(
         "name": branch,
         "active_version": st.active_version,
         "structure_version": st.structure_version,
+        "draft_rev": st.draft_rev,
         "draft": drafts,
     })))
 }
@@ -1149,7 +1155,14 @@ async fn promote(
     };
     if !updates.is_empty() {
         app.publish
-            .update_draft(&pid_obj, &to_b, updates, vec![], &principal_op(&principal))
+            .update_draft(
+                &pid_obj,
+                &to_b,
+                updates,
+                vec![],
+                None,
+                &principal_op(&principal),
+            )
             .await
             .map_err(ApiError::from)?;
     }

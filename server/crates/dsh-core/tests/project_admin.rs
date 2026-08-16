@@ -467,6 +467,7 @@ fn publish_operator_recorded_in_version() {
             deletes: vec![],
             operator: "pa:alice".to_string(),
             ts: 0,
+            expected_draft_rev: None,
         },
         1_700,
     )
@@ -539,6 +540,7 @@ fn publish_operator_defaults_to_admin() {
             deletes: vec![],
             operator: String::new(),
             ts: 0,
+            expected_draft_rev: None,
         },
         1_700,
     )

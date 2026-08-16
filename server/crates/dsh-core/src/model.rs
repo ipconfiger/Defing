@@ -239,6 +239,10 @@ pub struct BranchState {
     /// group → (key → DraftValue)
     #[serde(default)]
     pub value_draft: BTreeMap<String, BTreeMap<String, DraftValue>>,
+    /// 草稿修订号（乐观锁）：每次 DraftUpdate 提交 +1；客户端保存时带 expected_draft_rev
+    /// 校验，不匹配 → 409 Conflict（并发编辑冲突检测）。旧数据无此字段 → 0（兼容）。
+    #[serde(default)]
+    pub draft_rev: u64,
 }
 
 impl BranchState {
@@ -248,6 +252,7 @@ impl BranchState {
             structure_version,
             last_request_id: None,
             value_draft: BTreeMap::new(),
+            draft_rev: 0,
         }
     }
 }

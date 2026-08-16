@@ -2,7 +2,7 @@
 'use strict';
 
 let TOKEN = localStorage.getItem('dsh_admin_token') || '';
-let curProject = '', curBranch = '', curVersion = 0, watchES = null;
+let curProject = '', curBranch = '', curVersion = 0, curDraftRev = 0, watchES = null;
 
 const $ = (id) => document.getElementById(id);
 function auth() {
@@ -25,7 +25,9 @@ async function j(method, url, body) {
   if (!r.ok) {
     let detail = '';
     try { detail = (await r.json()).message || ''; } catch (_) {}
-    throw new Error('HTTP ' + r.status + ' ' + detail);
+    const err = new Error('HTTP ' + r.status + ' ' + detail);
+    err.status = r.status; // 乐观锁冲突判断用（409 → 刷新草稿）
+    throw err;
   }
   if (r.status === 204) return null;
   return r.json();
@@ -165,6 +167,8 @@ function loadBranch() {
 }
 function renderDraftEditor(b) {
   const box = $('draft-editor');
+  // 乐观锁（并发编辑冲突检测）：记录当前草稿修订号，保存时回传 expected_draft_rev
+  curDraftRev = b.draft_rev || 0;
   const groups = Object.keys(b.draft || {});
   let html = '';
   if (!groups.length) html = '<span class="muted">当前分支无草稿项（先改结构发布，或直接添加下方值）</span><br>';
@@ -247,8 +251,17 @@ function saveDraft() {
   document.querySelectorAll('#draft-editor input[type=checkbox][data-g][data-k]').forEach((inp) => {
     updates.push({ group: inp.dataset.g, key: inp.dataset.k, value: { type: 'bool', bool_value: inp.checked } });
   });
-  j('PUT', `/api/v1/projects/${curProject}/branches/${curBranch}/draft`, { updates, deletes: [] })
-    .then(() => msg('草稿已保存', true)).catch((e) => msg(e.message, false));
+  // 乐观锁：携带当前草稿修订号；409（草稿已被他人修改）→ 提示并刷新最新草稿供继续修改
+  j('PUT', `/api/v1/projects/${curProject}/branches/${curBranch}/draft`, { updates, deletes: [], expected_draft_rev: curDraftRev })
+    .then(() => { msg('草稿已保存', true); loadBranch(); })
+    .catch((e) => {
+      if (e.status === 409) {
+        msg('草稿已被他人修改！已加载最新版本，请查看后决定是否继续修改', false);
+        loadBranch(); // 拉取最新草稿（含最新 draft_rev 与值）
+      } else {
+        msg(e.message, false);
+      }
+    });
 }
 function doPublish() {
   askModal('发布版本备注', '备注（可选）', (comment) => {

@@ -104,6 +104,7 @@ pub fn seed_demo_project(
 
             operator: String::new(),
             ts: 0,
+            expected_draft_rev: None,
         },
         4,
     )?;

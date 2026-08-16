@@ -111,3 +111,25 @@ st.draft_rev += 1;   // 无论是否带 expected，提交都推进修订号
 2. **建议实施草稿乐观锁**（分支级 draft_rev，1-2 天）：对齐结构草稿既有机制，低风险高价值；
 3. 冲突粒度粗（不同 item 也冲突）可接受——配置编辑低频，409+刷新人工协调是行业惯例（Apollo 同样依赖发布确认流程）；
 4. 不改变写性能（纯状态机内比较），不破坏 Raft 确定性。
+
+## 8. 实施状态（2025-08-16）：已完成
+
+**核心**：
+- `BranchState.draft_rev`（serde default 0 兼容旧数据）；`DraftUpdate.expected_draft_rev: Option<u64>`
+  （`Some(rev)` 严格校验、`None` 不校验——消除"0 双义性"：新客户端首次传 `Some(0)` 也校验）；
+- `apply_draft_update`：`Some(exp) != draft_rev` → Conflict 409；提交后 `draft_rev += 1`；
+- **API**：`GET /branches/{b}` 返回 `draft_rev`；`PUT /draft` 接受 `expected_draft_rev`（可选）；
+- **Admin UI**：保存带 `expected_draft_rev`，409 → 提示"草稿已被他人修改"并**自动拉取最新草稿**供继续修改。
+
+**实测**（两人并发编辑）：
+```
+A 保存(rev=0) → 200
+B 保存(rev=0 过期) → 409 "草稿已被他人修改（draft_rev 1 != expected 0），请刷新后重试"
+B 拉取最新 → 看到 A 的值 + rev=1
+B 保存(rev=1) → 200
+旧客户端（无 expected）→ 200（兼容，last-write-wins）
+```
+
+**验收**：cargo test 31 套件全绿（新增乐观锁冲突/兼容用例）、clippy/fmt 零告警、
+e2e（dev-single/api-surface）全过、写性能不变（纯状态机内整数比较）、Raft wire 兼容
+（旧日志 None 不校验）。

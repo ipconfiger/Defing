@@ -67,6 +67,9 @@ pub enum Command {
         ts: i64,
     },
     /// 更新分支值草稿（不生效，I4）。
+    /// `expected_draft_rev`（乐观锁）：`Some(rev)` 时校验 == 当前 draft_rev，不匹配 →
+    /// Conflict 409（并发编辑冲突检测，客户端刷新最新草稿后重试）；`None` = 不校验
+    /// （旧客户端/旧日志，last-write-wins）。
     DraftUpdate {
         project: ProjectId,
         branch: BranchName,
@@ -78,6 +81,9 @@ pub enum Command {
         /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）
         #[serde(default)]
         ts: i64,
+        /// 期望的草稿修订号（乐观锁；None = 不校验，兼容旧客户端/旧日志）
+        #[serde(default)]
+        expected_draft_rev: Option<u64>,
     },
     /// 发布分支版本（原子：固化草稿→版本→指针→diff→事件；幂等 I10）。
     Publish {

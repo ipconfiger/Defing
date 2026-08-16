@@ -223,6 +223,7 @@ async fn three_node_bootstrap_join_failover() {
 
             operator: String::new(),
             ts: 0,
+            expected_draft_rev: None,
         },
         Duration::from_secs(10),
     )

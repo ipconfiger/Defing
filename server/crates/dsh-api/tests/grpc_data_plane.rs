@@ -41,6 +41,7 @@ fn seed_sm(sm: &RwLock<StateMachine>) {
 
             operator: String::new(),
             ts: 0,
+            expected_draft_rev: None,
         },
         6,
     )
@@ -188,6 +189,7 @@ async fn watch_delivers_publish_events() {
                 value: Value::String("10.0.0.2".into()),
             }],
             vec![],
+            None,
             "test",
         )
         .await
