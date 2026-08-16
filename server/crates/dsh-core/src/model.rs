@@ -229,7 +229,29 @@ pub struct DraftValue {
     pub updated_at: i64,
 }
 
-/// 分支状态（含值草稿、活动版本、幂等键）。
+/// 标签选择器（key=value；灰度规则内任一命中即命中，OR 语义）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelSelector {
+    pub key: String,
+    pub value: String,
+}
+
+/// 灰度规则（状态机数据，Raft 复制；selector 求值在读取路径——apply 不读请求/墙钟，D20）。
+/// 求值次序固定：labels → IP → percent（任一命中即命中；无身份永不进灰度，Q2）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct GrayRule {
+    /// 标签匹配（OR：任一 key=value 命中即命中）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub match_labels: Vec<LabelSelector>,
+    /// IP 段（CIDR，如 "10.0.0.0/8"；任一命中即命中）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ip_cidrs: Vec<String>,
+    /// 百分比放量（0-100；fnv1a(instance_id) % 100 < pct 命中）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percentage: Option<u32>,
+}
+
+/// 分支状态（含值草稿、活动版本、幂等键、灰度）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BranchState {
     pub active_version: u64,
@@ -243,6 +265,13 @@ pub struct BranchState {
     /// 校验，不匹配 → 409 Conflict（并发编辑冲突检测）。旧数据无此字段 → 0（兼容）。
     #[serde(default)]
     pub draft_rev: u64,
+    /// 灰度序号（G2/Q1：分支级独立单调递增，不与 active_version 版本号空间冲突；
+    /// 0 = 无灰度。旧数据无此字段 → 0，兼容）。
+    #[serde(default)]
+    pub gray_seq: u64,
+    /// 灰度规则（Some = 灰度活跃；None = 无灰度。旧数据无此字段 → None，兼容）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gray_rule: Option<GrayRule>,
 }
 
 impl BranchState {
@@ -253,6 +282,8 @@ impl BranchState {
             last_request_id: None,
             value_draft: BTreeMap::new(),
             draft_rev: 0,
+            gray_seq: 0,
+            gray_rule: None,
         }
     }
 }
@@ -283,6 +314,10 @@ pub struct VersionRecord {
     /// 产生本版本的事件类型（D-TYPE：watch 重放保真；旧日志无此字段 → 按 rollback_of 推断）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_ty: Option<EventType>,
+    /// 灰度转正标记（G2/Q3：由 GrayPromote 创建的版本；复用既有 EventType，不新增枚举值。
+    /// serde default 兼容旧快照/旧日志；watch 重放据此还原 gray 事件标记）。
+    #[serde(default)]
+    pub gray: bool,
 }
 
 /// 变更种类（diff 与事件共用）。
@@ -324,6 +359,11 @@ pub struct PublishEvent {
     pub comment: String,
     pub request_id: String,
     pub changes: Vec<DiffEntry>,
+    /// 灰度事件标记（G2/Q3：GrayPublish/Promote/Abort 事件 gray=true；
+    /// 复用既有 EventType（ValuePublish），serde default 兼容旧节点/旧日志——不新增枚举值，
+    /// 防新节点写的灰度记录进快照后旧节点反序列化失败。SDK 契约：gray=true 事件永不按版本过滤）。
+    #[serde(default)]
+    pub gray: bool,
 }
 
 /// 跨项目共享项（集群级）。

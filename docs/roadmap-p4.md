@@ -65,8 +65,8 @@ watch：
 |------|------|-----------|------|------|
 | **G0 设计先行** | ✅ **已完成**（`docs/design/gray-release.md`，330 行含流程图 + 审核 Q1-Q6 修订记录）：模型选型、分支内双版本、身份传递、watch 语义、回滚语义；决策 D17–D23 落地 | — | 设计评审通过（子代理 Q1-Q6 全闭环，含 3 阻塞级修订） | ✅ |
 | **G1 发布策略地基（D1 收尾）** | `--publish-policy=block\|warn`（warn 时发布校验失败仅记录 detail 继续）、`--shared-cascade=auto\|manual`（manual：共享发布只更共享版本，引用分支下次发布物化）、`--read-mode=linear\|stale` | cli main.rs 加参 → PublishService/apply 注入 policy；`apply_shared_publish` 拆 manual 路径（state.rs:1216） | 三旋钮 e2e 实测；对应 D1 偏差关闭 | 3–4 天 |
-| **G2 灰度核心状态机** | 新命令 `GrayPublish{project,branch,rule,comment,request_id,operator,ts}`、`GrayAbort{…}`、`GrayPromote{…}`（纯新增，旧变体不动）；`BranchState` 加 `gray_seq`/`gray_rule`（serde default）；灰度快照存独立前缀 `gray-snap/`（**独立灰度序号，不与 active_version 冲突**，Q1 修订）；**复用既有 EventType + `gray:bool` 字段**（不新增枚举值，Q3 修订）；补 I10 幂等；`prune_versions` 保留 gray_seq 指向快照（Q5 修订） | command.rs / model.rs / state.rs / keys.rs；core 测试先行 | `cargo test -p dsh-core` 新增 ≥15 用例（灰度发布/解析/转正/下量/幂等/结构发布×gray/无身份不进灰度） | 5–7 天 |
-| **G3 数据面解析 + watch** | `resolve_version`/`rule_matches`/`fnv1a_hash` 读路径纯函数（**固定求值次序 labels→IP→percent；无身份永不进灰度**，Q2 修订）；仅 HTTP snapshot / gRPC get_config / gRPC get_item 三处传 client_ctx（Q6 修订）；watch 按身份投递或 gray 事件永不按版本过滤 + abort 携带回落版本号（**§5.5 Q4 修订**） | state.rs、lib.rs snapshot/render/watch、grpc.rs、proto 加字段（向后兼容） | 数据面三路解析实测；watch 灰度事件隔离实测 | 4–5 天 |
+| **G2 灰度核心状态机** | ✅ **已完成**（`docs/plan-gray-g2.md` 13 任务全闭环）：新命令 `GrayPublish{project,branch,rule,comment,request_id,operator,ts}`、`GrayAbort{…}`、`GrayPromote{…}`（纯新增，旧变体不动）；`BranchState` 加 `gray_seq`/`gray_rule`（serde default）；灰度快照存独立前缀 `gray-snap/`（**独立灰度序号，不与 active_version 冲突**，Q1 修订；promote 用 `next=max(active,gray)+1` 单调分配器；结构发布灰度活跃时一次分配两个不同号，D23）；**复用既有 EventType + `gray:bool` 字段**（不新增枚举值，Q3 修订；PublishEvent/VersionRecord 均加，watch 重放保真）；补 I10 幂等；`resolve_version`/`rule_matches`/`fnv1a_hash` 读路径纯函数（**固定求值次序 labels→IP→percent；无身份永不进灰度**，Q2）；`prune_versions` 依赖 gray-snap/ 前缀隔离天然保留灰度快照（Q5，T8 实测）；`rewrap_deks` 覆盖灰度快照（轮换安全） | command.rs / model.rs / state.rs / keys.rs；core 测试先行 | `cargo test -p dsh-core` 全绿（新增 T1-T8：灰度发布/解析三路/转正/下量/幂等/错误路径/结构发布×gray/无身份不进灰度/保留策略，47 用例） | ✅ |
+| **G3 数据面解析 + watch** | 读路径纯函数（`resolve_version`/`rule_matches`/`fnv1a_hash`）**已在 G2 落地**；本阶段剩：仅 HTTP snapshot / gRPC get_config / gRPC get_item 三处传 client_ctx（Q6 修订）+ snapshot 响应加 `gray`/`resolved_version` 字段；watch 按身份投递或 gray 事件永不按版本过滤 + abort 携带回落版本号（**§5.5 Q4 修订**；事件字段与重放 gray 标记 G2 已就绪） | lib.rs snapshot/render/watch、grpc.rs、proto 加字段（向后兼容） | 数据面三路解析实测；watch 灰度事件隔离实测 | 3–4 天 |
 | **G4 灰度管理面 + UI** | HTTP：`POST /projects/{p}/branches/{b}/gray-publish`、`…/gray-abort`、`…/gray-promote`、`GET …/gray-status`；openapi 补路径；Admin UI 灰度 tab（规则编辑/状态/一键回滚）；审计 action 覆盖 | lib.rs handler、openapi.v1.yaml、admin/index.html+app.js | api-surface 新增断言组全过；浏览器全流程实测 | 4–5 天 |
 | **G5 百分比放量 + 观察** | 身份哈希分桶（确定性，文档化算法）；灰度期间 metrics（`dsh_gray_active` 等）；"一键回滚"= GrayAbort；自动回滚钩子（对接 /metrics 指标，可选） | observability、jobs（自动回滚任务，仅 leader） | 百分比放量跨节点一致（Raft 重放同一规则同一桶）；自动回滚触发实测 | 4–5 天 |
 
@@ -174,7 +174,7 @@ W1  W2  W3  W4  W5  W6  W7  W8  W9  W10 W11 W12
 | 里程碑 | 内容 | 关键依赖 | 退出标准 |
 |--------|------|----------|----------|
 | M-P4-1（W3 末） | 三线地基：G1 发布策略旋钮 + R1 角色模型 + E0 契约硬化 + E1 TLS | 无 | 4 项 e2e/测试全绿；D1/D4 偏差关闭 |
-| M-P4-2（W6 末） | G2 灰度状态机 + R2 action 授权 + E2 Java/Spring | M-P4-1 | core 测试新增 ≥25 用例；授权矩阵回归全过；Java 契约对拍 |
+| M-P4-2（W6 末） | ✅ **G2 灰度状态机完成**（提前于本周）+ R2 action 授权 + E2 Java/Spring | M-P4-1 | G2：core 测试全绿（T1-T8 + 47 用例）、clippy 0 警告、workspace 全绿；R2/E2 待续 |
 | M-P4-3（W9 末） | G3 数据面灰度 + R3 多项目 + E3 K8s 控制器 | M-P4-2 | 灰度三路解析实测；多项目 e2e；控制器 e2e |
 | M-P4-4（W12 末） | G4/G5 灰度管理面+放量 + R4 审批流 + E4/E5 Helm+基准 | M-P4-3 | 浏览器全流程；审批闭环；helm 集群实测；基准归档 |
 

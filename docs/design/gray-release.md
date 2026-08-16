@@ -1,8 +1,9 @@
 # 设计文档：灰度发布（G0 设计先行 · 含流程图）
 
-> 状态：待审核 ｜ 日期：2025-08-16 ｜ 代码基线：main `4377f13`
+> 状态：**G2 已实现**（2025-08-16 设计定稿；2025-08-16 G2 核心状态机落地）｜ 代码基线：main `8686999`
 > 本文档用**流程图 + 时序图 + 请求/响应示例**直白说明灰度是如何实现的。
 > 抽象设计决策（D17-D23）见文末附录；正文先讲"怎么跑起来"。
+> G2 实现落档：`docs/plan-gray-g2.md`（13 任务全闭环）、roadmap-p4.md §1.3 标记 ✅。
 
 ---
 
@@ -274,16 +275,26 @@ WatchEvent（proto）：加 bool gray = 8（向后兼容）
 
 ## 6. 实现清单（代码要改哪些地方）
 
-| 层 | 文件 | 改什么 |
-|----|------|--------|
-| 模型 | `model.rs` | `BranchState` 加 `gray_seq`/`gray_rule`（serde default）；新增 `GrayRule` 结构 |
-| 命令 | `command.rs` | **纯新增** `GrayPublish`/`GrayAbort`/`GrayPromote` 三个变体（旧命令不动，Raft wire 兼容） |
-| 状态机 | `state.rs` | 三个 apply 方法 + `resolve_version`/`rule_matches`/`fnv1a_hash`（读路径纯函数） |
-| 存储 | `keys.rs` | 新增 `gray_snap_key(pid, branch, seq)`（独立前缀 gray-snap/，不与 v/ 冲突） |
-| API | `lib.rs` | 4 个管理端点 + snapshot/render/watch 解析身份头 |
-| proto | `config.v1.proto` | `GetConfigRequest`/`WatchRequest` 加 `instance_id`/`labels` 字段（向后兼容）；`WatchEvent` 加 `gray` 标记 |
-| SDK | 三语言 | 加 `instance_id`/`labels` 配置项 + 上报 + watch 按 gray 过滤 |
-| UI | `admin/app.js` | 灰度 tab（规则编辑/状态/一键提升/一键回滚） |
+> ✅ = G2 已落地（2025-08-16）；⬜ = 后续阶段（G3/G4）。
+
+| 层 | 文件 | 改什么 | 状态 |
+|----|------|--------|------|
+| 模型 | `model.rs` | `BranchState` 加 `gray_seq`/`gray_rule`（serde default）；新增 `GrayRule`/`LabelSelector`；`PublishEvent`/`VersionRecord` 加 `gray: bool`（serde default，Q3） | ✅ |
+| 命令 | `command.rs` | **纯新增** `GrayPublish`/`GrayAbort`/`GrayPromote` 三个变体（旧命令不动，Raft wire 兼容） | ✅ |
+| 状态机 | `state.rs` | 三个 apply 方法 + `resolve_version`/`rule_matches`/`fnv1a_hash`/`ip_in_cidr`（读路径纯函数）+ 结构发布×灰度双号 bump（D23）+ `gray_snapshot_of` + `rewrap_deks` 覆盖灰度快照 | ✅ |
+| 存储 | `keys.rs` | 新增 `gray_snap_key(pid, branch, seq)`（独立前缀 gray-snap/，不与 v/ 冲突） | ✅ |
+| API | `lib.rs` | 4 个管理端点 + snapshot/render/watch 解析身份头 + snapshot 响应 `gray`/`resolved_version` | ⬜ G4（身份注入 ⬜ G3） |
+| proto | `config.v1.proto` | `GetConfigRequest`/`WatchRequest` 加 `instance_id`/`labels` 字段（向后兼容）；`WatchEvent` 加 `gray` 标记 | ⬜ G3 |
+| SDK | 三语言 | 加 `instance_id`/`labels` 配置项 + 上报 + watch 按 gray 过滤 | ⬜ G3/G4 |
+| UI | `admin/app.js` | 灰度 tab（规则编辑/状态/一键提升/一键回滚） | ⬜ G4 |
+
+> G2 实现要点（与设计逐条对齐）：promote 的 `next = max(active, gray)+1` 单调分配器（Q1）；
+> 灰度快照存**全量 SnapshotMap**（非 diff 链——仅当前灰度一个活跃快照，读路径直接命中）；
+> 结构发布灰度活跃时 `stable_next = max+1`、`gray_next = stable_next+1` 分配两个不同号（Q1/D23）；
+> abort 不产生新版本，事件携带回落版本号 = active_version（Q4）；
+> 事件 `changes`：publish 为 diff(active, gray)（稳定→灰度的增量），promote 为 diff(old, gray)，abort 为空。
+> 已知限制（后续阶段处理）：gray-snap/ 快照随灰度发布累积（当前仅分支删除级联清理，回收策略留待 G4+）；
+> watch 数据面按身份投递属 G3（G2 保证事件字段与重放 gray 标记正确）。
 
 ---
 

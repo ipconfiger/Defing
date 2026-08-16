@@ -243,4 +243,44 @@ pub enum Command {
         #[serde(default)]
         kek_enc: Vec<u8>,
     },
+
+    // ---------------- 灰度发布（G2，纯新增变体，B1/N10：既有变体不动） ----------------
+    /// 灰度发布：固化草稿 → 灰度快照（gray-snap/{seq}，独立灰度序号 gray_seq，Q1）+ 设置灰度规则。
+    /// 复用既有 EventType（ValuePublish）+ gray:bool 标记（Q3）；I10 幂等（last_request_id）。
+    GrayPublish {
+        project: ProjectId,
+        branch: BranchName,
+        rule: crate::model::GrayRule,
+        comment: String,
+        request_id: String,
+        #[serde(default)]
+        operator: String,
+        /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）
+        #[serde(default)]
+        ts: i64,
+    },
+    /// 灰度转正：读灰度快照内容 → 写新 active_version（next = max(active, gray)+1，Q1）→ 清灰度。
+    /// 事件 gray=true 携带新 active 版本号（灰度客户端据此重拉；Q4）。
+    GrayPromote {
+        project: ProjectId,
+        branch: BranchName,
+        comment: String,
+        request_id: String,
+        #[serde(default)]
+        operator: String,
+        #[serde(default)]
+        ts: i64,
+    },
+    /// 灰度下量/回滚：清灰度（gray_seq=0, gray_rule=None）。
+    /// 事件 gray=true 携带回落版本号（active_version；灰度客户端据此重拉稳定版，Q4）。
+    GrayAbort {
+        project: ProjectId,
+        branch: BranchName,
+        comment: String,
+        request_id: String,
+        #[serde(default)]
+        operator: String,
+        #[serde(default)]
+        ts: i64,
+    },
 }

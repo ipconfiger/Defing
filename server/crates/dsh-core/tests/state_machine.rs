@@ -2,7 +2,7 @@
 
 use dsh_core::command::{Command, DraftUpdateItem};
 use dsh_core::model::*;
-use dsh_core::{ErrorKind, InMemoryStore, StateMachine, Value};
+use dsh_core::{ClientCtx, ErrorKind, InMemoryStore, StateMachine, Value};
 
 fn sm() -> StateMachine {
     StateMachine::new(Box::new(InMemoryStore::new()))
@@ -1971,4 +1971,810 @@ fn draft_optimistic_lock_legacy_no_check() {
         Value::String("v2".into()),
         "last-write-wins（旧客户端不校验）"
     );
+}
+
+// ==================== G2 灰度发布（T1-T8，design/gray-release.md） ====================
+
+fn label_rule(key: &str, value: &str) -> GrayRule {
+    GrayRule {
+        match_labels: vec![LabelSelector {
+            key: key.into(),
+            value: value.into(),
+        }],
+        ip_cidrs: vec![],
+        percentage: None,
+    }
+}
+
+fn ctx(instance: &str, labels: &[(&str, &str)], ip: Option<&str>) -> ClientCtx {
+    ClientCtx {
+        instance_id: instance.into(),
+        labels: labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        ip: ip.map(|s| s.parse().unwrap()),
+    }
+}
+
+/// 灰度测试基线：项目 + 结构（v2）+ dev 稳定版 v2（host=stable-host）+ 新草稿（host=gray-host）。
+fn gray_setup(s: &mut StateMachine) -> (ProjectId, BranchName) {
+    let (pid, _branches) = setup(s);
+    let dev = BranchName("dev".into());
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "redis".into(),
+                key: "host".into(),
+                value: Value::String("stable-host".into()),
+            }],
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        10,
+    )
+    .unwrap();
+    s.apply(
+        &Command::Publish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            comment: "stable v2".into(),
+            request_id: "p1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        11,
+    )
+    .unwrap();
+    // 下一版草稿（将作为灰度内容）
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "redis".into(),
+                key: "host".into(),
+                value: Value::String("gray-host".into()),
+            }],
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        12,
+    )
+    .unwrap();
+    (pid, dev)
+}
+
+/// T1 灰度发布：稳定版不动、灰度快照落地、事件 gray=true、草稿清空。
+#[test]
+fn gray_publish_creates_gray_snapshot() {
+    let mut s = sm();
+    let (pid, dev) = gray_setup(&mut s);
+    let events = s
+        .apply(
+            &Command::GrayPublish {
+                project: pid.clone(),
+                branch: dev.clone(),
+                rule: label_rule("zone", "cn-north-1"),
+                comment: "先给华北".into(),
+                request_id: "g1".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            13,
+        )
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].gray, "灰度事件 gray=true");
+    assert_eq!(events[0].version, 2, "稳定版 active_version 未动");
+    assert_eq!(
+        events[0].ty,
+        EventType::ValuePublish,
+        "复用既有 EventType（Q3）"
+    );
+
+    let st = s.get_branch_state(&pid, &dev).unwrap().unwrap();
+    assert_eq!(st.active_version, 2);
+    assert_eq!(st.gray_seq, 1, "独立灰度序号 +1");
+    assert!(st.gray_rule.is_some());
+    assert!(st.value_draft.is_empty(), "草稿已物化清空");
+
+    // 灰度快照内容 = 草稿物化
+    let snap = s.gray_snapshot_of(&pid, &dev, 1).unwrap();
+    assert_eq!(snap["redis"]["host"], Value::String("gray-host".into()));
+
+    // 稳定客户端不受影响
+    let cfg = s.get_config(&pid, &dev, 0).unwrap();
+    assert_eq!(cfg.version, 2);
+    assert_eq!(
+        cfg.groups["redis"]["host"],
+        Value::String("stable-host".into())
+    );
+
+    // 解析：命中 → gray_seq；未命中 → active
+    assert_eq!(
+        s.resolve_version(&pid, &dev, &ctx("web-1", &[("zone", "cn-north-1")], None))
+            .unwrap(),
+        1,
+        "华北命中 → 灰度快照"
+    );
+    assert_eq!(
+        s.resolve_version(&pid, &dev, &ctx("web-2", &[("zone", "cn-south-1")], None))
+            .unwrap(),
+        2,
+        "华南未命中 → 稳定版"
+    );
+}
+
+/// T2 解析三路（labels → IP → percent 固定次序；任一命中）+ 纯函数单元断言。
+#[test]
+fn gray_resolve_three_paths() {
+    let mut s = sm();
+    let (pid, dev) = gray_setup(&mut s);
+    let rule = GrayRule {
+        match_labels: vec![LabelSelector {
+            key: "zone".into(),
+            value: "cn-north-1".into(),
+        }],
+        ip_cidrs: vec!["10.0.0.0/8".into()],
+        percentage: Some(50),
+    };
+    s.apply(
+        &Command::GrayPublish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            rule: rule.clone(),
+            comment: "三路".into(),
+            request_id: "g2".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        13,
+    )
+    .unwrap();
+
+    // ① labels 命中
+    assert!(StateMachine::rule_matches(
+        &rule,
+        &ctx("web-1", &[("zone", "cn-north-1")], Some("8.8.8.8"))
+    ));
+    // ② IP 命中（无标签）
+    assert!(StateMachine::rule_matches(
+        &rule,
+        &ctx("web-2", &[], Some("10.1.2.3"))
+    ));
+    assert!(!StateMachine::rule_matches(
+        &rule,
+        &ctx("web-2", &[], Some("192.168.1.1"))
+    ));
+    // ③ percentage 命中（无标签无 IP；用动态阈值保证确定性）
+    let h = StateMachine::fnv1a_hash("web-pct");
+    let hit_pct = h % 100 + 1; // 恒 < hit_pct
+    let miss_pct = h % 100; // 恒 >= miss_pct
+    let pct_rule = GrayRule {
+        match_labels: vec![],
+        ip_cidrs: vec![],
+        percentage: Some(hit_pct),
+    };
+    assert!(StateMachine::rule_matches(
+        &pct_rule,
+        &ctx("web-pct", &[], None)
+    ));
+    let miss_rule = GrayRule {
+        percentage: Some(miss_pct),
+        ..Default::default()
+    };
+    assert!(!StateMachine::rule_matches(
+        &miss_rule,
+        &ctx("web-pct", &[], None)
+    ));
+
+    // 纯函数确定性：同一输入恒同输出
+    assert_eq!(
+        StateMachine::fnv1a_hash("web-1"),
+        StateMachine::fnv1a_hash("web-1")
+    );
+
+    // 非法 CIDR 防御：不 panic、不命中
+    let bad_rule = GrayRule {
+        match_labels: vec![],
+        ip_cidrs: vec!["not-a-cidr".into()],
+        percentage: None,
+    };
+    assert!(!StateMachine::rule_matches(
+        &bad_rule,
+        &ctx("web-1", &[], Some("10.1.2.3"))
+    ));
+
+    // resolve 三路端到端
+    assert_eq!(
+        s.resolve_version(&pid, &dev, &ctx("web-1", &[("zone", "cn-north-1")], None))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        s.resolve_version(&pid, &dev, &ctx("web-2", &[], Some("10.1.2.3")))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        s.resolve_version(&pid, &dev, &ctx("web-3", &[], Some("8.8.8.8")))
+            .unwrap(),
+        2
+    );
+}
+
+/// T3 灰度转正：灰度内容 → 新 active（next=max(active,gray)+1），清灰度，事件携带新版本号。
+#[test]
+fn gray_promote_makes_gray_active() {
+    let mut s = sm();
+    let (pid, dev) = gray_setup(&mut s);
+    s.apply(
+        &Command::GrayPublish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            rule: label_rule("zone", "cn-north-1"),
+            comment: "g".into(),
+            request_id: "g1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        13,
+    )
+    .unwrap();
+
+    let events = s
+        .apply(
+            &Command::GrayPromote {
+                project: pid.clone(),
+                branch: dev.clone(),
+                comment: "全量".into(),
+                request_id: "prom1".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            14,
+        )
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].gray, "转正事件 gray=true（Q4 补发语义）");
+    assert_eq!(events[0].version, 3, "next = max(2, 1)+1");
+
+    let st = s.get_branch_state(&pid, &dev).unwrap().unwrap();
+    assert_eq!(st.active_version, 3);
+    assert_eq!(st.gray_seq, 0, "灰度清空");
+    assert!(st.gray_rule.is_none());
+
+    // 全量客户端现在读到灰度内容
+    let cfg = s.get_config(&pid, &dev, 0).unwrap();
+    assert_eq!(cfg.version, 3);
+    assert_eq!(
+        cfg.groups["redis"]["host"],
+        Value::String("gray-host".into())
+    );
+    // 任何身份解析都回稳定版
+    assert_eq!(
+        s.resolve_version(&pid, &dev, &ctx("web-1", &[("zone", "cn-north-1")], None))
+            .unwrap(),
+        3
+    );
+    // 版本记录带 gray 标记（重放保真，Q3）
+    let recs = s.version_history(&pid, &dev).unwrap();
+    let promoted = recs.iter().find(|r| r.no == 3).unwrap();
+    assert!(promoted.gray, "转正版本记录 gray=true");
+    assert_eq!(promoted.event_ty, Some(EventType::ValuePublish));
+}
+
+/// T4 灰度下量：清灰度、事件携带回落版本号、灰度快照历史可查（Q5）。
+#[test]
+fn gray_abort_reverts_to_stable() {
+    let mut s = sm();
+    let (pid, dev) = gray_setup(&mut s);
+    s.apply(
+        &Command::GrayPublish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            rule: label_rule("zone", "cn-north-1"),
+            comment: "g".into(),
+            request_id: "g1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        13,
+    )
+    .unwrap();
+
+    let events = s
+        .apply(
+            &Command::GrayAbort {
+                project: pid.clone(),
+                branch: dev.clone(),
+                comment: "撤回".into(),
+                request_id: "ab1".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            14,
+        )
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].gray, "下量事件 gray=true（Q4 携带回落版本号）");
+    assert_eq!(events[0].version, 2, "回落版本号 = active_version");
+    assert!(events[0].changes.is_empty(), "下量不产生新版本");
+
+    let st = s.get_branch_state(&pid, &dev).unwrap().unwrap();
+    assert_eq!(st.active_version, 2);
+    assert_eq!(st.gray_seq, 0);
+    assert!(st.gray_rule.is_none());
+
+    // 灰度客户端也回落到稳定版
+    assert_eq!(
+        s.resolve_version(&pid, &dev, &ctx("web-1", &[("zone", "cn-north-1")], None))
+            .unwrap(),
+        2
+    );
+    let cfg = s.get_config(&pid, &dev, 0).unwrap();
+    assert_eq!(
+        cfg.groups["redis"]["host"],
+        Value::String("stable-host".into())
+    );
+    // Q5：灰度快照保留（历史可查），不再被解析到
+    assert!(s.gray_snapshot_of(&pid, &dev, 1).is_ok());
+}
+
+/// T5 I10 幂等：三个灰度命令同 request_id 重放 → 空事件、状态不重复推进。
+#[test]
+fn gray_commands_idempotent() {
+    let mut s = sm();
+    let (pid, dev) = gray_setup(&mut s);
+    // publish 幂等
+    s.apply(
+        &Command::GrayPublish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            rule: label_rule("zone", "cn-north-1"),
+            comment: "g".into(),
+            request_id: "g1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        13,
+    )
+    .unwrap();
+    let replay = s
+        .apply(
+            &Command::GrayPublish {
+                project: pid.clone(),
+                branch: dev.clone(),
+                rule: label_rule("zone", "cn-north-1"),
+                comment: "g".into(),
+                request_id: "g1".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            14,
+        )
+        .unwrap();
+    assert!(replay.is_empty(), "重放不产生事件");
+    let st = s.get_branch_state(&pid, &dev).unwrap().unwrap();
+    assert_eq!(st.gray_seq, 1, "gray_seq 不重复递增");
+
+    // promote 幂等
+    s.apply(
+        &Command::GrayPromote {
+            project: pid.clone(),
+            branch: dev.clone(),
+            comment: "p".into(),
+            request_id: "prom1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        15,
+    )
+    .unwrap();
+    let replay = s
+        .apply(
+            &Command::GrayPromote {
+                project: pid.clone(),
+                branch: dev.clone(),
+                comment: "p".into(),
+                request_id: "prom1".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            16,
+        )
+        .unwrap();
+    assert!(replay.is_empty());
+    let st = s.get_branch_state(&pid, &dev).unwrap().unwrap();
+    assert_eq!(st.active_version, 3, "active 不重复推进");
+
+    // abort 幂等：promote 已清灰度 → 先再编辑草稿并灰度（g2），再 abort 并重放
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "redis".into(),
+                key: "host".into(),
+                value: Value::String("gray-2".into()),
+            }],
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        17,
+    )
+    .unwrap();
+    s.apply(
+        &Command::GrayPublish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            rule: label_rule("zone", "cn-north-1"),
+            comment: "g2".into(),
+            request_id: "g2".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        18,
+    )
+    .unwrap();
+    s.apply(
+        &Command::GrayAbort {
+            project: pid.clone(),
+            branch: dev.clone(),
+            comment: "a".into(),
+            request_id: "ab1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        19,
+    )
+    .unwrap();
+    let replay = s
+        .apply(
+            &Command::GrayAbort {
+                project: pid.clone(),
+                branch: dev.clone(),
+                comment: "a".into(),
+                request_id: "ab1".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            20,
+        )
+        .unwrap();
+    assert!(replay.is_empty());
+    let st = s.get_branch_state(&pid, &dev).unwrap().unwrap();
+    assert_eq!(st.gray_seq, 0, "abort 幂等重放不重复推进");
+}
+
+/// T5b 错误路径：空草稿发布 / 空规则 / 无灰度 promote / 无灰度 abort。
+#[test]
+fn gray_command_error_paths() {
+    let mut s = sm();
+    let (pid, _branches) = setup(&mut s);
+    let dev = BranchName("dev".into());
+    // 空草稿 → NoDraft
+    let e = s
+        .apply(
+            &Command::GrayPublish {
+                project: pid.clone(),
+                branch: dev.clone(),
+                rule: label_rule("zone", "cn-north-1"),
+                comment: "x".into(),
+                request_id: "g1".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            10,
+        )
+        .unwrap_err();
+    assert_eq!(e.kind, ErrorKind::NoDraft);
+    // 空规则 → Validation
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "redis".into(),
+                key: "host".into(),
+                value: Value::String("h".into()),
+            }],
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        11,
+    )
+    .unwrap();
+    let e = s
+        .apply(
+            &Command::GrayPublish {
+                project: pid.clone(),
+                branch: dev.clone(),
+                rule: GrayRule::default(),
+                comment: "x".into(),
+                request_id: "g2".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            12,
+        )
+        .unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Validation, "空规则拒绝");
+    // 百分比 > 100 → Validation
+    let e = s
+        .apply(
+            &Command::GrayPublish {
+                project: pid.clone(),
+                branch: dev.clone(),
+                rule: GrayRule {
+                    percentage: Some(101),
+                    ..Default::default()
+                },
+                comment: "x".into(),
+                request_id: "g3".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            13,
+        )
+        .unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Validation, "百分比 >100 拒绝");
+    // 非法 CIDR → Validation
+    let e = s
+        .apply(
+            &Command::GrayPublish {
+                project: pid.clone(),
+                branch: dev.clone(),
+                rule: GrayRule {
+                    ip_cidrs: vec!["nope".into()],
+                    ..Default::default()
+                },
+                comment: "x".into(),
+                request_id: "g4".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            14,
+        )
+        .unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Validation, "非法 CIDR 拒绝");
+    // 无灰度 promote → Validation
+    let e = s
+        .apply(
+            &Command::GrayPromote {
+                project: pid.clone(),
+                branch: dev.clone(),
+                comment: "x".into(),
+                request_id: "pr1".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            15,
+        )
+        .unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Validation);
+    // 无灰度 abort → Validation
+    let e = s
+        .apply(
+            &Command::GrayAbort {
+                project: pid.clone(),
+                branch: dev.clone(),
+                comment: "x".into(),
+                request_id: "ab1".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            16,
+        )
+        .unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Validation);
+}
+
+/// T6 结构发布 × 灰度（D23/Q1）：灰度活跃时一次分配两个不同号，灰度快照同步 bump 不失效。
+#[test]
+fn structure_publish_with_active_gray_bumps_both() {
+    let mut s = sm();
+    let (pid, dev) = gray_setup(&mut s);
+    s.apply(
+        &Command::GrayPublish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            rule: label_rule("zone", "cn-north-1"),
+            comment: "g".into(),
+            request_id: "g1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        13,
+    )
+    .unwrap();
+    // 结构草稿（当前结构版本 2 → base_version 2）+ 发布
+    let structure = s.get_structure(&pid).unwrap().unwrap();
+    assert_eq!(structure.version, 2);
+    s.apply(
+        &Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: structure.version,
+            groups: structure.groups.clone(),
+            operator: String::new(),
+        },
+        14,
+    )
+    .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "struct v3".into(),
+            request_id: "s3".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        15,
+    )
+    .unwrap();
+
+    let st = s.get_branch_state(&pid, &dev).unwrap().unwrap();
+    // Q1：stable_next = max(2,1)+1 = 3；gray_next = 3+1 = 4（两个不同号）
+    assert_eq!(st.active_version, 3);
+    assert_eq!(st.gray_seq, 4, "灰度快照同步 bump 分配不同号");
+    assert_eq!(st.structure_version, 3, "结构版本已推进");
+    // 灰度内容保留（D23 不失效）
+    let snap = s.gray_snapshot_of(&pid, &dev, 4).unwrap();
+    assert_eq!(snap["redis"]["host"], Value::String("gray-host".into()));
+    // 旧灰度快照仍在（历史可查）
+    assert!(s.gray_snapshot_of(&pid, &dev, 1).is_ok());
+    // 灰度客户端解析到新灰度号；稳定客户端读到新稳定版
+    assert_eq!(
+        s.resolve_version(&pid, &dev, &ctx("web-1", &[("zone", "cn-north-1")], None))
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        s.resolve_version(&pid, &dev, &ctx("web-2", &[], None))
+            .unwrap(),
+        3
+    );
+    // 无灰度的分支照旧（active = 1+1 = 2）
+    let test = BranchName("test".into());
+    let tst = s.get_branch_state(&pid, &test).unwrap().unwrap();
+    assert_eq!(tst.active_version, 2);
+    assert_eq!(tst.gray_seq, 0);
+}
+
+/// T7 Q2：无身份（instance_id 空）永不进灰度——即使标签命中。
+#[test]
+fn gray_resolve_no_identity_never_gray() {
+    let mut s = sm();
+    let (pid, dev) = gray_setup(&mut s);
+    s.apply(
+        &Command::GrayPublish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            rule: label_rule("zone", "cn-north-1"),
+            comment: "g".into(),
+            request_id: "g1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        13,
+    )
+    .unwrap();
+    // 无 instance_id、标签命中 → 仍解析稳定版
+    assert_eq!(
+        s.resolve_version(
+            &pid,
+            &dev,
+            &ClientCtx {
+                instance_id: String::new(),
+                labels: [("zone".to_string(), "cn-north-1".to_string())].into(),
+                ip: None,
+            }
+        )
+        .unwrap(),
+        2,
+        "Q2：无身份永不进灰度"
+    );
+    // 纯函数防御：空身份 + 100% 放量也不命中（rule_matches 内部守卫）
+    let rule = GrayRule {
+        percentage: Some(100),
+        ..Default::default()
+    };
+    assert!(!StateMachine::rule_matches(&rule, &ClientCtx::default()));
+}
+
+/// T8 Q5 保留策略：prune_versions 不触碰灰度快照（gray-snap/ 前缀独立于 v/）。
+#[test]
+fn prune_keeps_gray_snapshot() {
+    let mut s = sm();
+    let (pid, dev) = gray_setup(&mut s); // active=2
+                                         // 冲到 v102（越过 checkpoint 100），使 prune 真正能裁掉早期 v/ 历史
+    for i in 3..=102u64 {
+        s.apply(
+            &Command::DraftUpdate {
+                project: pid.clone(),
+                branch: dev.clone(),
+                updates: vec![DraftUpdateItem {
+                    group: "redis".into(),
+                    key: "host".into(),
+                    value: Value::String(format!("h{i}")),
+                }],
+                deletes: vec![],
+                operator: String::new(),
+                ts: 0,
+                expected_draft_rev: None,
+            },
+            100 + i as i64,
+        )
+        .unwrap();
+        s.apply(
+            &Command::Publish {
+                project: pid.clone(),
+                branch: dev.clone(),
+                comment: format!("v{i}"),
+                request_id: format!("p{i}"),
+                operator: String::new(),
+                ts: 0,
+            },
+            200 + i as i64,
+        )
+        .unwrap();
+    }
+    // 新草稿作为灰度内容（循环最后一次 Publish 已清空草稿）
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "redis".into(),
+                key: "host".into(),
+                value: Value::String("gray-host".into()),
+            }],
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        300,
+    )
+    .unwrap();
+    s.apply(
+        &Command::GrayPublish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            rule: label_rule("zone", "cn-north-1"),
+            comment: "g".into(),
+            request_id: "g1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        500,
+    )
+    .unwrap();
+    // keep=1：最新保留 = v101 → 基座对齐 checkpoint 100 → v1..v99 被裁剪
+    let removed = s.prune_versions(&pid, &dev, 1).unwrap();
+    assert!(removed >= 90, "早期 v/ 历史被裁剪（实际移除 {removed}）");
+    // 灰度快照可读、解析仍工作（Q5：灰度目标不被裁）
+    let snap = s.gray_snapshot_of(&pid, &dev, 1).unwrap();
+    assert_eq!(snap["redis"]["host"], Value::String("gray-host".into()));
+    assert_eq!(
+        s.resolve_version(&pid, &dev, &ctx("web-1", &[("zone", "cn-north-1")], None))
+            .unwrap(),
+        1,
+        "灰度客户端 resolve 目标未被裁掉（Q5）"
+    );
+    // 稳定版仍可读（active 保留）
+    let cfg = s.get_config(&pid, &dev, 0).unwrap();
+    assert_eq!(cfg.version, 102);
+    assert_eq!(cfg.groups["redis"]["host"], Value::String("h102".into()));
 }

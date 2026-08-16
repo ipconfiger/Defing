@@ -97,6 +97,7 @@ fn version_record_kind_serde() {
         snapshot_ref: None,
         diff_ref: Some("d".into()),
         event_ty: Some(EventType::Rollback),
+        gray: false,
     };
     let json = serde_json::to_string(&v).unwrap();
     let back: VersionRecord = serde_json::from_str(&json).unwrap();
@@ -119,6 +120,7 @@ fn publish_event_serde() {
             kind: ChangeKind::Upsert,
             new_value: Some(Value::Int(1)),
         }],
+        gray: false,
     };
     let json = serde_json::to_string(&e).unwrap();
     let back: PublishEvent = serde_json::from_str(&json).unwrap();

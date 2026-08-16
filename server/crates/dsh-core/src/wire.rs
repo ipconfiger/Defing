@@ -96,6 +96,7 @@ mod tests {
                     new_value: Some(Value::Secret(ct())),
                 },
             ],
+            gray: false,
         };
         let orig = e.clone();
         let masked = mask_event_for_wire(&e);

@@ -26,6 +26,15 @@ pub struct ConfigSnapshot {
     pub groups: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
+/// 客户端身份（G2 灰度解析输入；G3 数据面由 HTTP 头/gRPC 字段/对端地址注入）。
+/// D18：instance_id 优先（容器重建不变）> labels > IP（兜底）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientCtx {
+    pub instance_id: String,
+    pub labels: BTreeMap<String, String>,
+    pub ip: Option<std::net::IpAddr>,
+}
+
 /// 版本存储 checkpoint 间隔（perf 方案② D3）：每 N 版本存 full 快照，其余存 diff。
 /// 与 design-modules/04-publish.md §8 一致；改小可降低重建成本但增加存储，改大反之。
 pub const CHECKPOINT_INTERVAL: u64 = 100;
@@ -297,7 +306,7 @@ impl StateMachine {
     /// DEK 重包（B6）：扫描全部存储中的 secret 密文，用 `f` 逐个重写（轮换后台任务用）。
     /// `f` 返回 None = 跳过（如代际已最新）；返回 Some(新密文) = 写回。
     /// 覆盖：版本快照（…/snap）、版本 diff（…/diff，perf 方案② D3）、
-    /// 共享项（sh/、sh-draft/）、分支草稿（…/b/{branch}/state）。
+    /// 共享项（sh/、sh-draft/）、分支草稿（…/b/{branch}/state）、灰度快照（gray-snap/，G2）。
     pub fn rewrap_deks(
         &self,
         f: &dyn Fn(&Ciphertext) -> Option<Result<Ciphertext, Error>>,
@@ -344,6 +353,17 @@ impl StateMachine {
                 };
                 if Self::rewrap_value(&mut item.value, f)? {
                     save(&*self.store, key, &item)?;
+                    rewrapped += 1;
+                }
+            } else if key.contains(K_GRAY_SNAP) {
+                // G2：灰度快照（gray-snap/{seq}，SnapshotMap）——含 Secret 时同样重包，
+                // 否则 KEK 轮换后灰度客户端解密失败（与 /snap 版本快照同等对待）。
+                let mut snap: SnapshotMap = match serde_json::from_slice(&v) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                if Self::rewrap_snapshot(&mut snap, f)? {
+                    save(&*self.store, key, &snap)?;
                     rewrapped += 1;
                 }
             } else if let Some(rest) = key.strip_prefix(K_PROJECT) {
@@ -586,9 +606,11 @@ impl StateMachine {
     }
 
     /// 版本裁剪：保留活动版本 + 最近 keep 个版本，删除更早的历史（后台任务用）。
-    /// 版本裁剪：保留活动版本 + 最近 keep 个版本，删除更早的历史（后台任务用）。
     /// perf 方案② D3：同时删除 diff_key；且删除下限对齐到"最近保留 checkpoint 之前"——
     /// 保证最新保留版本是 checkpoint（full 基座），其后的 diff 链可完整重建。
+    /// G2/Q5：灰度快照位于 gray-snap/ 独立前缀（Q1），不在本方法的 v/ 扫描范围内，
+    /// 天然不会被裁剪（灰度客户端 resolve 目标永不 NotFound；Abort 后历史仍可查）。
+    /// 灰度快照的回收属后续维护任务（当前仅随分支删除级联清理）。
     pub fn prune_versions(
         &self,
         project: &ProjectId,
@@ -663,6 +685,173 @@ impl StateMachine {
             structure_version: structure.version,
             groups: snap,
         })
+    }
+
+    /// 读取灰度快照（gray-snap/{seq}，Q1 独立前缀；不存在 → NotFound）。
+    /// G2 供 GrayPromote 取内容；G3 数据面按 resolve_version 结果读取。
+    pub fn gray_snapshot_of(
+        &self,
+        id: &ProjectId,
+        branch: &BranchName,
+        seq: u64,
+    ) -> Result<SnapshotMap, Error> {
+        let key = gray_snap_key(id, branch, seq);
+        match self.get_merged(key.as_bytes())? {
+            Some(raw) => Ok(serde_json::from_slice(&raw)
+                .map_err(|e| Error::internal(format!("corrupt gray snapshot {key}: {e}")))?),
+            None => Err(Error::not_found(format!("gray snapshot {seq} of {branch}"))),
+        }
+    }
+
+    // ---------------- 灰度解析（G2 读路径纯函数，D20：apply 不读请求，selector 求值在此） ----------------
+
+    /// 灰度版本解析：返回客户端应读取的版本号。
+    /// - 无灰度（gray_seq==0 / 规则 None）→ active_version；
+    /// - Q2：无身份（instance_id 空）永不进灰度 → active_version；
+    /// - 规则命中 → gray_seq（灰度快照序号）；未命中 → active_version。
+    pub fn resolve_version(
+        &self,
+        id: &ProjectId,
+        branch: &BranchName,
+        ctx: &ClientCtx,
+    ) -> Result<u64, Error> {
+        let st = self
+            .get_branch_state(id, branch)?
+            .ok_or_else(|| Error::not_found(format!("branch {branch} of {id}")))?;
+        if st.gray_seq == 0 || st.gray_rule.is_none() {
+            return Ok(st.active_version);
+        }
+        // Q2：无身份永不进灰度（空 instance_id 哈希恒恒定，禁止参与分桶）
+        if ctx.instance_id.is_empty() {
+            return Ok(st.active_version);
+        }
+        let rule = st.gray_rule.as_ref().expect("gray_rule checked is_some");
+        if Self::rule_matches(rule, ctx) {
+            Ok(st.gray_seq)
+        } else {
+            Ok(st.active_version)
+        }
+    }
+
+    /// 规则求值（纯函数；固定次序 labels → IP → percent，任一命中即命中）。
+    pub fn rule_matches(rule: &GrayRule, ctx: &ClientCtx) -> bool {
+        // 1. 标签（OR：任一 key=value 命中）
+        for sel in &rule.match_labels {
+            if ctx.labels.get(&sel.key) == Some(&sel.value) {
+                return true;
+            }
+        }
+        // 2. IP（CIDR 段）
+        if let Some(ip) = ctx.ip {
+            for cidr in &rule.ip_cidrs {
+                if Self::ip_in_cidr(ip, cidr) {
+                    return true;
+                }
+            }
+        }
+        // 3. 百分比（fnv1a(instance_id) % 100 < pct；空身份防御性跳过）
+        if let Some(pct) = rule.percentage {
+            if !ctx.instance_id.is_empty() && Self::fnv1a_hash(&ctx.instance_id) % 100 < pct {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// FNV-1a 32 位哈希（分桶用；确定性纯函数，无墙钟/随机/IO）。
+    pub fn fnv1a_hash(s: &str) -> u32 {
+        let mut h: u32 = 0x811c9dc5;
+        for b in s.as_bytes() {
+            h ^= u32::from(*b);
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        h
+    }
+
+    /// IP 是否落在 CIDR 段内（v4/v6 分族比较；非法段 → false）。
+    fn ip_in_cidr(ip: std::net::IpAddr, cidr: &str) -> bool {
+        let Some((addr_s, prefix_s)) = cidr.split_once('/') else {
+            return false;
+        };
+        let Ok(addr) = addr_s.parse::<std::net::IpAddr>() else {
+            return false;
+        };
+        let Ok(prefix) = prefix_s.parse::<u32>() else {
+            return false;
+        };
+        match (ip, addr) {
+            (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
+                if prefix > 32 {
+                    return false;
+                }
+                let mask = if prefix == 0 {
+                    0u32
+                } else {
+                    u32::MAX << (32 - prefix)
+                };
+                (u32::from(a) & mask) == (u32::from(b) & mask)
+            }
+            (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => {
+                if prefix > 128 {
+                    return false;
+                }
+                let mask = if prefix == 0 {
+                    0u128
+                } else {
+                    u128::MAX << (128 - prefix)
+                };
+                (u128::from(a) & mask) == (u128::from(b) & mask)
+            }
+            _ => false,
+        }
+    }
+
+    /// 灰度规则校验（apply 时执行；规则是状态机数据，坏规则必须在写路径拒绝）：
+    /// 至少一个判据；标签键值非空；CIDR 语法合法；百分比 ≤ 100。
+    fn validate_gray_rule(rule: &GrayRule) -> Result<(), Error> {
+        if rule.match_labels.is_empty() && rule.ip_cidrs.is_empty() && rule.percentage.is_none() {
+            return Err(Error::validation(
+                "gray rule must have at least one criterion (labels / ip / percentage)",
+            ));
+        }
+        for sel in &rule.match_labels {
+            if sel.key.is_empty() || sel.value.is_empty() {
+                return Err(Error::validation(
+                    "gray rule label key/value must be non-empty",
+                ));
+            }
+        }
+        for cidr in &rule.ip_cidrs {
+            let Some((addr_s, prefix_s)) = cidr.split_once('/') else {
+                return Err(Error::validation(format!("invalid CIDR: {cidr:?}")));
+            };
+            let Ok(addr) = addr_s.parse::<std::net::IpAddr>() else {
+                return Err(Error::validation(format!("invalid CIDR: {cidr:?}")));
+            };
+            let Ok(prefix) = prefix_s.parse::<u32>() else {
+                return Err(Error::validation(format!("invalid CIDR: {cidr:?}")));
+            };
+            let max_prefix = match addr {
+                std::net::IpAddr::V4(_) => 32,
+                std::net::IpAddr::V6(_) => 128,
+            };
+            if prefix > max_prefix {
+                return Err(Error::validation(format!("invalid CIDR: {cidr:?}")));
+            }
+        }
+        if let Some(pct) = rule.percentage {
+            if pct > 100 {
+                return Err(Error::validation(format!("gray percentage {pct} > 100")));
+            }
+        }
+        Ok(())
+    }
+
+    /// 分支级单调分配器（Q1）：下一个版本号 = max(active, gray) + 1。
+    /// 灰度与稳定版本号共享一条单调序列（存储空间分离：v/ 与 gray-snap/），
+    /// 保证 promote 的新 active 号严格大于客户端见过的任何号（含 gray_seq）。
+    fn next_monotonic(active: u64, gray: u64) -> u64 {
+        active.max(gray) + 1
     }
 
     // ---------------- apply ----------------
@@ -899,6 +1088,53 @@ impl StateMachine {
             }
             Command::AuditAppend { entry } => self.apply_audit_append(entry),
             Command::RotateMasterKey { .. } => self.apply_rotate_master_key(),
+            Command::GrayPublish {
+                project,
+                branch,
+                rule,
+                comment,
+                request_id,
+                operator,
+                ts,
+            } => self.apply_gray_publish(
+                project,
+                branch,
+                rule,
+                comment,
+                request_id,
+                Self::eff_ts(ts, now_ms),
+                operator,
+            ),
+            Command::GrayPromote {
+                project,
+                branch,
+                comment,
+                request_id,
+                operator,
+                ts,
+            } => self.apply_gray_promote(
+                project,
+                branch,
+                comment,
+                request_id,
+                Self::eff_ts(ts, now_ms),
+                operator,
+            ),
+            Command::GrayAbort {
+                project,
+                branch,
+                comment,
+                request_id,
+                operator,
+                ts,
+            } => self.apply_gray_abort(
+                project,
+                branch,
+                comment,
+                request_id,
+                Self::eff_ts(ts, now_ms),
+                operator,
+            ),
         }
     }
 
@@ -1124,8 +1360,11 @@ impl StateMachine {
             let mut st = self
                 .get_branch_state(id, branch)?
                 .ok_or_else(|| Error::internal("branch state missing"))?;
-            let vno = st.active_version + 1;
-            // 结构发布：值不变（D14 只清理被删 item 的草稿值）
+            // Q1：分支级单调分配器——灰度活跃时新 active 号严格大于 gray_seq；
+            // 灰度快照同步 bump 分配另一个不同号（D23：灰度期间结构演进不中断观察）。
+            let vno = Self::next_monotonic(st.active_version, st.gray_seq);
+            let gray_next = vno + 1; // 与稳定号不同；且恒 > 旧 gray_seq
+                                     // 结构发布：值不变（D14 只清理被删 item 的草稿值）
             let values = if st.active_version == 0 {
                 SnapshotMap::new()
             } else {
@@ -1142,11 +1381,19 @@ impl StateMachine {
                 snapshot_ref: None,
                 diff_ref: None,
                 event_ty: Some(EventType::StructurePublish),
+                gray: false,
             };
             // 结构发布值不变：old==values==new → diff 恒空（checkpoint 规则仍按 vno）
             self.write_version_snapshot(id, branch, vno, &values, &values, &mut record)?;
             st.active_version = vno;
             st.structure_version = new_structure.version;
+            // D23：灰度活跃 → 灰度快照同步 bump（内容不变、序号前移；structure_version
+            // 取 BranchState 最新值，灰度客户端重拉后拿到结构一致的灰度快照）。
+            if st.gray_seq > 0 {
+                let gray_snap = self.gray_snapshot_of(id, branch, st.gray_seq)?;
+                self.save_pending(&gray_snap_key(id, branch, gray_next), &gray_snap)?;
+                st.gray_seq = gray_next;
+            }
             // D14：清理结构发布后不存在的 item 草稿值
             let mut known: BTreeMap<String, BTreeMap<String, ()>> = BTreeMap::new();
             for g in &new_structure.groups {
@@ -1173,6 +1420,7 @@ impl StateMachine {
                 comment: comment.to_string(),
                 request_id: request_id.to_string(),
                 changes: vec![],
+                gray: false,
             });
         }
         self.save_pending(&struct_key(id), &new_structure)?;
@@ -1266,33 +1514,17 @@ impl StateMachine {
         Ok(vec![])
     }
 
-    fn apply_publish(
-        &mut self,
+    /// 物化草稿为已解析快照（apply_publish 与 apply_gray_publish 共用，行为一致）：
+    /// 完整性校验（M1 policy=block）+ 草稿值 + 共享库引用补全（草稿无值时取共享值）。
+    fn materialize_resolved(
+        &self,
         id: &ProjectId,
-        branch: &BranchName,
-        comment: &str,
-        request_id: &str,
-        now_ms: i64,
-        operator: &str,
-    ) -> ApplyOutcome {
-        let mut st = self
-            .get_branch_state(id, branch)?
-            .ok_or_else(|| Error::not_found(format!("branch {branch} of {id}")))?;
-        let structure = self
-            .get_structure(id)?
-            .ok_or_else(|| Error::not_found(format!("project {id}")))?;
-
-        // 幂等（I10）：同 request_id 直接返回（已生效，不重复）
-        if st.last_request_id.as_deref() == Some(request_id) {
-            return Ok(vec![]);
-        }
-        if st.value_draft.is_empty() {
-            return Err(Error::new(ErrorKind::NoDraft, "no pending draft"));
-        }
-
+        st: &BranchState,
+        structure: &Structure,
+    ) -> Result<SnapshotMap, Error> {
         // 完整性校验（M1 policy=block）
         let draft_map: BTreeMap<String, BTreeMap<String, DraftValue>> = st.value_draft.clone();
-        let errs = validator::validate_publish(&draft_map, &structure);
+        let errs = validator::validate_publish(&draft_map, structure);
         if !errs.is_empty() {
             return Err(Error::publish_blocked(
                 serde_json::json!({ "errors": errs }),
@@ -1345,6 +1577,35 @@ impl StateMachine {
                 }
             }
         }
+        Ok(resolved)
+    }
+
+    fn apply_publish(
+        &mut self,
+        id: &ProjectId,
+        branch: &BranchName,
+        comment: &str,
+        request_id: &str,
+        now_ms: i64,
+        operator: &str,
+    ) -> ApplyOutcome {
+        let mut st = self
+            .get_branch_state(id, branch)?
+            .ok_or_else(|| Error::not_found(format!("branch {branch} of {id}")))?;
+        let structure = self
+            .get_structure(id)?
+            .ok_or_else(|| Error::not_found(format!("project {id}")))?;
+
+        // 幂等（I10）：同 request_id 直接返回（已生效，不重复）
+        if st.last_request_id.as_deref() == Some(request_id) {
+            return Ok(vec![]);
+        }
+        if st.value_draft.is_empty() {
+            return Err(Error::new(ErrorKind::NoDraft, "no pending draft"));
+        }
+
+        // 完整性校验 + 物化（草稿值 + 共享库引用）
+        let resolved = self.materialize_resolved(id, &st, &structure)?;
 
         let old = if st.active_version == 0 {
             SnapshotMap::new()
@@ -1365,6 +1626,7 @@ impl StateMachine {
             snapshot_ref: None,
             diff_ref: None,
             event_ty: Some(EventType::ValuePublish),
+            gray: false,
         };
         self.write_version_snapshot(id, branch, vno, &old, &resolved, &mut record)?;
         st.active_version = vno;
@@ -1381,6 +1643,7 @@ impl StateMachine {
             comment: comment.to_string(),
             request_id: request_id.to_string(),
             changes: diff,
+            gray: false,
         }])
     }
 
@@ -1429,6 +1692,7 @@ impl StateMachine {
             snapshot_ref: None,
             diff_ref: None,
             event_ty: Some(EventType::Rollback),
+            gray: false,
         };
         self.write_version_snapshot(project, branch, vno, &old, &snap, &mut record)?;
         st.active_version = vno;
@@ -1443,6 +1707,178 @@ impl StateMachine {
             comment: comment.to_string(),
             request_id: request_id.to_string(),
             changes: diff,
+            gray: false,
+        }])
+    }
+
+    // ---------------- 灰度发布（G2，纯新增命令；Q1 独立灰度序号 / Q3 gray 标记 / Q4 事件语义） ----------------
+
+    /// 灰度发布：固化草稿 → 灰度快照（gray-snap/{seq}）+ 设置灰度规则。
+    /// 与普通发布共用物化/校验（materialize_resolved）；稳定版 active_version 不动。
+    #[allow(clippy::too_many_arguments)]
+    fn apply_gray_publish(
+        &mut self,
+        id: &ProjectId,
+        branch: &BranchName,
+        rule: &GrayRule,
+        comment: &str,
+        request_id: &str,
+        _now_ms: i64,
+        _operator: &str,
+    ) -> ApplyOutcome {
+        Self::validate_gray_rule(rule)?;
+        let mut st = self
+            .get_branch_state(id, branch)?
+            .ok_or_else(|| Error::not_found(format!("branch {branch} of {id}")))?;
+        let structure = self
+            .get_structure(id)?
+            .ok_or_else(|| Error::not_found(format!("project {id}")))?;
+
+        // 幂等（I10）：同 request_id 直接返回（已生效，不重复）
+        if st.last_request_id.as_deref() == Some(request_id) {
+            return Ok(vec![]);
+        }
+        if st.value_draft.is_empty() {
+            return Err(Error::new(ErrorKind::NoDraft, "no pending draft"));
+        }
+
+        // 完整性校验 + 物化（草稿值 + 共享库引用；与普通发布同一路径）
+        let gray_snap = self.materialize_resolved(id, &st, &structure)?;
+        let old = if st.active_version == 0 {
+            SnapshotMap::new()
+        } else {
+            self.snapshot_of(id, branch, st.active_version)?
+        };
+        let diff = compute_diff(&old, &gray_snap);
+
+        // Q1：独立灰度序号 + 独立前缀（gray-snap/），与 active_version 版本号空间完全隔离
+        st.gray_seq += 1;
+        let seq = st.gray_seq;
+        self.save_pending(&gray_snap_key(id, branch, seq), &gray_snap)?;
+        st.gray_rule = Some(rule.clone());
+        st.last_request_id = Some(request_id.to_string());
+        st.value_draft.clear();
+        self.save_pending(&branch_state_key(id, branch), &st)?;
+
+        Ok(vec![PublishEvent {
+            project: id.clone(),
+            branch: branch.clone(),
+            version: st.active_version, // 稳定版未动；事件版本供稳定客户端（gray=false 过滤）
+            ty: EventType::ValuePublish,
+            structure_version: structure.version,
+            comment: comment.to_string(),
+            request_id: request_id.to_string(),
+            changes: diff,
+            gray: true, // Q3：复用 EventType + gray 标记；SDK 契约：gray 事件永不按版本过滤
+        }])
+    }
+
+    /// 灰度转正：读灰度快照 → 写新 active_version（next = max(active, gray)+1，Q1）→ 清灰度。
+    /// 事件 gray=true 携带新 active 版本号：灰度客户端收到后无条件重拉（Q4 补发语义）。
+    fn apply_gray_promote(
+        &mut self,
+        id: &ProjectId,
+        branch: &BranchName,
+        comment: &str,
+        request_id: &str,
+        now_ms: i64,
+        operator: &str,
+    ) -> ApplyOutcome {
+        let mut st = self
+            .get_branch_state(id, branch)?
+            .ok_or_else(|| Error::not_found(format!("branch {branch} of {id}")))?;
+
+        // 幂等（I10）
+        if st.last_request_id.as_deref() == Some(request_id) {
+            return Ok(vec![]);
+        }
+        if st.gray_seq == 0 || st.gray_rule.is_none() {
+            return Err(Error::validation(format!(
+                "no active gray on branch {branch}"
+            )));
+        }
+        let gray_snap = self.gray_snapshot_of(id, branch, st.gray_seq)?;
+        let old = if st.active_version == 0 {
+            SnapshotMap::new()
+        } else {
+            self.snapshot_of(id, branch, st.active_version)?
+        };
+        let diff = compute_diff(&old, &gray_snap);
+
+        // Q1：新 active 号 = max(active, gray)+1（单调分配器；严格大于客户端见过的任何号）
+        let vno = Self::next_monotonic(st.active_version, st.gray_seq);
+        let mut record = VersionRecord {
+            no: vno,
+            structure_version: st.structure_version,
+            created_at: now_ms,
+            operator: Self::operator_id(operator),
+            comment: comment.to_string(),
+            rollback_of: None,
+            kind: VersionKind::Full,
+            snapshot_ref: None,
+            diff_ref: None,
+            event_ty: Some(EventType::ValuePublish),
+            gray: true, // 转正版本：重放时还原 gray 事件标记
+        };
+        self.write_version_snapshot(id, branch, vno, &old, &gray_snap, &mut record)?;
+        st.active_version = vno;
+        st.gray_seq = 0;
+        st.gray_rule = None;
+        st.last_request_id = Some(request_id.to_string());
+        self.save_pending(&branch_state_key(id, branch), &st)?;
+
+        Ok(vec![PublishEvent {
+            project: id.clone(),
+            branch: branch.clone(),
+            version: vno, // 新稳定版号：灰度客户端据此重拉
+            ty: EventType::ValuePublish,
+            structure_version: st.structure_version,
+            comment: comment.to_string(),
+            request_id: request_id.to_string(),
+            changes: diff,
+            gray: true,
+        }])
+    }
+
+    /// 灰度下量/回滚：清灰度（gray_seq=0, gray_rule=None），不产生新版本。
+    /// 事件 gray=true 携带回落版本号（active_version）：灰度客户端据此重拉稳定版（Q4）。
+    fn apply_gray_abort(
+        &mut self,
+        id: &ProjectId,
+        branch: &BranchName,
+        comment: &str,
+        request_id: &str,
+        _now_ms: i64,
+        _operator: &str,
+    ) -> ApplyOutcome {
+        let mut st = self
+            .get_branch_state(id, branch)?
+            .ok_or_else(|| Error::not_found(format!("branch {branch} of {id}")))?;
+
+        // 幂等（I10）
+        if st.last_request_id.as_deref() == Some(request_id) {
+            return Ok(vec![]);
+        }
+        if st.gray_seq == 0 || st.gray_rule.is_none() {
+            return Err(Error::validation(format!(
+                "no active gray on branch {branch}"
+            )));
+        }
+        st.gray_seq = 0;
+        st.gray_rule = None;
+        st.last_request_id = Some(request_id.to_string());
+        self.save_pending(&branch_state_key(id, branch), &st)?;
+
+        Ok(vec![PublishEvent {
+            project: id.clone(),
+            branch: branch.clone(),
+            version: st.active_version, // 回落版本号：客户端重拉目标
+            ty: EventType::ValuePublish,
+            structure_version: st.structure_version,
+            comment: comment.to_string(),
+            request_id: request_id.to_string(),
+            changes: vec![],
+            gray: true,
         }])
     }
 
@@ -1660,6 +2096,7 @@ impl StateMachine {
                 snapshot_ref: None,
                 diff_ref: None,
                 event_ty: Some(EventType::SharedCascade),
+                gray: false,
             };
             self.write_version_snapshot(project, &branch, vno, &old, &new_snap, &mut record)?;
             st.active_version = vno;
@@ -1673,6 +2110,7 @@ impl StateMachine {
                 comment: comment.to_string(),
                 request_id: request_id.to_string(),
                 changes: diff,
+                gray: false,
             });
         }
         Ok(())

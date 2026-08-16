@@ -67,6 +67,17 @@ pub fn diff_key(id: &ProjectId, branch: &BranchName, no: u64) -> String {
         branch.as_str()
     )
 }
+/// 灰度快照前缀（G2/Q1：独立于 v/ 版本号空间，不与 active_version 冲突——双指针同号互覆盖问题）。
+/// 布局：p/{pid}/b/{branch}/gray-snap/{seq}；gray_seq 为分支级独立单调递增序号。
+pub const K_GRAY_SNAP: &str = "/gray-snap/";
+/// 灰度快照键：p/{pid}/b/{branch}/gray-snap/{seq}（全量 SnapshotMap；仅存当前灰度，非历史链）。
+pub fn gray_snap_key(id: &ProjectId, branch: &BranchName, seq: u64) -> String {
+    format!(
+        "{K_PROJECT}{}{K_BRANCH}{}{K_GRAY_SNAP}{seq}",
+        id.as_str(),
+        branch.as_str()
+    )
+}
 pub fn branch_prefix(id: &ProjectId, branch: &BranchName) -> String {
     format!("{K_PROJECT}{}{K_BRANCH}{}", id.as_str(), branch.as_str())
 }
@@ -144,6 +155,14 @@ mod tests {
             "p/order-service/b/prod/v/12/snap"
         );
         assert_eq!(diff_key(&id, &b, 12), "p/order-service/b/prod/v/12/diff");
+        assert_eq!(
+            gray_snap_key(&id, &b, 3),
+            "p/order-service/b/prod/gray-snap/3"
+        );
+        assert_eq!(
+            gray_snap_key(&id, &b, 12),
+            "p/order-service/b/prod/gray-snap/12"
+        );
         assert_eq!(shared_key("redis", "host"), "sh/redis/host");
         assert_eq!(idx_pname("order-service"), "idx/pname/order-service");
         assert_eq!(audit_key(7), "audit/00000000000000000007");

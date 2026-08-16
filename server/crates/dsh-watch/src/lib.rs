@@ -141,6 +141,7 @@ mod tests {
             comment: "c".into(),
             request_id: "r".into(),
             changes: vec![],
+            gray: false,
         }
     }
 

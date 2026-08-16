@@ -3129,6 +3129,9 @@ async fn watch_branch(
                             comment: rec.comment,
                             request_id: String::new(),
                             changes: diff,
+                            // G2/Q3：重放保真——转正（GrayPromote）产生的版本记录 gray=true，
+                            // 重放时同样标记，SDK 对 gray 事件不按版本过滤（Q4 方案 b 兜底）。
+                            gray: rec.gray,
                         });
                     }
                 }
