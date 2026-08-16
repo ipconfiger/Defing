@@ -228,9 +228,6 @@ mod tests {
             futures::stream::StreamExt::next(&mut s),
         )
         .await;
-        assert!(
-            timeout.is_err(),
-            "普通低版本事件仍被过滤（应超时而非投递）"
-        );
+        assert!(timeout.is_err(), "普通低版本事件仍被过滤（应超时而非投递）");
     }
 }
