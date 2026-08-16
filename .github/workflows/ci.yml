@@ -17,9 +17,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: arduino/setup-protoc@v3
-        with:
-          version: "25.x"
+      - name: protoc (apt, 避开 GitHub API 限流)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       - name: fmt
         working-directory: server
         run: cargo fmt --all -- --check
@@ -35,9 +34,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: arduino/setup-protoc@v3
-        with:
-          version: "25.x"
+      - name: protoc (apt, 避开 GitHub API 限流)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       - name: cache cargo
         uses: actions/cache@v4
         with:
@@ -53,9 +51,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: arduino/setup-protoc@v3
-        with:
-          version: "25.x"
+      - name: protoc (apt, 避开 GitHub API 限流)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -70,9 +67,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: arduino/setup-protoc@v3
-        with:
-          version: "25.x"
+      - name: protoc (apt, 避开 GitHub API 限流)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       - name: cache cargo
         uses: actions/cache@v4
         with:
@@ -90,9 +86,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: arduino/setup-protoc@v3
-        with:
-          version: "25.x"
+      - name: protoc (apt, 避开 GitHub API 限流)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -127,9 +122,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: arduino/setup-protoc@v3
-        with:
-          version: "25.x"
+      - name: protoc (apt, 避开 GitHub API 限流)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       - name: cache cargo
         uses: actions/cache@v4
         with:
@@ -159,9 +153,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: arduino/setup-protoc@v3
-        with:
-          version: "25.x"
+      - name: protoc (apt, 避开 GitHub API 限流)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
@@ -186,9 +179,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: arduino/setup-protoc@v3
-        with:
-          version: "25.x"
+      - name: protoc (apt, 避开 GitHub API 限流)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       - name: cache cargo
         uses: actions/cache@v4
         with:
