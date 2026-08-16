@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use dsh_core::command::{Command, DraftUpdateItem};
 use dsh_core::error::Error;
-use dsh_core::model::{BranchName, DiffEntry, ProjectId, PublishEvent, Value, ValueType};
+use dsh_core::model::{BranchName, DiffEntry, GrayRule, ProjectId, PublishEvent, Value, ValueType};
 use dsh_core::StateMachine;
 use dsh_crypto::Cipher;
 use dsh_raft::RaftHandle;
@@ -243,6 +243,86 @@ impl PublishService {
             .map(|e| (e.branch.as_str().to_string(), e.version))
             .collect();
         Ok(StructurePublishOutcome { affected })
+    }
+
+    // ---------------- 灰度发布（G2 命令的写路径；G3 最小管理面端点使用） ----------------
+
+    /// 灰度发布：固化草稿 → 灰度快照 + 灰度规则（写路径 dev-single/集群一致）。
+    /// 返回 apply 产出的事件（事件 gray=true，供 watch 广播）。
+    pub async fn gray_publish(
+        &self,
+        project: &ProjectId,
+        branch: &BranchName,
+        rule: GrayRule,
+        comment: &str,
+        request_id: &str,
+        operator: &str,
+    ) -> Result<Vec<PublishEvent>, Error> {
+        let wr = self
+            .write(
+                &Command::GrayPublish {
+                    project: project.clone(),
+                    branch: branch.clone(),
+                    rule,
+                    comment: comment.to_string(),
+                    request_id: request_id.to_string(),
+                    operator: operator.to_string(),
+                    ts: now_ms(),
+                },
+                now_ms(),
+            )
+            .await?;
+        Ok(wr.events)
+    }
+
+    /// 灰度转正：灰度内容 → 新 active_version（next=max(active,gray)+1），清灰度。
+    pub async fn gray_promote(
+        &self,
+        project: &ProjectId,
+        branch: &BranchName,
+        comment: &str,
+        request_id: &str,
+        operator: &str,
+    ) -> Result<Vec<PublishEvent>, Error> {
+        let wr = self
+            .write(
+                &Command::GrayPromote {
+                    project: project.clone(),
+                    branch: branch.clone(),
+                    comment: comment.to_string(),
+                    request_id: request_id.to_string(),
+                    operator: operator.to_string(),
+                    ts: now_ms(),
+                },
+                now_ms(),
+            )
+            .await?;
+        Ok(wr.events)
+    }
+
+    /// 灰度下量/回滚：清灰度，事件携带回落版本号。
+    pub async fn gray_abort(
+        &self,
+        project: &ProjectId,
+        branch: &BranchName,
+        comment: &str,
+        request_id: &str,
+        operator: &str,
+    ) -> Result<Vec<PublishEvent>, Error> {
+        let wr = self
+            .write(
+                &Command::GrayAbort {
+                    project: project.clone(),
+                    branch: branch.clone(),
+                    comment: comment.to_string(),
+                    request_id: request_id.to_string(),
+                    operator: operator.to_string(),
+                    ts: now_ms(),
+                },
+                now_ms(),
+            )
+            .await?;
+        Ok(wr.events)
     }
 }
 

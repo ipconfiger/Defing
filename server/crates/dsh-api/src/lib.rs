@@ -15,7 +15,9 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
 use dsh_core::command::{Command, DraftUpdateItem};
-use dsh_core::model::{BranchName, GroupDef, ProjectId, RefBinding, SharedItem, Value, ValueType};
+use dsh_core::model::{
+    BranchName, GrayRule, GroupDef, ProjectId, RefBinding, SharedItem, Value, ValueType,
+};
 use dsh_core::wire::masked_value;
 use dsh_core::{ErrorKind, StateMachine};
 use dsh_crypto::Cipher;
@@ -243,6 +245,23 @@ struct RollbackReq {
     request_id: Option<String>,
 }
 
+/// G3 最小管理面（G4 UI tab 前置）：灰度发布请求体。
+#[derive(Deserialize)]
+struct GrayPublishReq {
+    rule: GrayRule,
+    comment: String,
+    #[serde(default)]
+    request_id: Option<String>,
+}
+
+/// G3 最小管理面：灰度转正/下量请求体。
+#[derive(Deserialize)]
+struct GrayReq {
+    comment: String,
+    #[serde(default)]
+    request_id: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct DraftUpdateReq {
     #[serde(default)]
@@ -271,8 +290,13 @@ struct ConfigResp {
     project: String,
     branch: String,
     version: u64,
+    /// G3/D27：服务端按身份 resolve 的版本号（= version 的语义别名；稳定=active，灰度=gray_seq）。
+    resolved_version: u64,
     structure_version: u64,
     groups: serde_json::Value,
+    /// G3/D27：true = 本次返回灰度快照内容（客户端可见自己在灰度）。
+    #[serde(default)]
+    gray: bool,
 }
 
 #[derive(Serialize)]
@@ -895,6 +919,164 @@ async fn rollback(
     Ok(Json(
         serde_json::json!({ "new_version": new_version, "request_id": rid }),
     ))
+}
+
+// ---------------- 灰度管理面（G3 最小端点；G4 UI tab + openapi 补全） ----------------
+
+/// 灰度发布（POST /api/v1/projects/{p}/branches/{b}/gray-publish）。
+async fn gray_publish_branch(
+    principal: axum::Extension<dsh_core::Principal>,
+    State(app): State<ApiState>,
+    AxumPath((pid, branch)): AxumPath<(String, String)>,
+    Json(req): Json<GrayPublishReq>,
+) -> ApiResult<serde_json::Value> {
+    let rid = req.request_id.unwrap_or_else(new_request_id);
+    let events = app
+        .publish
+        .gray_publish(
+            &ProjectId(pid.clone()),
+            &BranchName(branch.clone()),
+            req.rule,
+            &req.comment,
+            &rid,
+            &principal_op(&principal),
+        )
+        .await
+        .map_err(ApiError::from)?;
+    let (gray_seq, gray_rule, active_version) = {
+        let sm = app.sm.read().map_err(lock_err)?;
+        let st = sm
+            .get_branch_state(&ProjectId(pid.clone()), &BranchName(branch.clone()))
+            .map_err(ApiError::from)?;
+        (
+            st.as_ref().map(|s| s.gray_seq).unwrap_or(0),
+            st.as_ref().and_then(|s| s.gray_rule.clone()),
+            st.as_ref().map(|s| s.active_version).unwrap_or(0),
+        )
+    };
+    app.audit
+        .append(
+            "gray_publish",
+            Some(pid.clone()),
+            Some(branch.clone()),
+            None,
+            Some(rid.clone()),
+            serde_json::json!({ "gray_seq": gray_seq }),
+            &principal_op(&principal),
+        )
+        .await;
+    Ok(Json(serde_json::json!({
+        "gray_seq": gray_seq,
+        "gray_rule": gray_rule,
+        "active_version": active_version,
+        "event_gray": events.first().map(|e| e.gray).unwrap_or(false),
+        "request_id": rid,
+    })))
+}
+
+/// 灰度转正（POST /api/v1/projects/{p}/branches/{b}/gray-promote）。
+async fn gray_promote_branch(
+    principal: axum::Extension<dsh_core::Principal>,
+    State(app): State<ApiState>,
+    AxumPath((pid, branch)): AxumPath<(String, String)>,
+    Json(req): Json<GrayReq>,
+) -> ApiResult<serde_json::Value> {
+    let rid = req.request_id.unwrap_or_else(new_request_id);
+    let events = app
+        .publish
+        .gray_promote(
+            &ProjectId(pid.clone()),
+            &BranchName(branch.clone()),
+            &req.comment,
+            &rid,
+            &principal_op(&principal),
+        )
+        .await
+        .map_err(ApiError::from)?;
+    let new_active = events.first().map(|e| e.version).unwrap_or_else(|| {
+        // 幂等重放：事件为空 → 读当前 active
+        app.sm
+            .read()
+            .ok()
+            .and_then(|sm| {
+                sm.get_branch_state(&ProjectId(pid.clone()), &BranchName(branch.clone()))
+                    .ok()
+                    .flatten()
+            })
+            .map(|s| s.active_version)
+            .unwrap_or(0)
+    });
+    app.audit
+        .append(
+            "gray_promote",
+            Some(pid.clone()),
+            Some(branch.clone()),
+            Some(new_active),
+            Some(rid.clone()),
+            serde_json::json!({}),
+            &principal_op(&principal),
+        )
+        .await;
+    Ok(Json(serde_json::json!({
+        "active_version": new_active,
+        "request_id": rid,
+    })))
+}
+
+/// 灰度下量/回滚（POST /api/v1/projects/{p}/branches/{b}/gray-abort）。
+async fn gray_abort_branch(
+    principal: axum::Extension<dsh_core::Principal>,
+    State(app): State<ApiState>,
+    AxumPath((pid, branch)): AxumPath<(String, String)>,
+    Json(req): Json<GrayReq>,
+) -> ApiResult<serde_json::Value> {
+    let rid = req.request_id.unwrap_or_else(new_request_id);
+    let events = app
+        .publish
+        .gray_abort(
+            &ProjectId(pid.clone()),
+            &BranchName(branch.clone()),
+            &req.comment,
+            &rid,
+            &principal_op(&principal),
+        )
+        .await
+        .map_err(ApiError::from)?;
+    let fallback_version = events.first().map(|e| e.version).unwrap_or(0);
+    app.audit
+        .append(
+            "gray_abort",
+            Some(pid.clone()),
+            Some(branch.clone()),
+            None,
+            Some(rid.clone()),
+            serde_json::json!({}),
+            &principal_op(&principal),
+        )
+        .await;
+    Ok(Json(serde_json::json!({
+        "fallback_version": fallback_version,
+        "request_id": rid,
+    })))
+}
+
+/// 灰度状态（GET /api/v1/projects/{p}/branches/{b}/gray-status）。
+async fn gray_status(
+    State(app): State<ApiState>,
+    AxumPath((pid, branch)): AxumPath<(String, String)>,
+) -> ApiResult<serde_json::Value> {
+    let sm = app.sm.read().map_err(lock_err)?;
+    let st = sm
+        .get_branch_state(&ProjectId(pid.clone()), &BranchName(branch.clone()))
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError(dsh_core::Error::not_found(format!("branch {branch}"))))?;
+    Ok(Json(serde_json::json!({
+        "active_version": st.active_version,
+        "structure_version": st.structure_version,
+        "gray_active": st.gray_seq > 0,
+        "gray_seq": st.gray_seq,
+        "gray_rule": st.gray_rule,
+    })))
 }
 
 // ---------------- 项目/分支详情与删除（openapi 契约补全） ----------------
@@ -1577,8 +1759,10 @@ async fn admin_config(
         project,
         branch: branch_name,
         version,
+        resolved_version: version,
         structure_version,
         groups: plain_groups(&groups),
+        gray: false, // 管理面 reveal：稳定路径（G3/D28 不 resolve）
     }))
 }
 
@@ -1783,17 +1967,29 @@ async fn set_project_admin_password(
 async fn snapshot(
     State(app): State<ApiState>,
     AxumPath((pid, branch)): AxumPath<(String, String)>,
+    headers: axum::http::HeaderMap,
+    PeerAddr(peer): PeerAddr,
 ) -> ApiResult<ConfigResp> {
-    let (version, project, branch_name, structure_version, mut groups) = {
+    // G3/D26：数据面身份解析——X-Dsh-Instance / X-Dsh-Labels（k=v,k2=v2 逗号分隔）+ 对端 IP 兜底。
+    // 无身份（缺头/空值）→ 空 ClientCtx → resolve 走稳定版（Q2 向后兼容）。
+    let ctx = client_ctx_from_headers(&headers, peer);
+    let (version, resolved_version, project, branch_name, structure_version, gray, mut groups) = {
         let sm = app.sm.read().map_err(lock_err)?;
         let snap = sm
-            .get_config(&ProjectId(pid.clone()), &BranchName(branch.clone()), 0)
+            .get_config_resolved(
+                &ProjectId(pid.clone()),
+                &BranchName(branch.clone()),
+                0,
+                &ctx,
+            )
             .map_err(ApiError::from)?;
         (
             snap.version,
+            snap.resolved_version,
             snap.project,
             snap.branch,
             snap.structure_version,
+            snap.gray,
             snap.groups,
         )
     };
@@ -1802,9 +1998,47 @@ async fn snapshot(
         project,
         branch: branch_name,
         version,
+        resolved_version,
         structure_version,
         groups: plain_groups(&groups),
+        gray,
     }))
+}
+
+/// G3/D26：HTTP 身份头解析 → ClientCtx。
+/// `X-Dsh-Instance`: 稳定身份键（如 Pod 名）；`X-Dsh-Labels`: `k=v,k2=v2`（逗号分隔，
+/// 值内不得含 `,`/`=`——SDK 侧保证）；重复 key 后者覆盖；非法段（无 `=`）跳过。
+fn client_ctx_from_headers(
+    headers: &axum::http::HeaderMap,
+    peer: Option<std::net::IpAddr>,
+) -> dsh_core::ClientCtx {
+    let instance = headers
+        .get("x-dsh-instance")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mut labels = std::collections::BTreeMap::new();
+    if let Some(raw) = headers.get("x-dsh-labels").and_then(|v| v.to_str().ok()) {
+        for pair in raw.split(',') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = pair.split_once('=') {
+                let k = k.trim();
+                let v = v.trim();
+                if !k.is_empty() {
+                    labels.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+    }
+    dsh_core::ClientCtx {
+        instance_id: instance,
+        labels,
+        ip: peer,
+    }
 }
 
 async fn version_history(
@@ -1882,6 +2116,8 @@ async fn render_config(
     axum::extract::Query(q): axum::extract::Query<RenderQuery>,
     req: axum::extract::Request,
 ) -> Result<axum::response::Response, (StatusCode, Json<ApiErrorBody>)> {
+    // G3/D28（Q6）：管理面渲染——明确**不接身份**（不 resolve 灰度）。管理员看到的是
+    // 稳定客户端所见（version=0 → active）；要看灰度明文须显式传版本号（G4 gray-status）。
     // reveal=true：校验管理面会话（本端点不在 /api/v1 鉴权中间件覆盖内，手动校验）。
     // B2 修复：走共享 resolve_principal（与中间件同一实现，N15），PA 只能 reveal 自己项目。
     // 区分两种失败：无有效会话 → 401；已认证但越权 → 403。
@@ -3411,6 +3647,22 @@ pub fn build_router(app: ApiState) -> Router {
         )
         .route("/api/v1/projects/{p}/diff", get(branch_diff))
         .route("/api/v1/projects/{p}/promote", post(promote))
+        .route(
+            "/api/v1/projects/{p}/branches/{b}/gray-publish",
+            post(gray_publish_branch),
+        )
+        .route(
+            "/api/v1/projects/{p}/branches/{b}/gray-promote",
+            post(gray_promote_branch),
+        )
+        .route(
+            "/api/v1/projects/{p}/branches/{b}/gray-abort",
+            post(gray_abort_branch),
+        )
+        .route(
+            "/api/v1/projects/{p}/branches/{b}/gray-status",
+            get(gray_status),
+        )
         .route("/api/v1/shared", get(list_shared).post(create_shared))
         .route(
             "/api/v1/shared-draft",

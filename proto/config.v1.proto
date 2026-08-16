@@ -64,6 +64,9 @@ message GetConfigRequest {
   string project = 1;
   string branch = 2;
   int64 version = 3;          // 0 = 活动版本
+  // G3/D26 灰度身份（向后兼容：旧客户端不传 = 空身份 = 稳定版，Q2）
+  string instance_id = 4;     // 稳定身份键（如 Pod 名/部署单元 ID；容器重建不变）
+  map<string, string> labels = 5;  // 灰度标签（如 zone=cn-north-1）；空 = 不参与标签匹配
 }
 
 message GroupData {
@@ -76,6 +79,9 @@ message ConfigSnapshot {
   int64 version = 3;              // 活动版本号（或请求的版本）
   int64 structure_version = 4;    // 结构版本号
   map<string, GroupData> groups = 5;
+  // G3/D27：灰度标记 + 解析出的版本号（客户端可见自己在哪个版本）
+  bool gray = 6;                  // true = 本次返回灰度快照内容
+  int64 resolved_version = 7;     // 服务端按身份 resolve 的版本号（稳定=active；灰度=gray_seq）
 }
 
 message GetItemRequest {
@@ -84,6 +90,9 @@ message GetItemRequest {
   string group = 3;
   string key = 4;
   int64 version = 5;              // 0 = 活动版本
+  // G3/D26 灰度身份（Q6：get_item 必须同样 resolve）
+  string instance_id = 6;
+  map<string, string> labels = 7;
 }
 
 message ItemValue {
@@ -120,7 +129,10 @@ message Change {
 }
 
 message WatchEvent {
-  int64 version = 1;            // 发布产生的新版本号（(项目,分支) 内单调递增）
+  // 事件相关版本号：普通事件 = 发布产生的新版本号（(项目,分支) 内单调递增）；
+  // 灰度事件（gray=true）可携带 ≤ 客户端 last 的版本（如 abort 的回落 active）——
+  // SDK 契约：gray 事件永不按版本过滤（见 gray 字段注释）。
+  int64 version = 1;
   EventType type = 2;
   int64 structure_version = 3;  // 本次事件时的结构版本
   string comment = 4;           // 发布备注
@@ -128,6 +140,8 @@ message WatchEvent {
   repeated Change changes = 6;
   // 服务端认为客户端缓存可能已失效（慢消费者/起点被裁剪前），客户端应重拉全量
   bool snapshot_required = 7;
+  // G3/D25 方案 b：gray=true 事件永不按版本过滤（SDK 契约：收到 gray 事件无条件重拉全量）
+  bool gray = 8;
 }
 
 message ListMembersRequest {}

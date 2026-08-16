@@ -23,5 +23,7 @@ pub use model::{
     ProjectAdminAccount, ProjectId, PublishEvent, RefBinding, SharedItem, SnapshotMap, Structure,
     StructureDraft, Value, ValueType, VersionKind, VersionRecord,
 };
-pub use state::{token_hash, ApplyOutcome, ClientCtx, ConfigSnapshot, StateMachine};
+pub use state::{
+    token_hash, ApplyOutcome, ClientCtx, ConfigSnapshot, ResolvedVersion, StateMachine,
+};
 pub use store::{InMemoryStore, Store};

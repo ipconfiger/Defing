@@ -97,7 +97,9 @@ fn sse_stream(
             let e: PublishEvent = item.ok()?;
             if e.project.as_str() == p.as_str()
                 && e.branch.as_str() == b.as_str()
-                && e.version > last
+                // G3/D25 方案 b：gray 事件永不按版本过滤（promote/abort 补发不丢，Q4）；
+                // `last` 为重放末尾固定值（非可变），无游标倒挂问题。
+                && (e.gray || e.version > last)
             {
                 Some(Ok(SseEvent::default().data(
                     serde_json::to_string(&mask_event_for_wire(&e)).unwrap_or_default(),
@@ -198,6 +200,37 @@ mod tests {
         assert!(
             futures::stream::StreamExt::next(&mut s).await.is_none(),
             "snapshot_required 后应结束流"
+        );
+    }
+
+    /// G3/D25 方案 b：gray 事件永不按版本过滤——version ≤ last 的 gray 事件仍投递（Q4 补发）。
+    /// 用 replay 末尾版本抬高 last：replay=[v10] → last=10；实时 gray 事件 v2（≤10）必须投递。
+    #[tokio::test]
+    async fn gray_event_bypasses_version_filter() {
+        let hub = WatchHub::new();
+        let rx = hub.subscribe();
+        // replay 含 v10 → last=10；流先发 replay（v10）
+        let mut s = sse_stream(rx, "p", "dev", vec![event("p", "dev", 10)], false);
+        let first = futures::stream::StreamExt::next(&mut s).await;
+        assert!(first.is_some(), "先重放 v10");
+
+        // ① gray=true、version=2（≤ last=10）→ 必须投递（Q4：promote/abort 补发）
+        let mut gray_ev = event("p", "dev", 2);
+        gray_ev.gray = true;
+        hub.publish(&gray_ev);
+        let item = futures::stream::StreamExt::next(&mut s).await;
+        assert!(item.is_some(), "gray 事件永不按版本过滤（D25/Q4）");
+
+        // ② gray=false、version=5（≤ last=10）→ 不投递（filter_map 丢弃后继续等待 → 超时）
+        hub.publish(&event("p", "dev", 5));
+        let timeout = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            futures::stream::StreamExt::next(&mut s),
+        )
+        .await;
+        assert!(
+            timeout.is_err(),
+            "普通低版本事件仍被过滤（应超时而非投递）"
         );
     }
 }

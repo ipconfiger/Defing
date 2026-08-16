@@ -22,8 +22,15 @@ pub struct ConfigSnapshot {
     pub project: String,
     pub branch: String,
     pub version: u64,
+    /// 解析出的版本号语义别名（G3/D27）：数据面读取时 = 服务端按身份 resolve 的结果
+    /// （稳定 = active_version；灰度命中 = gray_seq）；管理面显式版本请求 = version 本身。
+    #[serde(default)]
+    pub resolved_version: u64,
     pub structure_version: u64,
     pub groups: BTreeMap<String, BTreeMap<String, Value>>,
+    /// 灰度标记（G3/D27）：true = 本次返回的是灰度快照内容（客户端可见自己在灰度）。
+    #[serde(default)]
+    pub gray: bool,
 }
 
 /// 客户端身份（G2 灰度解析输入；G3 数据面由 HTTP 头/gRPC 字段/对端地址注入）。
@@ -33,6 +40,15 @@ pub struct ClientCtx {
     pub instance_id: String,
     pub labels: BTreeMap<String, String>,
     pub ip: Option<std::net::IpAddr>,
+}
+
+/// 灰度解析结果（G3/D24：消除 gray_seq 与 active_version 数值巧合的分流歧义）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedVersion {
+    /// 读稳定版 v（= active_version）。
+    Stable(u64),
+    /// 读灰度快照 gray-snap/{seq}（= gray_seq）。
+    Gray(u64),
 }
 
 /// 版本存储 checkpoint 间隔（perf 方案② D3）：每 N 版本存 full 快照，其余存 diff。
@@ -655,7 +671,7 @@ impl StateMachine {
         Ok(removed)
     }
 
-    /// GetConfig：version=0 取活动版本。
+    /// GetConfig：version=0 取活动版本（稳定路径；灰度解析见 [`Self::get_config_resolved`]）。
     pub fn get_config(
         &self,
         id: &ProjectId,
@@ -682,9 +698,50 @@ impl StateMachine {
             project: id.to_string(),
             branch: branch.to_string(),
             version: vno,
+            resolved_version: vno,
             structure_version: structure.version,
             groups: snap,
+            gray: false,
         })
+    }
+
+    /// 数据面统一入口（G3/D27-D28）：`version=0` 按客户端身份 resolve 并分流读取；
+    /// `version≠0` 显式版本（管理面/历史/reveal）恒走 v/ 空间、不 resolve（Q6 绕过）。
+    pub fn get_config_resolved(
+        &self,
+        id: &ProjectId,
+        branch: &BranchName,
+        version: u64,
+        ctx: &ClientCtx,
+    ) -> Result<ConfigSnapshot, Error> {
+        if version != 0 {
+            return self.get_config(id, branch, version);
+        }
+        match self.resolve_version(id, branch, ctx)? {
+            ResolvedVersion::Stable(_) => self.get_config(id, branch, 0),
+            ResolvedVersion::Gray(seq) => {
+                let snap = self.gray_snapshot_of(id, branch, seq)?;
+                let structure = self.get_structure(id)?.unwrap_or(Structure {
+                    version: 0,
+                    groups: vec![],
+                });
+                // R1（审核修订）：version 保持 active_version（v/ 空间）——客户端 watch 游标
+                // 不错位（after_version=active 增量重放正确）；resolved_version=gray_seq 标记
+                // 内容实际来自哪个灰度快照；gray=true 提示客户端可见自己在灰度。
+                let st = self
+                    .get_branch_state(id, branch)?
+                    .ok_or_else(|| Error::not_found(format!("branch {branch} of {id}")))?;
+                Ok(ConfigSnapshot {
+                    project: id.to_string(),
+                    branch: branch.to_string(),
+                    version: st.active_version,
+                    resolved_version: seq,
+                    structure_version: structure.version,
+                    groups: snap,
+                    gray: true,
+                })
+            }
+        }
     }
 
     /// 读取灰度快照（gray-snap/{seq}，Q1 独立前缀；不存在 → NotFound）。
@@ -705,31 +762,31 @@ impl StateMachine {
 
     // ---------------- 灰度解析（G2 读路径纯函数，D20：apply 不读请求，selector 求值在此） ----------------
 
-    /// 灰度版本解析：返回客户端应读取的版本号。
-    /// - 无灰度（gray_seq==0 / 规则 None）→ active_version；
-    /// - Q2：无身份（instance_id 空）永不进灰度 → active_version；
-    /// - 规则命中 → gray_seq（灰度快照序号）；未命中 → active_version。
+    /// 灰度版本解析（G3/D24）：返回客户端应读取的版本（带语义，消除数值巧合歧义）。
+    /// - 无灰度（gray_seq==0 / 规则 None）→ `Stable(active_version)`；
+    /// - Q2：无身份（instance_id 空）永不进灰度 → `Stable(active_version)`；
+    /// - 规则命中 → `Gray(gray_seq)`；未命中 → `Stable(active_version)`。
     pub fn resolve_version(
         &self,
         id: &ProjectId,
         branch: &BranchName,
         ctx: &ClientCtx,
-    ) -> Result<u64, Error> {
+    ) -> Result<ResolvedVersion, Error> {
         let st = self
             .get_branch_state(id, branch)?
             .ok_or_else(|| Error::not_found(format!("branch {branch} of {id}")))?;
         if st.gray_seq == 0 || st.gray_rule.is_none() {
-            return Ok(st.active_version);
+            return Ok(ResolvedVersion::Stable(st.active_version));
         }
         // Q2：无身份永不进灰度（空 instance_id 哈希恒恒定，禁止参与分桶）
         if ctx.instance_id.is_empty() {
-            return Ok(st.active_version);
+            return Ok(ResolvedVersion::Stable(st.active_version));
         }
         let rule = st.gray_rule.as_ref().expect("gray_rule checked is_some");
         if Self::rule_matches(rule, ctx) {
-            Ok(st.gray_seq)
+            Ok(ResolvedVersion::Gray(st.gray_seq))
         } else {
-            Ok(st.active_version)
+            Ok(ResolvedVersion::Stable(st.active_version))
         }
     }
 

@@ -2,7 +2,7 @@
 
 use dsh_core::command::{Command, DraftUpdateItem};
 use dsh_core::model::*;
-use dsh_core::{ClientCtx, ErrorKind, InMemoryStore, StateMachine, Value};
+use dsh_core::{ClientCtx, ErrorKind, InMemoryStore, ResolvedVersion, StateMachine, Value};
 
 fn sm() -> StateMachine {
     StateMachine::new(Box::new(InMemoryStore::new()))
@@ -2101,13 +2101,13 @@ fn gray_publish_creates_gray_snapshot() {
     assert_eq!(
         s.resolve_version(&pid, &dev, &ctx("web-1", &[("zone", "cn-north-1")], None))
             .unwrap(),
-        1,
+        ResolvedVersion::Gray(1),
         "华北命中 → 灰度快照"
     );
     assert_eq!(
         s.resolve_version(&pid, &dev, &ctx("web-2", &[("zone", "cn-south-1")], None))
             .unwrap(),
-        2,
+        ResolvedVersion::Stable(2),
         "华南未命中 → 稳定版"
     );
 }
@@ -2196,17 +2196,17 @@ fn gray_resolve_three_paths() {
     assert_eq!(
         s.resolve_version(&pid, &dev, &ctx("web-1", &[("zone", "cn-north-1")], None))
             .unwrap(),
-        1
+        ResolvedVersion::Gray(1)
     );
     assert_eq!(
         s.resolve_version(&pid, &dev, &ctx("web-2", &[], Some("10.1.2.3")))
             .unwrap(),
-        1
+        ResolvedVersion::Gray(1)
     );
     assert_eq!(
         s.resolve_version(&pid, &dev, &ctx("web-3", &[], Some("8.8.8.8")))
             .unwrap(),
-        2
+        ResolvedVersion::Stable(2)
     );
 }
 
@@ -2262,7 +2262,7 @@ fn gray_promote_makes_gray_active() {
     assert_eq!(
         s.resolve_version(&pid, &dev, &ctx("web-1", &[("zone", "cn-north-1")], None))
             .unwrap(),
-        3
+        ResolvedVersion::Stable(3)
     );
     // 版本记录带 gray 标记（重放保真，Q3）
     let recs = s.version_history(&pid, &dev).unwrap();
@@ -2317,7 +2317,7 @@ fn gray_abort_reverts_to_stable() {
     assert_eq!(
         s.resolve_version(&pid, &dev, &ctx("web-1", &[("zone", "cn-north-1")], None))
             .unwrap(),
-        2
+        ResolvedVersion::Stable(2)
     );
     let cfg = s.get_config(&pid, &dev, 0).unwrap();
     assert_eq!(
@@ -2638,12 +2638,12 @@ fn structure_publish_with_active_gray_bumps_both() {
     assert_eq!(
         s.resolve_version(&pid, &dev, &ctx("web-1", &[("zone", "cn-north-1")], None))
             .unwrap(),
-        4
+        ResolvedVersion::Gray(4)
     );
     assert_eq!(
         s.resolve_version(&pid, &dev, &ctx("web-2", &[], None))
             .unwrap(),
-        3
+        ResolvedVersion::Stable(3)
     );
     // 无灰度的分支照旧（active = 1+1 = 2）
     let test = BranchName("test".into());
@@ -2682,7 +2682,7 @@ fn gray_resolve_no_identity_never_gray() {
             }
         )
         .unwrap(),
-        2,
+        ResolvedVersion::Stable(2),
         "Q2：无身份永不进灰度"
     );
     // 纯函数防御：空身份 + 100% 放量也不命中（rule_matches 内部守卫）
@@ -2770,11 +2770,184 @@ fn prune_keeps_gray_snapshot() {
     assert_eq!(
         s.resolve_version(&pid, &dev, &ctx("web-1", &[("zone", "cn-north-1")], None))
             .unwrap(),
-        1,
+        ResolvedVersion::Gray(1),
         "灰度客户端 resolve 目标未被裁掉（Q5）"
     );
     // 稳定版仍可读（active 保留）
     let cfg = s.get_config(&pid, &dev, 0).unwrap();
     assert_eq!(cfg.version, 102);
     assert_eq!(cfg.groups["redis"]["host"], Value::String("h102".into()));
+}
+
+// ==================== G3 数据面解析（design/g3-dataplane.md，D24/D27/D28） ====================
+
+/// G3-D1：get_config_resolved 三路——灰度命中读 gray-snap/、未命中读稳定、无身份读稳定。
+/// 响应带 gray + resolved_version（D27）。
+#[test]
+fn g3_get_config_resolved_three_paths() {
+    let mut s = sm();
+    let (pid, dev) = gray_setup(&mut s); // active=2（host=stable-host）
+    s.apply(
+        &Command::GrayPublish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            rule: label_rule("zone", "cn-north-1"),
+            comment: "g".into(),
+            request_id: "g1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        13,
+    )
+    .unwrap(); // gray_seq=1（host=gray-host）
+
+    // ① 灰度命中：读 gray-snap/1 内容；version 保持 active（v/ 空间，R1），resolved_version=gray_seq
+    let gray = s
+        .get_config_resolved(
+            &pid,
+            &dev,
+            0,
+            &ctx("web-1", &[("zone", "cn-north-1")], None),
+        )
+        .unwrap();
+    assert!(gray.gray, "灰度命中 → gray=true");
+    assert_eq!(
+        gray.version, 2,
+        "R1：version 保持 active_version（watch 游标不错位）"
+    );
+    assert_eq!(gray.resolved_version, 1, "resolved_version = gray_seq");
+    assert_eq!(
+        gray.groups["redis"]["host"],
+        Value::String("gray-host".into())
+    );
+
+    // ② 未命中：稳定版（active=2）
+    let stable = s
+        .get_config_resolved(
+            &pid,
+            &dev,
+            0,
+            &ctx("web-2", &[("zone", "cn-south-1")], None),
+        )
+        .unwrap();
+    assert!(!stable.gray, "未命中 → gray=false");
+    assert_eq!(stable.version, 2);
+    assert_eq!(stable.resolved_version, 2);
+    assert_eq!(
+        stable.groups["redis"]["host"],
+        Value::String("stable-host".into())
+    );
+
+    // ③ 无身份（Q2）：永不进灰度
+    let noid = s
+        .get_config_resolved(&pid, &dev, 0, &ctx("", &[("zone", "cn-north-1")], None))
+        .unwrap();
+    assert!(!noid.gray);
+    assert_eq!(noid.version, 2);
+
+    // 普通 get_config 恒为稳定 + gray=false（管理面/旧路径语义不变）
+    let plain = s.get_config(&pid, &dev, 0).unwrap();
+    assert!(!plain.gray);
+    assert_eq!(plain.resolved_version, 2);
+}
+
+/// G3-D2（D24 关键）：gray_seq 与 active_version 数值巧合时仍读对快照。
+/// 构造：仅结构发布（active=1）后直接灰度发布 → gray_seq=1 与 active=1 数值相等。
+#[test]
+fn g3_numeric_coincidence_gray_seq_eq_active() {
+    let mut s = sm();
+    let (pid, _branches) = setup(&mut s); // 结构发布后各分支 active=1
+    let dev = BranchName("dev".into());
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "redis".into(),
+                key: "host".into(),
+                value: Value::String("gray-host".into()),
+            }],
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        10,
+    )
+    .unwrap();
+    s.apply(
+        &Command::GrayPublish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            rule: label_rule("zone", "cn-north-1"),
+            comment: "g".into(),
+            request_id: "g1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        11,
+    )
+    .unwrap();
+    // 数值巧合：active=1（结构发布）、gray_seq=1（首次灰度）
+    let st = s.get_branch_state(&pid, &dev).unwrap().unwrap();
+    assert_eq!(st.active_version, 1);
+    assert_eq!(st.gray_seq, 1, "数值巧合构造成立");
+    // 命中客户端读灰度快照（gray-snap/1 = gray-host），不是 v/1（空值）
+    let gray = s
+        .get_config_resolved(
+            &pid,
+            &dev,
+            0,
+            &ctx("web-1", &[("zone", "cn-north-1")], None),
+        )
+        .unwrap();
+    assert!(gray.gray);
+    assert_eq!(gray.version, 1);
+    assert_eq!(
+        gray.groups["redis"]["host"],
+        Value::String("gray-host".into()),
+        "D24：数值巧合时必须读 gray-snap/ 而非 v/"
+    );
+    // 稳定客户端读 v/1（空值）
+    let stable = s
+        .get_config_resolved(&pid, &dev, 0, &ctx("web-2", &[], None))
+        .unwrap();
+    assert!(!stable.gray);
+    assert!(stable.groups.is_empty(), "v/1 是结构发布的空值快照");
+}
+
+/// G3-D3（D28）：显式 version≠0 不 resolve——灰度活跃 + 身份命中时，
+/// version=N 恒读 v/N（管理面/历史/reveal 语义）。
+#[test]
+fn g3_explicit_version_bypasses_resolve() {
+    let mut s = sm();
+    let (pid, dev) = gray_setup(&mut s); // active=2
+    s.apply(
+        &Command::GrayPublish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            rule: label_rule("zone", "cn-north-1"),
+            comment: "g".into(),
+            request_id: "g1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        13,
+    )
+    .unwrap();
+    // 身份命中灰度，但显式请求 version=2 → 恒读 v/2（稳定内容）
+    let snap = s
+        .get_config_resolved(
+            &pid,
+            &dev,
+            2,
+            &ctx("web-1", &[("zone", "cn-north-1")], None),
+        )
+        .unwrap();
+    assert!(!snap.gray, "显式版本不 resolve");
+    assert_eq!(snap.version, 2);
+    assert_eq!(
+        snap.groups["redis"]["host"],
+        Value::String("stable-host".into())
+    );
 }

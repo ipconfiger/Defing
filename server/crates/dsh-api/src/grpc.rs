@@ -98,6 +98,8 @@ fn snapshot_to_proto(p: &str, b: &str, snap: &dsh_core::ConfigSnapshot) -> Confi
         version: snap.version as i64,
         structure_version: snap.structure_version as i64,
         groups,
+        gray: snap.gray,
+        resolved_version: snap.resolved_version as i64,
     }
 }
 
@@ -132,17 +134,29 @@ impl config_service_server::ConfigService for ConfigGrpcService {
         &self,
         req: Request<GetConfigRequest>,
     ) -> Result<Response<ConfigSnapshot>, Status> {
+        // G3/D26：对端 IP（tonic RemoteAddr 注入；须在 into_inner 前取）
+        let peer_ip = req.remote_addr().map(|a| a.ip());
         let r = req.into_inner();
+        let ctx = dsh_core::ClientCtx {
+            instance_id: r.instance_id.clone(),
+            labels: r
+                .labels
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            ip: peer_ip,
+        };
         let sm = self
             .state
             .sm
             .read()
             .map_err(|_| Status::internal("sm lock"))?;
         let snap = sm
-            .get_config(
+            .get_config_resolved(
                 &ProjectId(r.project.clone()),
                 &BranchName(r.branch.clone()),
                 r.version.max(0) as u64,
+                &ctx,
             )
             .map_err(map_err)?;
         Ok(Response::new(snapshot_to_proto(
@@ -151,17 +165,29 @@ impl config_service_server::ConfigService for ConfigGrpcService {
     }
 
     async fn get_item(&self, req: Request<GetItemRequest>) -> Result<Response<ItemValue>, Status> {
+        // G3/D26（Q6）：get_item 必须同样 resolve——单 item 读取按身份分流
+        let peer_ip = req.remote_addr().map(|a| a.ip());
         let r = req.into_inner();
+        let ctx = dsh_core::ClientCtx {
+            instance_id: r.instance_id.clone(),
+            labels: r
+                .labels
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            ip: peer_ip,
+        };
         let sm = self
             .state
             .sm
             .read()
             .map_err(|_| Status::internal("sm lock"))?;
         let snap = sm
-            .get_config(
+            .get_config_resolved(
                 &ProjectId(r.project.clone()),
                 &BranchName(r.branch.clone()),
                 r.version.max(0) as u64,
+                &ctx,
             )
             .map_err(map_err)?;
         let value = snap
@@ -236,6 +262,7 @@ impl config_service_server::ConfigService for ConfigGrpcService {
                     request_id: String::new(),
                     changes: diff_to_changes(diff),
                     snapshot_required: false,
+                    gray: rec.gray, // G2 还原：转正（GrayPromote）记录 gray=true，重放保真（Q3）
                 });
             }
         }
@@ -254,6 +281,7 @@ impl config_service_server::ConfigService for ConfigGrpcService {
                     request_id: String::new(),
                     changes: vec![],
                     snapshot_required: true,
+                    gray: false,
                 });
                 return;
             }
@@ -264,10 +292,15 @@ impl config_service_server::ConfigService for ConfigGrpcService {
             loop {
                 match rx.recv().await {
                     Ok(e) => {
+                        // G3/D25 方案 b：gray 事件永不按版本过滤（promote/abort 补发不丢，Q4）。
                         if e.project.as_str() == project && e.branch.as_str() == branch
-                            && (e.version as i64) > last
+                            && (e.gray || (e.version as i64) > last)
                         {
-                            last = e.version as i64;
+                            // 实现细节：last 只增不减——gray 事件 version 可能 ≤ last，
+                            // 投递但不回退游标（否则后续普通事件因 last 倒挂重复投递）。
+                            if (e.version as i64) > last {
+                                last = e.version as i64;
+                            }
                             yield Ok(WatchEvent {
                                 version: e.version as i64,
                                 r#type: event_type_to_proto(e.ty),
@@ -276,6 +309,7 @@ impl config_service_server::ConfigService for ConfigGrpcService {
                                 request_id: e.request_id,
                                 changes: diff_to_changes(e.changes),
                                 snapshot_required: false,
+                                gray: e.gray,
                             });
                         }
                     }
@@ -289,6 +323,7 @@ impl config_service_server::ConfigService for ConfigGrpcService {
                             request_id: String::new(),
                             changes: vec![],
                             snapshot_required: true,
+                            gray: false,
                         });
                         break;
                     }

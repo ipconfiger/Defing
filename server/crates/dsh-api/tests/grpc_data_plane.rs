@@ -109,6 +109,7 @@ async fn get_config_and_get_item() {
             project: "p".into(),
             branch: "dev".into(),
             version: 0,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -136,6 +137,7 @@ async fn get_config_and_get_item() {
             group: "redis".into(),
             key: "host".into(),
             version: 0,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -155,6 +157,7 @@ async fn get_config_and_get_item() {
             group: "redis".into(),
             key: "nope".into(),
             version: 0,
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -226,6 +229,7 @@ async fn auth_interceptor_enforces_token() {
             project: "p".into(),
             branch: "dev".into(),
             version: 0,
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -248,6 +252,7 @@ async fn auth_interceptor_enforces_token() {
             project: "p".into(),
             branch: "dev".into(),
             version: 0,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -265,4 +270,255 @@ async fn list_members_dev_single_fails_precondition() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+// ==================== G3 灰度数据面（design/g3-dataplane.md，D26/D27/D25） ====================
+
+/// G3：gRPC get_config / get_item 按身份 resolve——命中读灰度快照、未命中/无身份读稳定（D26/D27/Q6）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gray_data_plane_resolves_by_identity() {
+    let (url, state) = start_server(None).await;
+    let mut client = client_at(&url).await;
+
+    // 直接写状态机：新草稿（host=gray-host）→ GrayPublish（规则 zone=cn-north-1）
+    {
+        let mut sm = state.sm.write().unwrap();
+        sm.apply(
+            &Command::DraftUpdate {
+                project: "p".into(),
+                branch: BranchName("dev".into()),
+                updates: vec![dsh_core::command::DraftUpdateItem {
+                    group: "redis".into(),
+                    key: "host".into(),
+                    value: Value::String("gray-host".into()),
+                }],
+                deletes: vec![],
+                operator: String::new(),
+                ts: 0,
+                expected_draft_rev: None,
+            },
+            100,
+        )
+        .unwrap();
+        sm.apply(
+            &Command::GrayPublish {
+                project: "p".into(),
+                branch: BranchName("dev".into()),
+                rule: dsh_core::model::GrayRule {
+                    match_labels: vec![dsh_core::model::LabelSelector {
+                        key: "zone".into(),
+                        value: "cn-north-1".into(),
+                    }],
+                    ip_cidrs: vec![],
+                    percentage: None,
+                },
+                comment: "g".into(),
+                request_id: "g1".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            101,
+        )
+        .unwrap();
+    }
+    let north: std::collections::HashMap<String, String> =
+        [("zone".to_string(), "cn-north-1".to_string())].into();
+    let south: std::collections::HashMap<String, String> =
+        [("zone".to_string(), "cn-south-1".to_string())].into();
+
+    // ① 命中（instance_id + labels）→ 灰度内容 + gray=true + resolved_version=gray_seq
+    let snap = client
+        .get_config(GetConfigRequest {
+            project: "p".into(),
+            branch: "dev".into(),
+            version: 0,
+            instance_id: "web-1".into(),
+            labels: north.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(snap.gray, "身份命中 → gray=true");
+    assert_eq!(snap.resolved_version, 1, "resolved_version = gray_seq");
+    let host = snap.groups.get("redis").unwrap().items.get("host").unwrap();
+    match &host.data {
+        Some(dsh_api::grpc::value::Data::StrValue(s)) => assert_eq!(s, "gray-host"),
+        other => panic!("expected str, got {other:?}"),
+    }
+
+    // ② 未命中 → 稳定版 + gray=false（active=3：testkit v2 + secret v3）
+    let snap2 = client
+        .get_config(GetConfigRequest {
+            project: "p".into(),
+            branch: "dev".into(),
+            version: 0,
+            instance_id: "web-2".into(),
+            labels: south.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!snap2.gray);
+    assert_eq!(snap2.resolved_version, 3);
+    let host2 = snap2
+        .groups
+        .get("redis")
+        .unwrap()
+        .items
+        .get("host")
+        .unwrap();
+    match &host2.data {
+        Some(dsh_api::grpc::value::Data::StrValue(s)) => assert_eq!(s, "10.0.0.1"),
+        other => panic!("expected str, got {other:?}"),
+    }
+
+    // ③ 无身份（旧客户端）→ 稳定版（Q2 向后兼容）
+    let snap3 = client
+        .get_config(GetConfigRequest {
+            project: "p".into(),
+            branch: "dev".into(),
+            version: 0,
+            instance_id: String::new(),
+            labels: std::collections::HashMap::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!snap3.gray, "无身份永不进灰度（Q2）");
+
+    // ④ get_item 同分流（Q6）
+    let item = client
+        .get_item(GetItemRequest {
+            project: "p".into(),
+            branch: "dev".into(),
+            group: "redis".into(),
+            key: "host".into(),
+            version: 0,
+            instance_id: "web-1".into(),
+            labels: north,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    match &item.value.unwrap().data {
+        Some(dsh_api::grpc::value::Data::StrValue(s)) => {
+            assert_eq!(s, "gray-host", "get_item 必须同样 resolve")
+        }
+        other => panic!("expected str, got {other:?}"),
+    }
+}
+
+/// G3/D25：gRPC watch 灰度事件永不按版本过滤——gray:true 且 version ≤ last（active 未变）
+/// 的 GrayPublish 事件仍投递（Q4：promote/abort 补发不丢）；last 游标不因 gray 事件倒挂。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gray_watch_delivers_gray_events() {
+    let (url, state) = start_server(None).await;
+    let mut client = client_at(&url).await;
+
+    // 订阅：after_version=3（当前 active）→ last=3
+    let mut stream = client
+        .watch(WatchRequest {
+            project: "p".into(),
+            branch: "dev".into(),
+            after_version: 3,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // 灰度发布（sm.apply + hub 手动广播，模拟写路径）——事件 gray=true、version=3（active 未变 ≤ last）
+    let events = {
+        let mut sm = state.sm.write().unwrap();
+        sm.apply(
+            &Command::DraftUpdate {
+                project: "p".into(),
+                branch: BranchName("dev".into()),
+                updates: vec![dsh_core::command::DraftUpdateItem {
+                    group: "redis".into(),
+                    key: "host".into(),
+                    value: Value::String("gray-host".into()),
+                }],
+                deletes: vec![],
+                operator: String::new(),
+                ts: 0,
+                expected_draft_rev: None,
+            },
+            100,
+        )
+        .unwrap();
+        sm.apply(
+            &Command::GrayPublish {
+                project: "p".into(),
+                branch: BranchName("dev".into()),
+                rule: dsh_core::model::GrayRule {
+                    match_labels: vec![dsh_core::model::LabelSelector {
+                        key: "zone".into(),
+                        value: "cn-north-1".into(),
+                    }],
+                    ip_cidrs: vec![],
+                    percentage: None,
+                },
+                comment: "g".into(),
+                request_id: "g1".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            101,
+        )
+        .unwrap()
+    };
+    for e in &events {
+        state.hub.publish(e);
+    }
+
+    // GrayPublish 事件必须投递（尽管 version=3 == last）
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(5), stream.message())
+        .await
+        .expect("watch timeout")
+        .unwrap()
+        .expect("stream message");
+    assert!(ev.gray, "灰度事件 gray=true");
+    assert_eq!(
+        ev.version, 3,
+        "GrayPublish 事件 version=active（未变）仍投递（D25）"
+    );
+
+    // 普通发布 v4 → 版本推进，正常投递（验证游标未因 gray 事件倒挂）
+    state
+        .publish
+        .update_draft(
+            &ProjectId("p".into()),
+            &BranchName("dev".into()),
+            vec![dsh_core::command::DraftUpdateItem {
+                group: "redis".into(),
+                key: "host".into(),
+                value: Value::String("10.0.0.3".into()),
+            }],
+            vec![],
+            None,
+            "test",
+        )
+        .await
+        .unwrap();
+    state
+        .publish
+        .publish(
+            &ProjectId("p".into()),
+            &BranchName("dev".into()),
+            "v4",
+            "r4",
+            "test",
+        )
+        .await
+        .unwrap();
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(5), stream.message())
+        .await
+        .expect("watch timeout")
+        .unwrap()
+        .expect("stream message");
+    assert!(!ev.gray);
+    assert_eq!(
+        ev.version, 4,
+        "last 游标未因 gray 事件倒挂（普通事件正常推进）"
+    );
 }
