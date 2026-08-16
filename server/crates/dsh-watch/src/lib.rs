@@ -97,8 +97,9 @@ fn sse_stream(
             let e: PublishEvent = item.ok()?;
             if e.project.as_str() == p.as_str()
                 && e.branch.as_str() == b.as_str()
-                // G3/D25 方案 b：gray 事件永不按版本过滤（promote/abort 补发不丢，Q4）；
-                // `last` 为重放末尾固定值（非可变），无游标倒挂问题。
+                // G3/D25 方案 b：gray 事件永不按版本过滤（promote/abort 补发不丢，Q4）。
+                // `last` 冻结为重放末尾版本；参与比较的事件 version 恒在 v/ 空间
+                // （D27/R1：snapshot 响应 version=active，after_version 不离开 v/ 空间）。
                 && (e.gray || e.version > last)
             {
                 Some(Ok(SseEvent::default().data(

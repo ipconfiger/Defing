@@ -2006,8 +2006,9 @@ async fn snapshot(
 }
 
 /// G3/D26：HTTP 身份头解析 → ClientCtx。
-/// `X-Dsh-Instance`: 稳定身份键（如 Pod 名）；`X-Dsh-Labels`: `k=v,k2=v2`（逗号分隔，
-/// 值内不得含 `,`/`=`——SDK 侧保证）；重复 key 后者覆盖；非法段（无 `=`）跳过。
+/// `X-Dsh-Instance`: 稳定身份键（如 Pod 名）；`X-Dsh-Labels`: `k=v,k2=v2`（逗号分隔；
+/// 值内不得含 `,`；`=` 允许但按首个 `=` 切分——SDK 侧保证格式）；重复 key 后者覆盖；
+/// 非法段（无 `=`）跳过。
 fn client_ctx_from_headers(
     headers: &axum::http::HeaderMap,
     peer: Option<std::net::IpAddr>,

@@ -3,6 +3,7 @@
 use dsh_core::command::{Command, DraftUpdateItem};
 use dsh_core::model::*;
 use dsh_core::{ClientCtx, ErrorKind, InMemoryStore, ResolvedVersion, StateMachine, Value};
+use std::collections::BTreeMap;
 
 fn sm() -> StateMachine {
     StateMachine::new(Box::new(InMemoryStore::new()))
@@ -2691,6 +2692,72 @@ fn gray_resolve_no_identity_never_gray() {
         ..Default::default()
     };
     assert!(!StateMachine::rule_matches(&rule, &ClientCtx::default()));
+
+    // R2（审核）钉死文档化行为：纯 IP 规则 + 无 instance_id → 同样不进灰度
+    // （Q2 门闩在 rule_matches 之前；IP 规则实际要求上报 instance_id，design g3-dataplane.md D26）
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "redis".into(),
+                key: "host".into(),
+                value: Value::String("ip-gray".into()),
+            }],
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        14,
+    )
+    .unwrap();
+    s.apply(
+        &Command::GrayPublish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            rule: GrayRule {
+                ip_cidrs: vec!["10.0.0.0/8".into()],
+                ..Default::default()
+            },
+            comment: "ip-rule".into(),
+            request_id: "g-ip".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        15,
+    )
+    .unwrap();
+    // 空 instance_id + IP 在段内 → 仍 Stable（Q2 门闩优先于 IP 判据）
+    assert_eq!(
+        s.resolve_version(
+            &pid,
+            &dev,
+            &ClientCtx {
+                instance_id: String::new(),
+                labels: BTreeMap::new(),
+                ip: Some("10.1.2.3".parse().unwrap()),
+            }
+        )
+        .unwrap(),
+        ResolvedVersion::Stable(2),
+        "R2：纯 IP 规则对无 instance_id 客户端不生效（Q2 门闩）"
+    );
+    // 对照组：有 instance_id + IP 命中 → 进灰度（IP 规则对已标识客户端生效）
+    assert_eq!(
+        s.resolve_version(
+            &pid,
+            &dev,
+            &ClientCtx {
+                instance_id: "web-ip".into(),
+                labels: BTreeMap::new(),
+                ip: Some("10.1.2.3".parse().unwrap()),
+            }
+        )
+        .unwrap(),
+        ResolvedVersion::Gray(2),
+        "IP 规则对已上报 instance_id 的客户端生效"
+    );
 }
 
 /// T8 Q5 保留策略：prune_versions 不触碰灰度快照（gray-snap/ 前缀独立于 v/）。

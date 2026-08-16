@@ -122,6 +122,9 @@ proto ConfigSnapshot  + bool gray = 6
 即 `version` 永远是 v/ 空间单调值（watch 过滤 `e.version > last` 的正确性依赖此点）；
 内容来源由 `gray` + `resolved_version` 表达。稳定路径 version=resolved_version=active。
 
+**get_item 契约（🟡5 记录）**：`ItemValue` 不携带 gray/resolved_version——单值读取的客户端
+以 `get_config`（snapshot）为准判断自己在灰度；get_item 仅保证值已按身份分流（Q6）。
+
 `get_config`（普通路径）设 `gray=false, resolved_version=vno`；灰度路径设 `gray=true, resolved_version=seq`。
 
 ### D28：管理面绕过（Q6 明确）
@@ -225,7 +228,7 @@ pub fn get_config_resolved(
 |---|---------|--------|------|
 | B1 | **重放缺口**：gray publish/abort 不写 v/ 记录 → watch 重放不含这两个事件；灰度客户端 abort 前断线、重连后收不到撤回事件，持续服务已撤回的灰度内容（Q4 反向漏收） | 🔴 阻塞 | ✅ **SDK 契约闭环**（§D25 重放语义）：watch 重连/订阅后必须做一次 snapshot 拉取（resolve 返回当前状态，abort 后回落 active）；缓存版本号只取 snapshot 响应（与方案 b 既有契约一致） |
 | R1 | **D27 语义问题**：灰度响应 `version=gray_seq` 使客户端缓存离开 v/ 空间 → 重连 after_version=灰度号导致全量重放放大/force_snapshot、`version==after_version` 碰撞时普通 v/ 事件被 `e.version>last` 静默滤掉 | 🟠 修订 | ✅ **已改**：灰度命中 `version=active_version`（v/ 空间）、`resolved_version=gray_seq`、`gray=true`；G3-D1 测试与文档同步 |
-| R2 | **Q2 门闩 vs IP 规则**：instance_id 空 → 直接 Stable，纯 IP 段规则对无 instance_id 客户端永不命中 | 🟠 修订 | ✅ 记录性接受（§D26）：Q2 安全门闩的直接推论；IP 规则实际要求上报 instance_id（容器重建场景 instance_id 不变、IP 兜底）；文档化 |
+| R2 | **Q2 门闩 vs IP 规则**：instance_id 空 → 直接 Stable，纯 IP 段规则对无 instance_id 客户端永不命中 | 🟠 修订 | ✅ 记录性接受（§D26）：Q2 安全门闩的直接推论；IP 规则实际要求上报 instance_id（容器重建场景 instance_id 不变、IP 兜底）；文档化 + **补测试钉死**（T7：纯 IP 规则 + 空 instance_id → Stable） |
 | R3 | **「灰度记录在版本历史中」不成立**：灰度发布不产生 v/ 记录，`get_config_resolved(灰度号)` → NotFound | 🟠 修订 | ✅ 文档修正（§D28）：管理面看灰度内容走 gray-status 端点；灰度内容预览随 G4 UI tab |
 | T1 | dsh-watch 注释过度自信（SSE 无游标倒挂） | 🟡 | ✅ 注释已限定"`last` 为重放末尾固定值（非可变）" |
 | T2 | openapi.yaml 未列入改动清单 | 🟡 | ✅ 明确：openapi 补全归 G4（contract 检查不校验路由对拍） |
