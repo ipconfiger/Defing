@@ -125,9 +125,7 @@ pub enum Command {
     /// 登出：清除会话（幂等）。
     SessionLogout,
     /// 心跳续期：更新 expires_at；无会话 → ERR_SESSION_EXPIRED。
-    SessionHeartbeat {
-        expires_at: Option<i64>,
-    },
+    SessionHeartbeat { expires_at: Option<i64> },
     /// 创建项目管理员账号（项目须存在；用户名 [A-Za-z0-9_-]{2,64} 且 ≠ "admin"）。
     ProjectAdminCreate {
         project: ProjectId,
@@ -136,9 +134,7 @@ pub enum Command {
         password_hash: String,
     },
     /// 删除项目管理员账号（级联删除其会话）。
-    ProjectAdminDelete {
-        username: String,
-    },
+    ProjectAdminDelete { username: String },
     /// 修改项目管理员密码（级联删除其会话，需重新登录）。
     ProjectAdminSetPassword {
         username: String,
@@ -155,20 +151,14 @@ pub enum Command {
         device_id: String,
     },
     /// 项目管理员登出（幂等）。
-    PaSessionLogout {
-        username: String,
-    },
+    PaSessionLogout { username: String },
     /// 项目管理员心跳续期（None = 永不过期，语义同 SessionHeartbeat）。
     PaSessionHeartbeat {
         username: String,
         expires_at: Option<i64>,
     },
     /// 修改管理员密码（哈希落状态机，集群一致；登录优先用它校验，回退节点配置）。
-    AdminSetPassword {
-        password_hash: String,
-    },
+    AdminSetPassword { password_hash: String },
     /// 审计落库（seq 由状态机单调分配并覆写；经 Raft 复制，集群一致）。
-    AuditAppend {
-        entry: crate::model::AuditEntry,
-    },
+    AuditAppend { entry: crate::model::AuditEntry },
 }

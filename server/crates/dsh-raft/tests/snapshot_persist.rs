@@ -1,5 +1,5 @@
 //! B5 快照持久化：build_snapshot 落盘 → 重启（同 data-dir 重新打开）→ get_current_snapshot 读盘返回。
-//! 依赖：snapshots 列族（dsh-storage 已预留）。
+//! 依赖：snapshots 表（dsh-storage）。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use dsh_core::command::Command;
 use dsh_core::StateMachine;
 use dsh_raft::*;
-use dsh_storage::{OpenOptions, RocksStore};
+use dsh_storage::RedbStorage;
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -24,18 +24,18 @@ async fn snapshot_persists_across_restart() {
 
     // 1) 首启：写入状态 + 构建快照（落盘）
     {
-        let rocks = RocksStore::open(&OpenOptions {
-            dir: dir.display().to_string(),
-            max_open_files: 64,
-        })
-        .unwrap();
-        let db = rocks.raw();
-        let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(rocks))));
+        let storage = RedbStorage::open(&dir.display().to_string()).unwrap();
+        let db = storage.raw_db();
+        let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage))));
         sm.lock()
             .unwrap()
-            .apply(&Command::ProjectCreate { name: "p".into() 
-                operator: String::new(),
-            }, 1)
+            .apply(
+                &Command::ProjectCreate {
+                    name: "p".into(),
+                    operator: String::new(),
+                },
+                1,
+            )
             .unwrap();
         let mut sm_store = StateMachineStore::new(sm.clone(), db.clone());
         let mut builder = sm_store.get_snapshot_builder().await;
@@ -52,13 +52,9 @@ async fn snapshot_persists_across_restart() {
 
     // 2) 重启：同 data-dir 重新打开，内存无快照 → 应从盘恢复
     {
-        let rocks = RocksStore::open(&OpenOptions {
-            dir: dir.display().to_string(),
-            max_open_files: 64,
-        })
-        .unwrap();
-        let db = rocks.raw();
-        let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(rocks))));
+        let storage = RedbStorage::open(&dir.display().to_string()).unwrap();
+        let db = storage.raw_db();
+        let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage))));
         let mut s = StateMachineStore::new(sm.clone(), db);
         let snap = s
             .get_current_snapshot()

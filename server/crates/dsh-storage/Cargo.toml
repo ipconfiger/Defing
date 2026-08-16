@@ -3,9 +3,11 @@ name = "dsh-storage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Defing config service - RocksDB storage (Store trait impl, module 02)"
+description = "Defing config service - redb storage (Store trait impl, module 02)"
 
 [dependencies]
 dsh-core = { path = "../dsh-core" }
-# rust-rocksdb 0.23 的 lib 名为 rust_rocksdb；重命名以便代码用 rocksdb::
-rocksdb = { package = "rust-rocksdb", version = "0.23" }
+# 纯 Rust 嵌入式 KV（v3 磁盘格式），替代 rust-rocksdb 以移除 C++ 工具链依赖
+redb = "4.1"
+# repair callback 记日志（与 dsh-raft/dsh-cli 等 crate 一致的 workspace 依赖形态）
+tracing = { workspace = true }

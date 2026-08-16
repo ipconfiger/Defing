@@ -9,7 +9,7 @@ use dsh_core::command::{Command, DraftUpdateItem};
 use dsh_core::model::{BranchName, ItemDef, Value, ValueType};
 use dsh_core::StateMachine;
 use dsh_raft::*;
-use dsh_storage::{OpenOptions, RocksStore};
+use dsh_storage::RedbStorage;
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -28,13 +28,9 @@ struct NodeCtx {
 async fn make_node(id: NodeId, tag: &str, network: &NetworkFactory) -> NodeCtx {
     let dir = tmpdir(tag);
     let _ = std::fs::remove_dir_all(&dir);
-    let rocks = RocksStore::open(&OpenOptions {
-        dir: dir.display().to_string(),
-        max_open_files: 64,
-    })
-    .unwrap();
-    let db = rocks.raw();
-    let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(rocks))));
+    let storage = RedbStorage::open(&dir.display().to_string()).unwrap();
+    let db = storage.raw_db();
+    let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage))));
     let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone()));
     let log_store = LogStore::new(db.clone());
     let node = NodeInfo {
@@ -133,7 +129,7 @@ async fn three_node_bootstrap_join_failover() {
         &leader_raft,
         Command::ProjectCreate {
             name: "order-service".into(),
-        
+
             operator: String::new(),
         },
         Duration::from_secs(10),
@@ -182,7 +178,7 @@ async fn three_node_bootstrap_join_failover() {
             project: "order-service".into(),
             base_version: 1,
             groups: groups.clone(),
-        
+
             operator: String::new(),
         },
         Duration::from_secs(10),
@@ -196,7 +192,7 @@ async fn three_node_bootstrap_join_failover() {
             project: "order-service".into(),
             comment: "init".into(),
             request_id: "s1".into(),
-        
+
             operator: String::new(),
         },
         Duration::from_secs(10),
@@ -222,9 +218,9 @@ async fn three_node_bootstrap_join_failover() {
                 },
             ],
             deletes: vec![],
-        
-                    operator: String::new(),
-                },
+
+            operator: String::new(),
+        },
         Duration::from_secs(10),
     )
     .await
@@ -237,7 +233,7 @@ async fn three_node_bootstrap_join_failover() {
             branch: BranchName("dev".into()),
             comment: "dev".into(),
             request_id: "r1".into(),
-        
+
             operator: String::new(),
         },
         Duration::from_secs(10),
@@ -278,7 +274,7 @@ async fn three_node_bootstrap_join_failover() {
         &leader_raft,
         Command::ProjectCreate {
             name: "svc-b".into(),
-        
+
             operator: String::new(),
         },
         Duration::from_secs(10),
@@ -432,7 +428,7 @@ async fn cluster_watch_events_reach_subscribers() {
         &n1.raft,
         Command::ProjectCreate {
             name: "watch-proj".into(),
-        
+
             operator: String::new(),
         },
         Duration::from_secs(10),
@@ -456,7 +452,7 @@ async fn cluster_watch_events_reach_subscribers() {
             project: "watch-proj".into(),
             base_version: 1,
             groups,
-        
+
             operator: String::new(),
         },
         Duration::from_secs(10),
@@ -470,7 +466,7 @@ async fn cluster_watch_events_reach_subscribers() {
             project: "watch-proj".into(),
             comment: "init".into(),
             request_id: "ws1".into(),
-        
+
             operator: String::new(),
         },
         Duration::from_secs(10),

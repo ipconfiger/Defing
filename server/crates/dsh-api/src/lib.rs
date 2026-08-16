@@ -313,10 +313,7 @@ async fn security_headers(
 }
 
 /// 会话主体解析结果（中间件与 render_config 共用，N15：禁止第三份解析实现）。
-fn resolve_principal(
-    app: &ApiState,
-    auth_header: Option<&str>,
-) -> Result<dsh_core::Principal, ()> {
+fn resolve_principal(app: &ApiState, auth_header: Option<&str>) -> Result<dsh_core::Principal, ()> {
     let token = auth_header
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(())?;
@@ -324,7 +321,7 @@ fn resolve_principal(
     let sm = app.sm.lock().expect("sm lock");
     // token 前缀路由（§3）：pa.{username}.{secret} → sess/pa/{username}；
     // adm.{secret} 或无前缀（旧格式 fallback）→ sess/admin。
-    let (principal, session) = if let Some(rest) = token.strip_prefix("pa.") {
+    let (_, session) = if let Some(rest) = token.strip_prefix("pa.") {
         let username = rest.split('.').next().unwrap_or("");
         let session = sm.get_pa_session(username).ok().flatten();
         (
@@ -335,10 +332,7 @@ fn resolve_principal(
             session,
         )
     } else {
-        (
-            dsh_core::Principal::Admin,
-            sm.get_session().ok().flatten(),
-        )
+        (dsh_core::Principal::Admin, sm.get_session().ok().flatten())
     };
     match session {
         Some(s) => {
@@ -359,7 +353,10 @@ fn resolve_principal(
 fn project_segment(path: &str) -> Option<String> {
     let rest = path.strip_prefix("/api/v1/projects/")?;
     let seg = rest.split('/').next()?;
-    if !seg.is_empty() && seg.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    if !seg.is_empty()
+        && seg
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
         Some(seg.to_string())
     } else {
@@ -376,9 +373,7 @@ fn pa_allowed(principal: &dsh_core::Principal, method: &str, path: &str) -> bool
     let pid = &project.0;
 
     // 自身会话（显式放行，防锁死 B5）
-    if (method == "POST" && path == "/api/v1/logout")
-        || (method == "POST" && path == "/api/v1/heartbeat")
-    {
+    if method == "POST" && (path == "/api/v1/logout" || path == "/api/v1/heartbeat") {
         return true;
     }
     // 读项目列表（handler 内过滤为自己项目）
@@ -473,11 +468,14 @@ async fn create_project(
     Json(req): Json<CreateProjectReq>,
 ) -> ApiResult<serde_json::Value> {
     let pid = ProjectId(req.name.clone());
-    app.write(&Command::ProjectCreate {
-                name: req.name.clone(),
-                operator: "admin".to_string(),
-            }, now_ms())
-        .await?;
+    app.write(
+        &Command::ProjectCreate {
+            name: req.name.clone(),
+            operator: "admin".to_string(),
+        },
+        now_ms(),
+    )
+    .await?;
     app.audit
         .append(
             "project_create",
@@ -545,7 +543,7 @@ async fn create_branch(
             project: ProjectId(pid.clone()),
             name: BranchName(req.name.clone()),
             source,
-        
+
             operator: principal_op(&principal),
         },
         now_ms(),
@@ -594,7 +592,7 @@ async fn set_structure_draft(
             project: ProjectId(pid.clone()),
             base_version: req.base_version,
             groups: req.groups,
-        
+
             operator: principal_op(&principal),
         },
         now_ms(),
@@ -623,7 +621,12 @@ async fn publish_structure(
     let rid = req.request_id.unwrap_or_else(new_request_id);
     let outcome = app
         .publish
-        .publish_structure(&ProjectId(pid.clone()), &req.comment, &rid, &principal_op(&principal))
+        .publish_structure(
+            &ProjectId(pid.clone()),
+            &req.comment,
+            &rid,
+            &principal_op(&principal),
+        )
         .await
         .map_err(ApiError::from)?;
     let affected = outcome
@@ -666,7 +669,13 @@ async fn update_draft(
     let pid_obj = ProjectId(pid.clone());
     let branch_obj = BranchName(branch.clone());
     app.publish
-        .update_draft(&pid_obj, &branch_obj, req.updates, deletes, &principal_op(&principal))
+        .update_draft(
+            &pid_obj,
+            &branch_obj,
+            req.updates,
+            deletes,
+            &principal_op(&principal),
+        )
         .await
         .map_err(ApiError::from)?;
     app.audit
@@ -797,12 +806,15 @@ async fn delete_project(
         ));
     }
     let pid_obj = ProjectId(pid.clone());
-    app.write(&Command::ProjectDelete {
-                id: pid_obj,
-                operator: "admin".to_string(),
-            }, now_ms())
-        .await
-        .map_err(Into::<(StatusCode, Json<ApiErrorBody>)>::into)?;
+    app.write(
+        &Command::ProjectDelete {
+            id: pid_obj,
+            operator: "admin".to_string(),
+        },
+        now_ms(),
+    )
+    .await
+    .map_err(Into::<(StatusCode, Json<ApiErrorBody>)>::into)?;
     app.audit
         .append(
             "project_delete",
@@ -861,7 +873,7 @@ async fn delete_branch(
         &Command::BranchDelete {
             project: ProjectId(pid.clone()),
             name: BranchName(branch.clone()),
-        
+
             operator: principal_op(&principal),
         },
         now_ms(),
@@ -1100,12 +1112,15 @@ async fn write_shared_draft(
         value,
         version: 0,
     };
-    app.write(&Command::SharedDraftUpdate {
-                item,
-                operator: "admin".to_string(),
-            }, now_ms())
-        .await
-        .map_err(Into::<(StatusCode, Json<ApiErrorBody>)>::into)?;
+    app.write(
+        &Command::SharedDraftUpdate {
+            item,
+            operator: "admin".to_string(),
+        },
+        now_ms(),
+    )
+    .await
+    .map_err(Into::<(StatusCode, Json<ApiErrorBody>)>::into)?;
     app.audit
         .append(
             action,
@@ -1175,7 +1190,7 @@ async fn publish_shared(
             &Command::SharedPublish {
                 comment: req.comment,
                 request_id: rid.clone(),
-            
+
                 operator: principal_op(&principal),
             },
             now_ms(),
@@ -1258,7 +1273,7 @@ async fn ref_bind(
         &Command::RefBind {
             project: ProjectId(req.project.clone()),
             binding,
-        
+
             operator: principal_op(&principal),
         },
         now_ms(),
@@ -1290,7 +1305,7 @@ async fn ref_unbind(
             project: ProjectId(req.project.clone()),
             group: req.group.clone(),
             item_key: req.item_key.clone(),
-        
+
             operator: principal_op(&principal),
         },
         now_ms(),
@@ -1426,7 +1441,10 @@ fn salted_password_hash(password: &str) -> (String, String) {
     use rand::RngCore;
     let mut salt_bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut salt_bytes);
-    let salt = salt_bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let salt = salt_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     let hash = dsh_core::token_hash(&format!("{salt}{password}"));
     (salt, hash)
 }
@@ -1741,7 +1759,7 @@ async fn render_config(
                 serde_json::json!({ "format": q.format }),
                 &principal
                     .as_ref()
-                    .map(|p| principal_op(p))
+                    .map(principal_op)
                     .unwrap_or_else(|_| "admin".to_string()),
             )
             .await;
@@ -1849,7 +1867,15 @@ async fn login(
         match res {
             Ok(_) => {
                 app.audit
-                    .append("login", None, None, None, None, serde_json::json!({}), "admin")
+                    .append(
+                        "login",
+                        None,
+                        None,
+                        None,
+                        None,
+                        serde_json::json!({}),
+                        "admin",
+                    )
                     .await;
                 return Ok(Json(LoginResp {
                     token,
@@ -1896,7 +1922,11 @@ async fn login(
                                     .get("project")
                                     .and_then(|p| p.as_str())
                                     .map(str::to_string);
-                                return Ok(Json(LoginResp { token, role, project }));
+                                return Ok(Json(LoginResp {
+                                    token,
+                                    role,
+                                    project,
+                                }));
                             }
                             // 409 ERR_SESSION_IN_USE 等：原样转发 leader 的错误体
                             let code = body
@@ -2081,7 +2111,10 @@ async fn pa_login(
                                     .and_then(|t| t.as_str())
                                     .unwrap_or_default()
                                     .to_string(),
-                                role: body.get("role").and_then(|r| r.as_str()).map(str::to_string),
+                                role: body
+                                    .get("role")
+                                    .and_then(|r| r.as_str())
+                                    .map(str::to_string),
                                 project: body
                                     .get("project")
                                     .and_then(|p| p.as_str())
@@ -2099,7 +2132,14 @@ async fn pa_login(
                             .unwrap_or("login failed")
                             .to_string();
                         let detail = body.get("detail").cloned();
-                        return Err((status, Json(ApiErrorBody { code, message, detail })));
+                        return Err((
+                            status,
+                            Json(ApiErrorBody {
+                                code,
+                                message,
+                                detail,
+                            }),
+                        ));
                     }
                 }
             }
@@ -2139,7 +2179,15 @@ async fn logout(
         }
     }
     app.audit
-        .append("logout", None, None, None, None, serde_json::json!({}), &operator)
+        .append(
+            "logout",
+            None,
+            None,
+            None,
+            None,
+            serde_json::json!({}),
+            &operator,
+        )
         .await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2244,7 +2292,12 @@ async fn audit_list(
         dsh_core::Principal::ProjectAdmin { project, .. } => Some(project.0),
     };
     let entries = sm
-        .get_audit(q.action.as_deref(), project_filter.as_deref(), q.since, q.limit)
+        .get_audit(
+            q.action.as_deref(),
+            project_filter.as_deref(),
+            q.since,
+            q.limit,
+        )
         .map_err(ApiError::from)?;
     Ok(Json(serde_json::to_value(entries).expect("serialize")))
 }
@@ -2433,7 +2486,12 @@ async fn admin_force_logout(
     State(app): State<ApiState>,
     axum::extract::Json(req): axum::extract::Json<ForceLogoutReq>,
 ) -> ApiResult<serde_json::Value> {
-    match req.username.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+    match req
+        .username
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    {
         None => {
             app.write(&Command::SessionLogout, now_ms()).await?;
         }

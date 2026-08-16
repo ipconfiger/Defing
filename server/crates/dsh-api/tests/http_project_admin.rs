@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use dsh_api::{build_router, ApiState};
 use dsh_core::command::Command;
 use dsh_core::model::ProjectId;
-use dsh_core::{InMemoryStore, StateMachine, token_hash};
+use dsh_core::{token_hash, InMemoryStore, StateMachine};
 use dsh_watch::WatchHub;
 
 struct TestServer {
@@ -17,7 +17,9 @@ struct TestServer {
 }
 
 async fn start() -> TestServer {
-    let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(InMemoryStore::new()))));
+    let sm = Arc::new(Mutex::new(StateMachine::new(
+        Box::new(InMemoryStore::new()),
+    )));
     {
         let mut g = sm.lock().unwrap();
         // 两个项目 + PA 账号（p1: alice，p2 无 PA）
@@ -75,7 +77,10 @@ async fn req(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
-    let mut r = client.request(reqwest::Method::from_bytes(method.as_bytes()).unwrap(), format!("{base}{path}"));
+    let mut r = client.request(
+        reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+        format!("{base}{path}"),
+    );
     if let Some(t) = token {
         r = r.bearer_auth(t);
     }
@@ -90,23 +95,51 @@ async fn req(
 }
 
 async fn admin_login(base: &str) -> String {
-    let (code, body) = req(base, "POST", "/api/v1/login", None, Some(serde_json::json!({"password": "admin-pw"}))).await;
+    let (code, body) = req(
+        base,
+        "POST",
+        "/api/v1/login",
+        None,
+        Some(serde_json::json!({"password": "admin-pw"})),
+    )
+    .await;
     assert_eq!(code, 200, "admin login: {body}");
     body["token"].as_str().unwrap().to_string()
 }
 
 async fn pa_login(base: &str, user: &str, pw: &str) -> (u16, serde_json::Value) {
-    req(base, "POST", "/api/v1/login", None, Some(serde_json::json!({"username": user, "password": pw}))).await
+    req(
+        base,
+        "POST",
+        "/api/v1/login",
+        None,
+        Some(serde_json::json!({"username": user, "password": pw})),
+    )
+    .await
 }
 
 /// 初始化 p1 结构（admin token）。
 async fn setup_p1_structure(base: &str, admin: &str) {
-    let (code, body) = req(base, "PUT", "/api/v1/projects/p1/structure-draft", Some(admin), Some(serde_json::json!({
-        "base_version": 1,
-        "groups": [{"name": "g", "items": [{"key": "k", "type": "string", "required": true}]}]
-    }))).await;
+    let (code, body) = req(
+        base,
+        "PUT",
+        "/api/v1/projects/p1/structure-draft",
+        Some(admin),
+        Some(serde_json::json!({
+            "base_version": 1,
+            "groups": [{"name": "g", "items": [{"key": "k", "type": "string", "required": true}]}]
+        })),
+    )
+    .await;
     assert_eq!(code, 200, "structure-draft: {body}");
-    let (code, body) = req(base, "POST", "/api/v1/projects/p1/structure-draft/publish", Some(admin), Some(serde_json::json!({"comment": "init"}))).await;
+    let (code, body) = req(
+        base,
+        "POST",
+        "/api/v1/projects/p1/structure-draft/publish",
+        Some(admin),
+        Some(serde_json::json!({"comment": "init"})),
+    )
+    .await;
     assert_eq!(code, 200, "structure publish: {body}");
 }
 
@@ -119,7 +152,10 @@ async fn pa_login_flow_and_role_response() {
     assert_eq!(body["role"], "project_admin");
     assert_eq!(body["project"], "p1");
     let token = body["token"].as_str().unwrap();
-    assert!(token.starts_with("pa.alice."), "token 前缀路由格式: {token}");
+    assert!(
+        token.starts_with("pa.alice."),
+        "token 前缀路由格式: {token}"
+    );
 
     // 重复登录 → 409 ERR_SESSION_IN_USE（每账号单会话）
     let (code, body) = pa_login(&s.base, "alice", "alicepw").await;
@@ -153,17 +189,52 @@ async fn pa_authorization_matrix() {
         "updates": [{"group": "g", "key": "k", "value": {"type": "string", "str_value": "v1"}}], "deletes": []
     }))).await;
     assert_eq!(c, 200, "PA 写自己项目草稿: {b}");
-    let (c, b) = req(&s.base, "POST", "/api/v1/projects/p1/branches/dev/publish", Some(&pa), Some(serde_json::json!({"comment": "pa"}))).await;
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/projects/p1/branches/dev/publish",
+        Some(&pa),
+        Some(serde_json::json!({"comment": "pa"})),
+    )
+    .await;
     assert_eq!(c, 200, "PA 发布: {b}");
-    let (c, _) = req(&s.base, "GET", "/api/v1/projects/p1/branches/dev/config", Some(&pa), None).await;
+    let (c, _) = req(
+        &s.base,
+        "GET",
+        "/api/v1/projects/p1/branches/dev/config",
+        Some(&pa),
+        None,
+    )
+    .await;
     assert_eq!(c, 200);
-    let (c, _) = req(&s.base, "GET", "/api/v1/projects/p1/branches/dev/versions", Some(&pa), None).await;
+    let (c, _) = req(
+        &s.base,
+        "GET",
+        "/api/v1/projects/p1/branches/dev/versions",
+        Some(&pa),
+        None,
+    )
+    .await;
     assert_eq!(c, 200);
-    let (c, _) = req(&s.base, "GET", "/api/v1/projects/p1/diff?branch_a=dev&branch_b=test", Some(&pa), None).await;
+    let (c, _) = req(
+        &s.base,
+        "GET",
+        "/api/v1/projects/p1/diff?branch_a=dev&branch_b=test",
+        Some(&pa),
+        None,
+    )
+    .await;
     assert_eq!(c, 200);
     let (c, _) = req(&s.base, "GET", "/api/v1/projects/p1", Some(&pa), None).await;
     assert_eq!(c, 200);
-    let (c, _) = req(&s.base, "GET", "/api/v1/projects/p1/structure-draft", Some(&pa), None).await;
+    let (c, _) = req(
+        &s.base,
+        "GET",
+        "/api/v1/projects/p1/structure-draft",
+        Some(&pa),
+        None,
+    )
+    .await;
     assert_eq!(c, 200);
     // heartbeat 可用（B5/B7）
     let (c, _) = req(&s.base, "POST", "/api/v1/heartbeat", Some(&pa), None).await;
@@ -197,7 +268,14 @@ async fn pa_authorization_matrix() {
         }
     }
     // ✅ GET /shared/refs 只读放行
-    let (c, _) = req(&s.base, "GET", "/api/v1/shared/refs?project=p1", Some(&pa), None).await;
+    let (c, _) = req(
+        &s.base,
+        "GET",
+        "/api/v1/shared/refs?project=p1",
+        Some(&pa),
+        None,
+    )
+    .await;
     assert_eq!(c, 200);
 
     // ❌ 项目面/账号/集群/全局
@@ -229,10 +307,10 @@ async fn pa_path_traversal_blocked() {
 
     // URL 编码/大写/尾斜杠/编码斜杠 → 全部 403（不落入项目路径匹配）
     for p in [
-        "/api/v1/projects/%70%31/branches/dev/config",  // %70%31 = "p1" 编码
-        "/api/v1/projects/P1/branches/dev/config",      // 大写（不匹配 valid_name → 非项目路径）
-        "/api/v1/projects/p1/branches/dev/config/",     // 尾斜杠
-        "/api/v1/projects/p1%2Fbranches/dev/config",    // 编码斜杠
+        "/api/v1/projects/%70%31/branches/dev/config", // %70%31 = "p1" 编码
+        "/api/v1/projects/P1/branches/dev/config",     // 大写（不匹配 valid_name → 非项目路径）
+        "/api/v1/projects/p1/branches/dev/config/",    // 尾斜杠
+        "/api/v1/projects/p1%2Fbranches/dev/config",   // 编码斜杠
         "/api/v1/projects/..%2Fp2/branches/dev/config", // 穿越
     ] {
         let (c, b) = req(&s.base, "GET", p, Some(&pa), None).await;
@@ -274,20 +352,41 @@ async fn reveal_b2_regression() {
         "groups": [{"name": "g", "items": [{"key": "sec", "type": "secret", "required": true, "secret": true}]}]
     }))).await;
     assert_eq!(c, 200, "p2 structure-draft: {b}");
-    let (c, b) = req(&s.base, "POST", "/api/v1/projects/p2/structure-draft/publish", Some(&admin), Some(serde_json::json!({"comment": "c"}))).await;
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/projects/p2/structure-draft/publish",
+        Some(&admin),
+        Some(serde_json::json!({"comment": "c"})),
+    )
+    .await;
     assert_eq!(c, 200, "p2 structure publish: {b}");
     let (c, b) = req(&s.base, "PUT", "/api/v1/projects/p2/branches/dev/draft", Some(&admin), Some(serde_json::json!({
         "updates": [{"group": "g", "key": "sec", "value": {"type": "secret", "ciphertext": {"enc": "aes-256-gcm", "v": 1, "dek_v": 1, "nonce": "AAAAAAAAAAAAAAAA", "ct": "AAAAAAAA", "edek": "AAAAAAAA", "edek_nonce": "AAAAAAAAAAAAAAAA"}}}], "deletes": []
     }))).await;
     assert_eq!(c, 200, "p2 draft: {b}");
-    let (c, b) = req(&s.base, "POST", "/api/v1/projects/p2/branches/dev/publish", Some(&admin), Some(serde_json::json!({"comment": "c"}))).await;
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/projects/p2/branches/dev/publish",
+        Some(&admin),
+        Some(serde_json::json!({"comment": "c"})),
+    )
+    .await;
     assert_eq!(c, 200, "p2 publish: {b}");
 
     let (_, body) = pa_login(&s.base, "alice", "alicepw").await;
     let pa = body["token"].as_str().unwrap().to_string();
 
     // PA reveal 自己项目 → 200（无 secret 则正常输出）
-    let (c, _) = req(&s.base, "GET", "/v1/projects/p1/branches/dev/config?reveal=true", Some(&pa), None).await;
+    let (c, _) = req(
+        &s.base,
+        "GET",
+        "/v1/projects/p1/branches/dev/config?reveal=true",
+        Some(&pa),
+        None,
+    )
+    .await;
     assert_eq!(c, 200);
     // R1 回归：reveal 审计 operator 应为 pa:alice（不是 admin）
     let (c, b) = req(&s.base, "GET", "/api/v1/audit?limit=10", Some(&pa), None).await;
@@ -300,10 +399,24 @@ async fn reveal_b2_regression() {
         "reveal 审计 operator 须为 pa:alice: {b}"
     );
     // PA reveal 其他项目 → 403（B2 修复前是 200 越权）
-    let (c, b) = req(&s.base, "GET", "/v1/projects/p2/branches/dev/config?reveal=true", Some(&pa), None).await;
+    let (c, b) = req(
+        &s.base,
+        "GET",
+        "/v1/projects/p2/branches/dev/config?reveal=true",
+        Some(&pa),
+        None,
+    )
+    .await;
     assert_eq!(c, 403, "B2 regression: {b}");
     // admin 全通
-    let (c, _) = req(&s.base, "GET", "/v1/projects/p2/branches/dev/config?reveal=true", Some(&admin), None).await;
+    let (c, _) = req(
+        &s.base,
+        "GET",
+        "/v1/projects/p2/branches/dev/config?reveal=true",
+        Some(&admin),
+        None,
+    )
+    .await;
     assert_eq!(c, 200);
 }
 
@@ -326,7 +439,14 @@ async fn session_lifecycle_and_filters() {
     req(&s.base, "PUT", "/api/v1/projects/p1/branches/dev/draft", Some(&pa), Some(serde_json::json!({
         "updates": [{"group": "g", "key": "k", "value": {"type": "string", "str_value": "v"}}], "deletes": []
     }))).await;
-    req(&s.base, "POST", "/api/v1/projects/p1/branches/dev/publish", Some(&pa), Some(serde_json::json!({"comment": "c"}))).await;
+    req(
+        &s.base,
+        "POST",
+        "/api/v1/projects/p1/branches/dev/publish",
+        Some(&pa),
+        Some(serde_json::json!({"comment": "c"})),
+    )
+    .await;
     let (c, b) = req(&s.base, "GET", "/api/v1/audit?limit=50", Some(&pa), None).await;
     assert_eq!(c, 200);
     let entries = b.as_array().unwrap();
@@ -342,7 +462,14 @@ async fn session_lifecycle_and_filters() {
     );
 
     // force-logout 带 username（N16）：admin 踢 PA
-    let (c, _) = req(&s.base, "POST", "/api/v1/admin/force-logout", Some(&admin), Some(serde_json::json!({"username": "alice"}))).await;
+    let (c, _) = req(
+        &s.base,
+        "POST",
+        "/api/v1/admin/force-logout",
+        Some(&admin),
+        Some(serde_json::json!({"username": "alice"})),
+    )
+    .await;
     assert_eq!(c, 200);
     let (c, _) = req(&s.base, "GET", "/api/v1/projects/p1", Some(&pa), None).await;
     assert_eq!(c, 401, "被踢后旧 token 失效");
@@ -350,7 +477,14 @@ async fn session_lifecycle_and_filters() {
     // 重登 → 改密 → 旧 token 失效
     let (_, body) = pa_login(&s.base, "alice", "alicepw").await;
     let pa2 = body["token"].as_str().unwrap().to_string();
-    let (c, _) = req(&s.base, "PUT", "/api/v1/projects/p1/admins/alice", Some(&admin), Some(serde_json::json!({"password": "new-pw"}))).await;
+    let (c, _) = req(
+        &s.base,
+        "PUT",
+        "/api/v1/projects/p1/admins/alice",
+        Some(&admin),
+        Some(serde_json::json!({"password": "new-pw"})),
+    )
+    .await;
     assert_eq!(c, 204);
     let (c, _) = req(&s.base, "GET", "/api/v1/projects/p1", Some(&pa2), None).await;
     assert_eq!(c, 401, "改密后旧 token 失效");
@@ -359,7 +493,14 @@ async fn session_lifecycle_and_filters() {
     assert_eq!(c, 200);
 
     // 删号 → 登录 401（账号不存在与错误密码同响应）
-    req(&s.base, "DELETE", "/api/v1/projects/p1/admins/alice", Some(&admin), None).await;
+    req(
+        &s.base,
+        "DELETE",
+        "/api/v1/projects/p1/admins/alice",
+        Some(&admin),
+        None,
+    )
+    .await;
     let (c, _) = pa_login(&s.base, "alice", "new-pw").await;
     assert_eq!(c, 401);
 }
@@ -370,28 +511,76 @@ async fn admin_account_management_endpoints() {
     let admin = admin_login(&s.base).await;
 
     // 创建 → 列表 → 重复创建 409 ERR_ACCOUNT_EXISTS → 修改 → 删除 → 404 ERR_ACCOUNT_NOT_FOUND
-    let (c, b) = req(&s.base, "POST", "/api/v1/projects/p1/admins", Some(&admin), Some(serde_json::json!({"username": "bob", "password": "pw-bob"}))).await;
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/projects/p1/admins",
+        Some(&admin),
+        Some(serde_json::json!({"username": "bob", "password": "pw-bob"})),
+    )
+    .await;
     assert_eq!(c, 201, "{b}");
-    let (c, b) = req(&s.base, "GET", "/api/v1/projects/p1/admins", Some(&admin), None).await;
+    let (c, b) = req(
+        &s.base,
+        "GET",
+        "/api/v1/projects/p1/admins",
+        Some(&admin),
+        None,
+    )
+    .await;
     assert_eq!(c, 200);
     assert_eq!(b.as_array().unwrap().len(), 2); // alice + bob（alice 来自播种）
-    let (c, b) = req(&s.base, "POST", "/api/v1/projects/p1/admins", Some(&admin), Some(serde_json::json!({"username": "bob", "password": "x"}))).await;
+    let (c, b) = req(
+        &s.base,
+        "POST",
+        "/api/v1/projects/p1/admins",
+        Some(&admin),
+        Some(serde_json::json!({"username": "bob", "password": "x"})),
+    )
+    .await;
     assert_eq!(c, 409);
     assert_eq!(b["code"], "ERR_ACCOUNT_EXISTS");
     // 不存在的项目创建账号 → 404
-    let (c, _) = req(&s.base, "POST", "/api/v1/projects/ghost/admins", Some(&admin), Some(serde_json::json!({"username": "b2", "password": "x"}))).await;
+    let (c, _) = req(
+        &s.base,
+        "POST",
+        "/api/v1/projects/ghost/admins",
+        Some(&admin),
+        Some(serde_json::json!({"username": "b2", "password": "x"})),
+    )
+    .await;
     assert_eq!(c, 404);
     // 删除
-    let (c, _) = req(&s.base, "DELETE", "/api/v1/projects/p1/admins/bob", Some(&admin), None).await;
+    let (c, _) = req(
+        &s.base,
+        "DELETE",
+        "/api/v1/projects/p1/admins/bob",
+        Some(&admin),
+        None,
+    )
+    .await;
     assert_eq!(c, 204);
-    let (c, b) = req(&s.base, "DELETE", "/api/v1/projects/p1/admins/bob", Some(&admin), None).await;
+    let (c, b) = req(
+        &s.base,
+        "DELETE",
+        "/api/v1/projects/p1/admins/bob",
+        Some(&admin),
+        None,
+    )
+    .await;
     assert_eq!(c, 404);
     assert_eq!(b["code"], "ERR_ACCOUNT_NOT_FOUND");
     // 禁用名 admin
-    let (c, _) = req(&s.base, "POST", "/api/v1/projects/p1/admins", Some(&admin), Some(serde_json::json!({"username": "admin", "password": "x"}))).await;
+    let (c, _) = req(
+        &s.base,
+        "POST",
+        "/api/v1/projects/p1/admins",
+        Some(&admin),
+        Some(serde_json::json!({"username": "admin", "password": "x"})),
+    )
+    .await;
     assert!(c == 400 || c == 422, "禁用名 admin 应被拒绝: {c}");
 }
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expired_session_relogin_and_heartbeat_ttl() {

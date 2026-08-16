@@ -522,11 +522,18 @@ impl StateMachine {
                 issued_at,
                 expires_at,
                 device_id,
-            } => self.apply_pa_session_login(username, token_hash, *issued_at, *expires_at, device_id),
+            } => self.apply_pa_session_login(
+                username,
+                token_hash,
+                *issued_at,
+                *expires_at,
+                device_id,
+            ),
             Command::PaSessionLogout { username } => self.apply_pa_session_logout(username),
-            Command::PaSessionHeartbeat { username, expires_at } => {
-                self.apply_pa_session_heartbeat(username, *expires_at)
-            }
+            Command::PaSessionHeartbeat {
+                username,
+                expires_at,
+            } => self.apply_pa_session_heartbeat(username, *expires_at),
             Command::AdminSetPassword { password_hash } => {
                 self.apply_admin_set_password(password_hash)
             }
@@ -641,7 +648,12 @@ impl StateMachine {
         Ok(vec![])
     }
 
-    fn apply_branch_delete(&mut self, id: &ProjectId, name: &BranchName, _operator: &str) -> ApplyOutcome {
+    fn apply_branch_delete(
+        &mut self,
+        id: &ProjectId,
+        name: &BranchName,
+        _operator: &str,
+    ) -> ApplyOutcome {
         let st = self
             .get_branch_state(id, name)?
             .ok_or_else(|| Error::not_found(format!("branch {name} of {id}")))?;
@@ -975,6 +987,7 @@ impl StateMachine {
 
     // ---------------- 回滚（I6/I9） ----------------
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_rollback(
         &mut self,
         project: &ProjectId,
@@ -1112,7 +1125,7 @@ impl StateMachine {
         comment: &str,
         request_id: &str,
         now_ms: i64,
-        operator: &str,
+        _operator: &str,
     ) -> ApplyOutcome {
         let drafts = self.list_shared_drafts()?;
         if drafts.is_empty() {
@@ -1263,7 +1276,12 @@ impl StateMachine {
         Ok(())
     }
 
-    fn apply_ref_bind(&mut self, project: &ProjectId, binding: &RefBinding, _operator: &str) -> ApplyOutcome {
+    fn apply_ref_bind(
+        &mut self,
+        project: &ProjectId,
+        binding: &RefBinding,
+        _operator: &str,
+    ) -> ApplyOutcome {
         let structure = self
             .get_structure(project)?
             .ok_or_else(|| Error::not_found(format!("project {project}")))?;
@@ -1354,7 +1372,7 @@ impl StateMachine {
         project: &ProjectId,
         group: &str,
         item_key: Option<&str>,
-        operator: &str,
+        _operator: &str,
     ) -> ApplyOutcome {
         match item_key {
             Some(key) => {
@@ -1442,8 +1460,6 @@ impl StateMachine {
         Ok(vec![])
     }
 
-    /// 设置管理员密码哈希（set-password；集群一致，登录时优先于节点配置）。
-
     // ---------------- 项目管理员（Project Admin）----------------
     // 设计文档 docs/design/project-admin.md §3.1/§6。
     // 会话判定只看 is_some()，不读墙钟（D16 确定性）。
@@ -1475,7 +1491,7 @@ impl StateMachine {
         if load::<Project>(&*self.store, &project_key(project))?.is_none() {
             return Err(Error::new(
                 ErrorKind::NotFound,
-                &format!("项目 {project} 不存在"),
+                format!("项目 {project} 不存在"),
             ));
         }
         let key = project_admin_key(username);
@@ -1533,7 +1549,8 @@ impl StateMachine {
         if load::<AdminSession>(&*self.store, &key)?.is_some() {
             return Err(Error::new(ErrorKind::SessionInUse, "该账号已有会话在线"));
         }
-        let Some(acct) = load::<ProjectAdminAccount>(&*self.store, &project_admin_key(username))? else {
+        let Some(acct) = load::<ProjectAdminAccount>(&*self.store, &project_admin_key(username))?
+        else {
             return Err(Error::new(ErrorKind::NotFound, "账号不存在"));
         };
         let session = AdminSession {
@@ -1555,7 +1572,11 @@ impl StateMachine {
         Ok(vec![])
     }
 
-    fn apply_pa_session_heartbeat(&mut self, username: &str, expires_at: Option<i64>) -> ApplyOutcome {
+    fn apply_pa_session_heartbeat(
+        &mut self,
+        username: &str,
+        expires_at: Option<i64>,
+    ) -> ApplyOutcome {
         let key = pa_session_key(username);
         let Some(mut session) = load::<AdminSession>(&*self.store, &key)? else {
             return Err(Error::new(ErrorKind::SessionExpired, "会话不存在"));
@@ -1585,7 +1606,7 @@ impl StateMachine {
     }
 
     /// 读取项目管理员会话。
-        /// 是否存在任一活动项目管理员会话（metrics 聚合用）。
+    /// 是否存在任一活动项目管理员会话（metrics 聚合用）。
     pub fn any_pa_session_active(&self, now_ms: i64) -> bool {
         match self.store.get_prefix(K_PA_SESSION.as_bytes()) {
             Ok(entries) => entries.iter().any(|(_, raw)| {
@@ -1598,7 +1619,7 @@ impl StateMachine {
         }
     }
 
-pub fn get_pa_session(&self, username: &str) -> Result<Option<AdminSession>, Error> {
+    pub fn get_pa_session(&self, username: &str) -> Result<Option<AdminSession>, Error> {
         load(&*self.store, &pa_session_key(username))
     }
 

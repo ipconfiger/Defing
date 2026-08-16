@@ -22,6 +22,7 @@ impl AuditLog {
 
     /// 追加审计条目（action 使用 schema AuditEntry 枚举；失败仅告警）。
     /// operator：操作者身份（"admin" / "pa:{username}"），由 API 层传入。
+    #[allow(clippy::too_many_arguments)]
     pub async fn append(
         &self,
         action: &str,
@@ -129,7 +130,9 @@ pub fn metrics_text(
     out.push_str("# TYPE dsh_audit_entries gauge\n");
     out.push_str(&format!("dsh_audit_entries {audits}\n"));
 
-    out.push_str("# HELP dsh_session_active 管理员会话是否活动（0/1，全局管理员或任一项目管理员）\n");
+    out.push_str(
+        "# HELP dsh_session_active 管理员会话是否活动（0/1，全局管理员或任一项目管理员）\n",
+    );
     out.push_str("# TYPE dsh_session_active gauge\n");
     out.push_str(&format!("dsh_session_active {}\n", session_active as u8));
     out.push_str("# HELP dsh_master_key_ok 主密钥是否就绪（0/1）\n");

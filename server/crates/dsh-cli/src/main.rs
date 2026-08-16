@@ -11,7 +11,7 @@ use dsh_crypto::{load_master_key, Cipher};
 use dsh_raft::{
     HttpNetworkFactory, LogStore, NodeInfo as RaftNodeInfo, RaftServerState, StateMachineStore,
 };
-use dsh_storage::{OpenOptions as StorageOptions, RocksStore};
+use dsh_storage::RedbStorage;
 use dsh_watch::WatchHub;
 
 // ---------------- 配置 ----------------
@@ -412,10 +412,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     if cli.dev_single {
         let store: Box<dyn dsh_core::Store> = match &cli.data_dir {
-            Some(dir) => Box::new(RocksStore::open(&StorageOptions {
-                dir: dir.clone(),
-                max_open_files: 256,
-            })?),
+            Some(dir) => Box::new(RedbStorage::open(dir)?),
             None => Box::new(InMemoryStore::new()),
         };
         let sm = StateMachine::new(store);
@@ -446,24 +443,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let data_dir = cli.data_dir.clone().ok_or("集群模式需要 --data-dir")?;
     let node_id = cli.node_id.ok_or("集群模式需要 --node-id")?;
 
-    let rocks = RocksStore::open(&StorageOptions {
-        dir: data_dir,
-        max_open_files: 256,
-    })?;
-    let db = rocks.raw();
+    let storage = RedbStorage::open(&data_dir)?;
+    let db = storage.raw_db();
     // 重启恢复：raft-meta 非空说明该节点已有持久化状态 → 无需 --bootstrap/--join，自动 resume
-    let has_state = db
-        .cf_handle("raft-meta")
-        .map(|cf| {
-            let mut iter = db.raw_iterator_cf(&cf);
-            iter.seek_to_first();
-            iter.valid()
-        })
-        .unwrap_or(false);
+    let has_state = {
+        use redb::ReadableDatabase;
+        let txn = db
+            .begin_read()
+            .map_err(|e| format!("读取 raft-meta 失败: {e}"))?;
+        match txn.open_table::<&[u8], &[u8]>(dsh_storage::TBL_RAFT_META) {
+            Ok(tbl) => tbl
+                .range::<&[u8]>(..)
+                .map(|mut it| it.next().is_some())
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    };
     if !cli.bootstrap && cli.join.is_none() && !has_state {
         return Err("集群模式需要 --bootstrap、--join 或已有数据目录".into());
     }
-    let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(rocks))));
+    let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage))));
     let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone()));
     // 集群 watch：raft apply 事件 → hub（SSE）
     hub.spawn_raft_forward(sm_store.clone());

@@ -1,5 +1,5 @@
 //! Raft 日志/状态机/快照存储（模块 03 §5）。
-//! - LogStore：raft-log / raft-meta 列族（经 RocksStore::raw）
+//! - LogStore：raft-log / raft-meta 表（经 RedbStorage::raw_db）
 #![allow(clippy::result_large_err, clippy::type_complexity)] // openraft StorageError/RPCError 的 Err 变体较大（上游类型）
 
 use std::io::Cursor;
@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use dsh_core::error::Error as DshError;
 use dsh_core::model::PublishEvent;
 use dsh_core::StateMachine;
+use dsh_storage::{TBL_RAFT_LOG, TBL_RAFT_META, TBL_SNAPSHOTS};
 use openraft::storage::{
     LogState, RaftLogReader, RaftLogStorage, RaftSnapshotBuilder, RaftStateMachine,
 };
@@ -15,6 +16,7 @@ use openraft::{
     Entry, EntryPayload, ErrorSubject, ErrorVerb, LeaderId, LogId, OptionalSend, Snapshot,
     SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
 };
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{NodeId, NodeInfo, TypeConfig};
@@ -24,53 +26,63 @@ type ErrOf = StorageError<NodeId>;
 pub type EntryOf = Entry<TypeConfig>;
 pub type LogIdOf = LogId<NodeId>;
 
-// 公共存储句柄：共享 rocksdb（dsh-storage::RocksStore::raw）
-pub type DbHandle = std::sync::Arc<rocksdb::DBWithThreadMode<rocksdb::SingleThreaded>>;
+// 公共存储句柄：共享 redb（dsh_storage::RedbStorage::raw_db）
+pub type DbHandle = std::sync::Arc<redb::Database>;
 
-// ---------------- meta 键（raft-meta 列族） ----------------
+// ---------------- meta 键（raft-meta 表） ----------------
 
 const META_VOTE: &[u8] = b"vote";
 const META_LAST_PURGED: &[u8] = b"last_purged";
 const META_LAST_APPLIED: &[u8] = b"last_applied";
 const META_MEMBERSHIP: &[u8] = b"membership";
 
-// ---------------- 快照持久化（snapshots 列族；B5） ----------------
+// ---------------- 快照持久化（snapshots 表；B5） ----------------
 
 const SNAP_META_KEY: &[u8] = b"meta";
 const SNAP_DATA_KEY: &[u8] = b"data";
-
-fn snap_cf_of(db: &DbHandle) -> Result<rocksdb::ColumnFamilyRef<'_>, ErrOf> {
-    db.cf_handle("snapshots")
-        .ok_or_else(|| io_err(ErrorSubject::Store, ErrorVerb::Read, "missing snapshots cf"))
-}
 
 fn persist_snapshot(
     db: &DbHandle,
     meta: &SnapshotMeta<NodeId, NodeInfo>,
     data: &[u8],
 ) -> Result<(), ErrOf> {
-    let cf = snap_cf_of(db)?;
-    db.put_cf(&cf, SNAP_META_KEY, ser(meta)?)
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e.to_string()))?;
-    db.put_cf(&cf, SNAP_DATA_KEY, data)
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e.to_string()))?;
-    db.flush_cf(&cf)
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e.to_string()))?;
-    Ok(())
+    let meta_raw = ser(meta)?;
+    // meta+data 同一事务原子提交（Durability 默认 Immediate：commit 返回即已 fsync）
+    let txn = db
+        .begin_write()
+        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+    {
+        let mut table = txn
+            .open_table(TBL_SNAPSHOTS)
+            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+        table
+            .insert(SNAP_META_KEY, meta_raw.as_slice())
+            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+        table
+            .insert(SNAP_DATA_KEY, data)
+            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+    }
+    txn.commit()
+        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))
 }
 
 fn load_persisted_snapshot(
     db: &DbHandle,
 ) -> Result<Option<(SnapshotMeta<NodeId, NodeInfo>, Vec<u8>)>, ErrOf> {
-    let cf = snap_cf_of(db)?;
-    let meta_raw = db
-        .get_cf(&cf, SNAP_META_KEY)
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e.to_string()))?;
-    let data = db
-        .get_cf(&cf, SNAP_DATA_KEY)
-        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e.to_string()))?;
+    let txn = db
+        .begin_read()
+        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+    let table = txn
+        .open_table(TBL_SNAPSHOTS)
+        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+    let meta_raw = table
+        .get(SNAP_META_KEY)
+        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+    let data = table
+        .get(SNAP_DATA_KEY)
+        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
     match (meta_raw, data) {
-        (Some(m), Some(d)) => Ok(Some((de(&m)?, d))),
+        (Some(m), Some(d)) => Ok(Some((de(m.value())?, d.value().to_vec()))),
         _ => Ok(None),
     }
 }
@@ -109,39 +121,118 @@ fn storage_err(e: DshError) -> ErrOf {
     io_err(ErrorSubject::Store, ErrorVerb::Write, e.to_string())
 }
 
-fn log_cf_of(db: &DbHandle) -> Result<rocksdb::ColumnFamilyRef<'_>, ErrOf> {
-    db.cf_handle("raft-log")
-        .ok_or_else(|| io_err(ErrorSubject::Logs, ErrorVerb::Read, "missing raft-log cf"))
+// ---------------- raft-meta 表读写（LogStore / StateMachineStore 共用） ----------------
+
+fn meta_get(db: &DbHandle, key: &[u8]) -> Result<Option<Vec<u8>>, ErrOf> {
+    let txn = db
+        .begin_read()
+        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+    let table = txn
+        .open_table(TBL_RAFT_META)
+        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+    match table
+        .get(key)
+        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?
+    {
+        Some(guard) => Ok(Some(guard.value().to_vec())),
+        None => Ok(None),
+    }
 }
 
-fn meta_cf_of(db: &DbHandle) -> Result<rocksdb::ColumnFamilyRef<'_>, ErrOf> {
-    db.cf_handle("raft-meta")
-        .ok_or_else(|| io_err(ErrorSubject::Store, ErrorVerb::Read, "missing raft-meta cf"))
+/// 写 raft-meta 单键（单事务提交；Durability 默认 Immediate，commit 即 fsync）。
+fn meta_put(db: &DbHandle, key: &[u8], value: &[u8]) -> Result<(), ErrOf> {
+    let txn = db
+        .begin_write()
+        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+    let mut table = txn
+        .open_table(TBL_RAFT_META)
+        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+    table
+        .insert(key, value)
+        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+    drop(table); // 表句柄先于 commit 释放（commit 消费事务）
+    txn.commit()
+        .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))
 }
 
-/// 共享的日志读取逻辑（LogReader 与 LogStore 复用）。
+/// 共享的日志读取逻辑（LogReader 与 LogStore 复用）：[start, end] 闭区间。
 fn read_entries(db: &DbHandle, start: u64, end: u64) -> Result<Vec<EntryOf>, ErrOf> {
-    let cf = log_cf_of(db)?;
-    let mut iter = db.raw_iterator_cf(&cf);
-    iter.seek(log_key(start));
+    let txn = db
+        .begin_read()
+        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+    let table = txn
+        .open_table(TBL_RAFT_LOG)
+        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+    let start_key = log_key(start);
     let mut out = Vec::new();
-    while iter.valid() {
-        let k = iter.key().map(log_index_from_key).unwrap_or(0);
-        if k > end {
+    for row in table
+        .range(start_key.as_slice()..)
+        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?
+    {
+        let (k, v) = row.map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+        if log_index_from_key(k.value()) > end {
             break;
         }
-        let v = iter
-            .value()
-            .ok_or_else(|| io_err(ErrorSubject::LogIndex(k), ErrorVerb::Read, "nil value"))?;
-        out.push(de(v)?);
-        iter.next();
+        out.push(de(v.value())?);
     }
     Ok(out)
 }
 
+/// 最后一条日志（升序表尾部）。空表返回 None。
+fn last_log_entry(db: &DbHandle) -> Result<Option<EntryOf>, ErrOf> {
+    let txn = db
+        .begin_read()
+        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+    let table = txn
+        .open_table(TBL_RAFT_LOG)
+        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+    // 先绑定局部再匹配：避免尾表达式的 AccessGuard 临时值活得比 table 久
+    let last = table
+        .last()
+        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Read, e))?;
+    match last {
+        Some((_, v)) => Ok(Some(de(v.value())?)),
+        None => Ok(None),
+    }
+}
+
+/// 在写事务内收集 range 命中的日志索引（BE u64 key → u64）。
+/// 表句柄随本函数结束 drop——之后可在同一事务重新 open_table 执行删除
+/// （同一事务内同名表二次 open_table 会报 TableAlreadyOpen，设计 §3.1）。
+fn collect_log_indexes<'k, R>(txn: &redb::WriteTransaction, range: R) -> Result<Vec<u64>, ErrOf>
+where
+    R: std::ops::RangeBounds<&'k [u8]> + 'k,
+{
+    let table = txn
+        .open_table(TBL_RAFT_LOG)
+        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+    let mut out = Vec::new();
+    for row in table
+        .range(range)
+        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?
+    {
+        let (k, _) = row.map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+        out.push(log_index_from_key(k.value()));
+    }
+    Ok(out)
+}
+
+/// 在写事务内逐条删除日志（调用前须已 drop 收集阶段的表句柄，见 collect_log_indexes）。
+fn remove_log_indexes(txn: &redb::WriteTransaction, indexes: Vec<u64>) -> Result<(), ErrOf> {
+    let mut table = txn
+        .open_table(TBL_RAFT_LOG)
+        .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+    for idx in indexes {
+        table
+            .remove(log_key(idx).as_slice())
+            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+    }
+    Ok(())
+}
+
 // ---------------- LogStore ----------------
 
-/// Raft 日志存储（raft-log 列族：key = 8B BE index）。
+/// Raft 日志存储（raft-log 表：key = 8B BE index）。
 pub struct LogStore {
     db: DbHandle,
 }
@@ -149,20 +240,6 @@ pub struct LogStore {
 impl LogStore {
     pub fn new(db: DbHandle) -> Self {
         Self { db }
-    }
-
-    fn get_meta(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ErrOf> {
-        let cf = meta_cf_of(&self.db)?;
-        self.db
-            .get_cf(&cf, key)
-            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e.to_string()))
-    }
-
-    fn put_meta(&self, key: &[u8], value: &[u8]) -> Result<(), ErrOf> {
-        let cf = meta_cf_of(&self.db)?;
-        self.db
-            .put_cf(&cf, key, value)
-            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e.to_string()))
     }
 }
 
@@ -219,16 +296,14 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     type LogReader = LogReader;
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, ErrOf> {
-        let last_purged = self
-            .get_meta(META_LAST_PURGED)?
+        let last_purged = meta_get(&self.db, META_LAST_PURGED)?
             .map(|raw| de::<u64>(&raw))
             .transpose()?
             .map(|idx| LogId {
                 leader_id: LeaderId::new(0, NodeId::MAX),
                 index: idx,
             });
-        let entries = read_entries(&self.db, 0, u64::MAX)?;
-        let last_log = entries.last().map(|e| e.log_id);
+        let last_log = last_log_entry(&self.db)?.map(|e| e.log_id);
         Ok(LogState {
             last_purged_log_id: last_purged,
             last_log_id: last_log,
@@ -241,11 +316,13 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), ErrOf> {
         let raw = ser(vote)?;
-        self.put_meta(META_VOTE, &raw)
+        meta_put(&self.db, META_VOTE, &raw)
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, ErrOf> {
-        self.get_meta(META_VOTE)?.map(|raw| de(&raw)).transpose()
+        meta_get(&self.db, META_VOTE)?
+            .map(|raw| de(&raw))
+            .transpose()
     }
 
     async fn append<I>(
@@ -257,53 +334,60 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         I: IntoIterator<Item = EntryOf> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let cf = log_cf_of(&self.db)?;
-        let mut batch = rocksdb::WriteBatch::default();
-        for e in entries {
-            let raw = ser(&e)?;
-            batch.put_cf(&cf, log_key(e.log_id.index), raw);
+        // 单写事务批量 insert 后一次 commit：等价原 WriteBatch+flush_wal(true)
+        // （WriteTransaction 默认 Durability::Immediate，commit 返回即已 fsync）
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+        {
+            let mut table = txn
+                .open_table(TBL_RAFT_LOG)
+                .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+            for e in entries {
+                let raw = ser(&e)?;
+                table
+                    .insert(log_key(e.log_id.index).as_slice(), raw.as_slice())
+                    .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+            }
         }
-        self.db
-            .write(batch)
-            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e.to_string()))?;
-        self.db
-            .flush_wal(true)
-            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e.to_string()))?;
+        txn.commit()
+            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
         callback.log_io_completed(Ok(()));
         Ok(())
     }
 
     async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), ErrOf> {
-        let cf = log_cf_of(&self.db)?;
-        let mut iter = self.db.raw_iterator_cf(&cf);
-        iter.seek(log_key(log_id.index));
-        let mut batch = rocksdb::WriteBatch::default();
-        while iter.valid() {
-            let k = iter.key().map(|k| k.to_vec()).unwrap_or_default();
-            batch.delete_cf(&cf, k);
-            iter.next();
-        }
-        self.db
-            .write(batch)
-            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e.to_string()))
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+        let from = log_key(log_id.index);
+        let indexes = collect_log_indexes(&txn, from.as_slice()..)?;
+        remove_log_indexes(&txn, indexes)?;
+        txn.commit()
+            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), ErrOf> {
-        let cf = log_cf_of(&self.db)?;
-        let mut iter = self.db.raw_iterator_cf(&cf);
-        iter.seek_to_first();
-        let mut batch = rocksdb::WriteBatch::default();
-        while iter.valid() {
-            let k = iter.key().map(|k| k.to_vec()).unwrap_or_default();
-            if log_index_from_key(&k) <= log_id.index {
-                batch.delete_cf(&cf, k);
-            }
-            iter.next();
-        }
-        self.db
-            .write(batch)
-            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e.to_string()))?;
-        self.put_meta(META_LAST_PURGED, &ser(&log_id.index)?)
+        // BE 定宽 key：..=idx 的字典序范围恰为索引 <= idx 的全部日志
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))?;
+        let upto = log_key(log_id.index);
+        let indexes = collect_log_indexes(&txn, ..=upto.as_slice())?;
+        remove_log_indexes(&txn, indexes)?;
+        // 日志清理与 last_purged 同一事务原子提交（redb 多表事务原生支持）
+        let mut meta_table = txn
+            .open_table(TBL_RAFT_META)
+            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+        meta_table
+            .insert(META_LAST_PURGED, ser(&log_id.index)?.as_slice())
+            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e))?;
+        drop(meta_table); // 表句柄先于 commit 释放（commit 消费事务）
+        txn.commit()
+            .map_err(|e| io_err(ErrorSubject::Logs, ErrorVerb::Write, e))
     }
 }
 
@@ -337,39 +421,52 @@ impl StateMachineStore {
         self.events.subscribe()
     }
 
-    fn get_meta(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ErrOf> {
-        let cf = meta_cf_of(&self.db)?;
-        self.db
-            .get_cf(&cf, key)
-            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e.to_string()))
+    /// 重启恢复判断（dsh-cli）：raft-meta 表非空即存在已落盘的 Raft 状态
+    /// （vote / last_applied / last_purged / membership 任一存在即 true）。
+    pub fn has_persisted_state(&self) -> bool {
+        match self.raft_meta_is_empty() {
+            Ok(empty) => !empty,
+            Err(e) => {
+                // 读失败按「无持久化状态」处理并告警——该方法仅用于重启恢复判断
+                tracing::warn!("has_persisted_state: {e}");
+                false
+            }
+        }
     }
 
-    fn put_meta(&self, key: &[u8], value: &[u8]) -> Result<(), ErrOf> {
-        let cf = meta_cf_of(&self.db)?;
-        self.db
-            .put_cf(&cf, key, value)
-            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Write, e.to_string()))
+    fn raft_meta_is_empty(&self) -> Result<bool, ErrOf> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+        let table = txn
+            .open_table(TBL_RAFT_META)
+            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))?;
+        table
+            .is_empty()
+            .map_err(|e| io_err(ErrorSubject::Store, ErrorVerb::Read, e))
     }
 
     fn read_last_applied(&self) -> Result<Option<LogIdOf>, ErrOf> {
-        self.get_meta(META_LAST_APPLIED)?
+        meta_get(&self.db, META_LAST_APPLIED)?
             .map(|raw| de(&raw))
             .transpose()
     }
 
     fn write_last_applied(&self, id: &LogIdOf) -> Result<(), ErrOf> {
-        self.put_meta(META_LAST_APPLIED, &ser(id)?)
+        // 每条独立事务（设计 §8.7：重启重放边界语义优先，不合并为批末单写）
+        meta_put(&self.db, META_LAST_APPLIED, &ser(id)?)
     }
 
     fn read_membership(&self) -> Result<StoredMembership<NodeId, NodeInfo>, ErrOf> {
-        match self.get_meta(META_MEMBERSHIP)? {
+        match meta_get(&self.db, META_MEMBERSHIP)? {
             Some(raw) => de(&raw),
             None => Ok(StoredMembership::default()),
         }
     }
 
     fn write_membership(&self, m: &StoredMembership<NodeId, NodeInfo>) -> Result<(), ErrOf> {
-        self.put_meta(META_MEMBERSHIP, &ser(m)?)
+        meta_put(&self.db, META_MEMBERSHIP, &ser(m)?)
     }
 }
 
@@ -523,5 +620,168 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             })),
             None => Ok(None),
         }
+    }
+}
+
+// ---------------- 内嵌单测（设计 §6 N4a：范围翻译+多表事务最易错路径） ----------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dsh_storage::RedbStorage;
+    use openraft::storage::RaftLogStorageExt;
+
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("dsh-raft-store-{tag}-{}-{n}", std::process::id()))
+    }
+
+    fn open_storage(dir: &std::path::Path) -> RedbStorage {
+        RedbStorage::open(&dir.display().to_string()).unwrap()
+    }
+
+    fn blank(index: u64) -> EntryOf {
+        Entry {
+            log_id: LogId {
+                leader_id: LeaderId::new(1, 1),
+                index,
+            },
+            payload: EntryPayload::Blank,
+        }
+    }
+
+    fn truncate_at(index: u64) -> LogId<NodeId> {
+        LogId {
+            leader_id: LeaderId::new(1, 1),
+            index,
+        }
+    }
+
+    /// (last_purged, last_log) 索引对。
+    async fn log_state_of(store: &mut LogStore) -> (Option<u64>, Option<u64>) {
+        let st = store.get_log_state().await.unwrap();
+        (
+            st.last_purged_log_id.map(|l| l.index),
+            st.last_log_id.map(|l| l.index),
+        )
+    }
+
+    async fn indexes_of(store: &mut LogStore, range: std::ops::RangeInclusive<u64>) -> Vec<u64> {
+        store
+            .try_get_log_entries(range)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.log_id.index)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn append_truncate_get_log_state_consistent() {
+        let dir = tmpdir("trunc");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let mut store = LogStore::new(storage.raw_db());
+
+        store
+            .blocking_append([blank(1), blank(2), blank(3)])
+            .await
+            .unwrap();
+        assert_eq!(log_state_of(&mut store).await, (None, Some(3)));
+        assert_eq!(indexes_of(&mut store, 1..=3).await, vec![1, 2, 3]);
+
+        // 截断 index >= 2
+        store.truncate(truncate_at(2)).await.unwrap();
+        assert_eq!(log_state_of(&mut store).await, (None, Some(1)));
+        assert_eq!(indexes_of(&mut store, 1..=3).await, vec![1]);
+
+        // 截到头：last_log_id 变 None
+        store.truncate(truncate_at(1)).await.unwrap();
+        assert_eq!(log_state_of(&mut store).await, (None, None));
+        assert!(indexes_of(&mut store, 1..=3).await.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn purge_updates_last_purged_and_clears_prefix() {
+        let dir = tmpdir("purge");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let mut store = LogStore::new(storage.raw_db());
+
+        store.blocking_append((1..=5).map(blank)).await.unwrap();
+        store.purge(truncate_at(3)).await.unwrap();
+
+        // last_purged=3；日志仅剩 4、5
+        assert_eq!(log_state_of(&mut store).await, (Some(3), Some(5)));
+        assert_eq!(indexes_of(&mut store, 1..=u64::MAX).await, vec![4, 5]);
+
+        // 重复 purge（空 range）幂等
+        store.purge(truncate_at(3)).await.unwrap();
+        assert_eq!(log_state_of(&mut store).await, (Some(3), Some(5)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn snapshot_persist_load_roundtrip() {
+        let dir = tmpdir("snap");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+
+        // 安装快照（install_snapshot 内部落盘到 snapshots 表）
+        let data = serde_json::to_vec(&vec![(b"k".to_vec(), b"v".to_vec())]).unwrap();
+        let meta = SnapshotMeta {
+            last_log_id: Some(LogId {
+                leader_id: LeaderId::new(1, 1),
+                index: 5,
+            }),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "5-2".to_string(),
+        };
+        {
+            let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage.clone()))));
+            let mut store = StateMachineStore::new(sm, storage.raw_db());
+            store
+                .install_snapshot(&meta, Box::new(Cursor::new(data.clone())))
+                .await
+                .unwrap();
+        }
+
+        // 「重启」：全新 StateMachineStore（内存快照为空）→ 从盘恢复
+        let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut revived = StateMachineStore::new(sm, storage.raw_db());
+        let snap = revived
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("snapshot should persist (B5)");
+        assert_eq!(snap.meta.snapshot_id, meta.snapshot_id);
+        assert_eq!(snap.meta.last_log_id, meta.last_log_id);
+        assert_eq!(snap.snapshot.into_inner(), data);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn has_persisted_state_tracks_raft_meta() {
+        let dir = tmpdir("meta");
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = open_storage(&dir);
+        let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage.clone()))));
+        let mut store = StateMachineStore::new(sm, storage.raw_db());
+
+        assert!(
+            !store.has_persisted_state(),
+            "fresh store: no persisted state"
+        );
+        // apply 一条空白日志 → last_applied 落盘（per-entry 独立事务）
+        store.apply([blank(1)]).await.unwrap();
+        assert!(store.has_persisted_state());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

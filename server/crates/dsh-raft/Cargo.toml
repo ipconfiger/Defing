@@ -9,7 +9,8 @@ description = "Defing config service - openraft integration (module 03)"
 dsh-core = { path = "../dsh-core" }
 dsh-storage = { path = "../dsh-storage" }
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
-rocksdb = { package = "rust-rocksdb", version = "0.23" }
+# 表类型/事务操作需直接 use redb（Database/WriteTransaction/ReadableTable 等）
+redb = "4.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

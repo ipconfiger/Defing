@@ -38,9 +38,9 @@ fn seed_sm(sm: &Mutex<StateMachine>) {
                 },
             ],
             deletes: vec![],
-        
-                    operator: String::new(),
-                },
+
+            operator: String::new(),
+        },
         6,
     )
     .unwrap();
@@ -50,7 +50,7 @@ fn seed_sm(sm: &Mutex<StateMachine>) {
             branch: BranchName("dev".into()),
             comment: "v3".into(),
             request_id: "r2".into(),
-        
+
             operator: String::new(),
         },
         7,

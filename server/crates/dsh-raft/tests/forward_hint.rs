@@ -5,7 +5,7 @@ use std::time::Duration;
 use dsh_core::command::Command;
 use dsh_core::StateMachine;
 use dsh_raft::*;
-use dsh_storage::{OpenOptions, RocksStore};
+use dsh_storage::RedbStorage;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn learner_forward_hint() {
@@ -15,13 +15,9 @@ async fn learner_forward_hint() {
     let dir2 = std::env::temp_dir().join("dsh-fwd-hint2");
     let _ = std::fs::remove_dir_all(&dir2);
 
-    let rocks = RocksStore::open(&OpenOptions {
-        dir: dir.display().to_string(),
-        max_open_files: 64,
-    })
-    .unwrap();
-    let db = rocks.raw();
-    let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(rocks))));
+    let storage = RedbStorage::open(&dir.display().to_string()).unwrap();
+    let db = storage.raw_db();
+    let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage))));
     let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone()));
     let log_store = LogStore::new(db.clone());
     let n1 = NodeInfo {
@@ -38,13 +34,9 @@ async fn learner_forward_hint() {
         .await
         .is_some());
 
-    let rocks2 = RocksStore::open(&OpenOptions {
-        dir: dir2.display().to_string(),
-        max_open_files: 64,
-    })
-    .unwrap();
-    let db2 = rocks2.raw();
-    let sm2 = Arc::new(Mutex::new(StateMachine::new(Box::new(rocks2))));
+    let storage2 = RedbStorage::open(&dir2.display().to_string()).unwrap();
+    let db2 = storage2.raw_db();
+    let sm2 = Arc::new(Mutex::new(StateMachine::new(Box::new(storage2))));
     let sm_store2 = Arc::new(StateMachineStore::new(sm2.clone(), db2.clone()));
     let log_store2 = LogStore::new(db2.clone());
     let n2 = NodeInfo {
@@ -60,9 +52,14 @@ async fn learner_forward_hint() {
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     // learner 上 client_write → ForwardToLeader 且携带 leader 的 http_addr（login 转发依赖此契约）
-    let r = try_client_write(&raft2, Command::ProjectCreate { name: "x".into() 
-                operator: String::new(),
-            }).await;
+    let r = try_client_write(
+        &raft2,
+        Command::ProjectCreate {
+            name: "x".into(),
+            operator: String::new(),
+        },
+    )
+    .await;
     match r {
         Err(WriteError::ForwardToLeader {
             leader_id: Some(1),

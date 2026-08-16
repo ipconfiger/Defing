@@ -111,7 +111,7 @@ impl PublishService {
         branch: &BranchName,
         mut updates: Vec<DraftUpdateItem>,
         deletes: Vec<(String, String)>,
-        operator: &str,
+        _operator: &str,
     ) -> Result<(), Error> {
         self.encrypt_secret_updates(project, &mut updates)?;
         self.write(
@@ -120,7 +120,7 @@ impl PublishService {
                 branch: branch.clone(),
                 updates,
                 deletes,
-            
+
                 operator: "test".to_string(),
             },
             now_ms(),
@@ -136,7 +136,7 @@ impl PublishService {
         branch: &BranchName,
         comment: &str,
         request_id: &str,
-        operator: &str,
+        _operator: &str,
     ) -> Result<PublishOutcome, Error> {
         let wr = self
             .write(
@@ -145,7 +145,7 @@ impl PublishService {
                     branch: branch.clone(),
                     comment: comment.to_string(),
                     request_id: request_id.to_string(),
-                
+
                     operator: "test".to_string(),
                 },
                 now_ms(),
@@ -175,7 +175,7 @@ impl PublishService {
         to_version: u64,
         comment: &str,
         request_id: &str,
-        operator: &str,
+        _operator: &str,
     ) -> Result<u64, Error> {
         let wr = self
             .write(
@@ -185,7 +185,7 @@ impl PublishService {
                     to_version,
                     comment: comment.to_string(),
                     request_id: request_id.to_string(),
-                
+
                     operator: "test".to_string(),
                 },
                 now_ms(),
@@ -207,7 +207,7 @@ impl PublishService {
         project: &ProjectId,
         comment: &str,
         request_id: &str,
-        operator: &str,
+        _operator: &str,
     ) -> Result<StructurePublishOutcome, Error> {
         let wr = self
             .write(
@@ -215,7 +215,7 @@ impl PublishService {
                     project: project.clone(),
                     comment: comment.to_string(),
                     request_id: request_id.to_string(),
-                
+
                     operator: "test".to_string(),
                 },
                 now_ms(),
@@ -239,11 +239,14 @@ mod tests {
 
     fn sm_with_structure() -> Arc<Mutex<StateMachine>> {
         let mut sm = StateMachine::new(Box::new(InMemoryStore::new()));
-        sm.apply(&Command::ProjectCreate {
-                    name: "p".into(),
-                    operator: "test".to_string(),
-                }, 1)
-            .unwrap();
+        sm.apply(
+            &Command::ProjectCreate {
+                name: "p".into(),
+                operator: "test".to_string(),
+            },
+            1,
+        )
+        .unwrap();
         sm.apply(
             &Command::StructureDraftSet {
                 project: "p".into(),
@@ -267,9 +270,9 @@ mod tests {
                         },
                     ],
                 }],
-            
-                            operator: "test".to_string(),
-                        },
+
+                operator: "test".to_string(),
+            },
             2,
         )
         .unwrap();
