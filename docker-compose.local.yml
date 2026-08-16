@@ -34,7 +34,7 @@ services:
       CARGO_HOME: /cargo-home
       RUSTUP_HOME: /cargo-home/rustup
       CARGO_TARGET_DIR: /src/server/target
-      # GCC 与 RocksDB 9.x 的 uint64_t 兼容问题，注入 <cstdint>（同 scripts/build-env.sh）
+      # 纯 Rust 存储（redb）后无需 C++ 工具链；clang/libclang 仅构建脚本遗留可再精简
       CXXFLAGS: "-include cstdint"
     volumes:
       - ./server:/src/server          # 源码（Cargo 需可写 Cargo.lock）

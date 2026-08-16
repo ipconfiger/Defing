@@ -1,5 +1,5 @@
 //! Defing 配置服务 —— openraft 集成（模块 03）。
-//! 本版：进程内直连网络（测试/联调）；存储基于 dsh-storage RocksDB。
+//! 本版：进程内直连网络（测试/联调）；存储基于 dsh-storage redb。
 
 pub mod http_network;
 pub mod network;

@@ -8,7 +8,7 @@ use crate::error::{Error, ErrorKind};
 /// 前缀扫描结果：(key, value) 列表。
 pub type KeyValuePairs = Vec<(Vec<u8>, Vec<u8>)>;
 
-/// 应用层 KV 存储接口（RocksDB 由 dsh-storage 实现；单命名空间）。
+/// 应用层 KV 存储接口（redb 由 dsh-storage 实现；单命名空间）。
 pub trait Store: Send + Sync {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error>;
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), Error>;
