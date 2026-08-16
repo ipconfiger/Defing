@@ -118,7 +118,9 @@
   ③ gray_seq = gray_seq + 1（分支级独立灰度序号，不与 active_version 冲突）
   ④ 灰度快照存 gray-snap/{pid}/{branch}/{gray_seq}（复用方案② diff/checkpoint 逻辑）
   ⑤ 写 BranchState：gray_seq=新值, gray_rule=规则, 清空草稿
-  ⑥ 发事件 { gray_seq:1, ty:gray_publish }
+  ⑥ 发事件 { version:active_version, ty:ValuePublish, gray:true, gray_seq:1 }
+     ← 复用既有 EventType（ValuePublish），加 gray:bool 字段（serde default）——
+        不新增枚举值（否则新节点写的灰度 VersionRecord 进快照后旧节点装快照反序列化失败，Q3）
 
 结果：
   - 稳定版（5）原封不动，普通客户端照常用
@@ -135,8 +137,9 @@
   ① 校验 gray_seq > 0（没有灰度就报错）
   ② 读取灰度快照内容 → 写入新的 active_version（active = max+1，走方案② write_version_snapshot）
   ③ gray_seq = 0, gray_rule = None（清掉灰度）
-  ④ 发事件 { version:新active, ty:gray_promote, gray:true }
-     ← gray:true 标记是给"原来在灰度里"的客户端：它们收到后知道要重拉
+  ④ 发事件 { version:新active, ty:ValuePublish, gray:true, gray_seq:0 }
+     ← gray:true 标记 + 携带新 active 版本号：灰度客户端收到后无条件重拉（Q4 修订：
+        该事件永不被 version>last 过滤，且 abort 也必须带回落版本号）
 
 结果：
   - 所有客户端现在都读到新稳定版 6
@@ -151,7 +154,8 @@
 
 服务器 apply_gray_abort 做的事：
   ① gray_seq = 0, gray_rule = None
-  ② 发事件 { ty:gray_abort }
+  ② 发事件 { version:active_version, ty:ValuePublish, gray:true, gray_seq:0 }
+     ← 必须携带回落版本号（active_version）：灰度客户端据此重拉稳定版（Q4 修订）
 
 结果：
   - 所有客户端（含灰度客户端）回落到稳定版 5
@@ -210,6 +214,64 @@ gRPC：  GetConfigRequest { project, branch, instance_id, labels }
 
 ---
 
+## 5.5 watch 语义（Q4 审核修订——重点）
+
+**现状问题**：现有 watch 按 `e.version > last` 去重（SSE 与 gRPC 同），灰度事件若只加 gray 标记，
+`promote/abort` 事件会被该过滤直接滤掉——gray 标记根本没机会被读到，正是 D22 要防的"灰→全量漏收"。
+
+**修订后的 watch 契约（二选一，推荐 a）**：
+
+```
+方案 a（服务端按身份投递，推荐）：
+  watch 连接注册 instance_id/labels（WatchRequest 加字段）
+  服务端按该客户端的 resolve 结果决定是否投递事件
+    - 灰度客户端：只收 gray:true 事件 + promote 补发事件
+    - 稳定客户端：只收 gray:false 事件
+  对 after_version 重放同样生效（重放基于 version_history，按 resolve 过滤）
+
+方案 b（客户端契约，实现简单但语义靠 SDK 保证）：
+  gray 标记事件永不按版本过滤、无条件重拉
+  SDK 缓存版本只取自快照响应（不取事件版本）
+  abort/promote 必须携带回落/新版本号
+```
+
+**事件字段（Q3 修订）**：
+```
+PublishEvent / VersionRecord：加 #[serde(default)] gray: bool
+  - 灰度事件 gray=true（复用既有 EventType，如 ValuePublish）
+  - 不新增 EventType 枚举值（否则新节点写灰度 VersionRecord 进快照，
+    旧节点装快照反序列化失败——快照传输面的兼容破口）
+WatchEvent（proto）：加 bool gray = 8（向后兼容）
+```
+
+**SDK 契约（配合方案 b 兜底）**：
+```
+- watch 回调收到 gray:true 事件 → 无条件重拉全量（无论版本号）
+- 缓存版本号只从 snapshot 响应更新（不信任事件版本）
+- abort 事件携带回落版本号 → SDK 据此重拉稳定版
+```
+
+## 5.6 数据面调用点（Q6 审核明确）
+
+**需传 client_ctx 做灰度解析（仅 3 处）**：
+```
+1. HTTP snapshot    GET /v1/projects/{p}/branches/{b}/snapshot   （lib.rs:1790 附近）
+2. gRPC get_config  GetConfigRequest                             （grpc.rs:142）
+3. gRPC get_item    GetItemRequest                                （grpc.rs:161，必须同样 resolve！）
+```
+
+**明确绕过灰度解析（管理面/历史）**：
+```
+- render/reveal（lib.rs:1925）：version=0 解析稳定 active（管理员看稳定客户端所见）；
+  要看灰度明文须显式传灰度版本号（灰度记录在版本历史中）
+- branch_diff/compare：按显式版本对比，不涉及灰度解析
+- testkit/jobs 内部调用：绕过（内部确定性路径）
+```
+
+**响应补充**：snapshot 响应加 `"gray": true/false` + `"resolved_version"`（客户端可见自己处于哪个版本）。
+
+---
+
 ## 6. 实现清单（代码要改哪些地方）
 
 | 层 | 文件 | 改什么 |
@@ -253,3 +315,16 @@ gRPC：  GetConfigRequest { project, branch, instance_id, labels }
 - 自动回滚决策（只留 `dsh_gray_active` 指标 + 钩子）；
 - 多级灰度（A/B/C，双版本封顶）；
 - K8s 原生灰度（上层平台对接，本设计提供数据面能力）。
+
+---
+
+## 附录二：高精度审核修订记录（2025-08-16，子代理 Q1-Q6）
+
+| # | 审核问题 | 严重度 | 处理 |
+|---|---------|--------|------|
+| Q1 | **版本号冲突**：gray=active+1 与普通发布共用单调基底 → 双指针同号、快照互相覆盖（含结构发布撞号） | 🔴 阻塞 | ✅ 修订：**独立灰度序号 gray_seq + 独立前缀 gray-snap/**；实现时用分支级单调分配器 `next = max(active, gray)+1`，结构发布灰度活跃时一次分配两个不同号；灰度命令补 I10 幂等（last_request_id） |
+| Q2 | **确定性两缺口**：无身份客户端未定义（空串哈希恒恒定）；求值顺序未固定 | 🟠 修订 | ✅ 补"**无身份永不进灰度**"（instance_id 空 → 直接 stable）；labels/IP/percent 按**固定次序**求值（labels → IP → percent），纯函数 |
+| Q3 | **新增 EventType 枚举值破坏快照兼容**：新节点写灰度 VersionRecord 进快照，旧节点装快照反序列化失败 | 🔴 阻塞 | ✅ 修订：灰度事件**复用既有 EventType**（ValuePublish），`PublishEvent`/`VersionRecord` 加 `#[serde(default)] gray: bool`；proto `WatchEvent` 加 `bool gray=8`（向后兼容） |
+| Q4 | **watch 漏收**：现有 `version > last` 过滤会滤掉 promote/abort 事件，gray 标记根本没机会被读；abort 连版本号都没带 | 🔴 阻塞 | ✅ 修订（§5.5）：推荐方案 a（watch 连接注册身份、服务端按 resolve 投递）；方案 b 兜底（gray 事件永不按版本过滤 + SDK 缓存版本只取快照响应 + abort 携带回落版本号） |
+| Q5 | **prune 裁掉灰度快照**：prune_versions 只保 `no==active_version`，灰度期间普通发布会把 gray 指向的快照裁掉 → 灰度客户端 NotFound | 🟠 修订 | ✅ 修订：保留条件加 `\|\| no == gray_version`（Abort 后历史可查同样依赖） |
+| Q6 | **数据面调用点未明确**：get_item 走同一解析必须 resolve；reveal/对比应绕过 | 🟡 修订 | ✅ 明确（§5.6）：仅 HTTP snapshot / gRPC get_config / gRPC get_item 三处传身份；render/reveal/branch_diff 绕过；snapshot 响应加 `gray`/`resolved_version` 字段 |
