@@ -1,7 +1,7 @@
-// Defing ConfigClient — TypeScript SDK（浏览器/Node）。
-// 端点池 failover：连接失败自动切换下一个端点（指数退避）。
-// 数据面双通道：端点可带 grpc 地址（design §3.1 Endpoint{grpc?,http?}）→ 走 gRPC（:8383）；
-// 纯字符串端点 → HTTP/SSE（降级通道）。两通道 API 形状一致。
+// Defing ConfigClient — TypeScript SDK。
+// 运行时说明（F-SDK 修正）：gRPC 通道依赖 @grpc/grpc-js + proto-loader（fs/http2）→ **Node-only**；
+// 浏览器环境仅 HTTP/SSE 通道可用（fetch/EventSource），且需 TS 感知 bundler 编译本入口（无 dist 产物）。
+// 端点池 failover：连接失败自动切换下一个端点（指数退避）；HTTP 4xx/5xx 视为确定性错误不切换端点。
 
 export interface Change {
   group: string;
@@ -58,10 +58,13 @@ export interface ConfigClientOptions {
 type GrpcClientLike = {
   getConfig(project: string, branch: string, version?: number): Promise<any>;
   getItem(project: string, branch: string, group: string, key: string, version?: number): Promise<unknown | undefined>;
-  listMembers(): Promise<any[]>;
+  listMembers(): Promise<Member[]>;
   watch(project: string, branch: string, listener: (e: any) => void, signal?: AbortSignal): void;
   close(): void;
 };
+
+/** 普通请求超时（F-SDK） */
+const REQUEST_TIMEOUT_MS = 10_000;
 
 export class ConfigClient {
   private endpoints: Endpoint[];
@@ -74,16 +77,23 @@ export class ConfigClient {
     this.token = opts?.token;
   }
 
-  /** 懒加载 gRPC 客户端：仅当端点带 grpc 地址时动态 import（HTTP-only/浏览器零依赖）。 */
+  /** 懒加载 gRPC 客户端：仅当端点带 grpc 地址时动态 import（HTTP-only/浏览器零依赖）。
+   *  F-SDK：import 失败（缺 @grpc/grpc-js 等）捕获后回落 HTTP 通道，不再产生未处理 rejection。 */
   private ensureGrpc(): Promise<GrpcClientLike | null> {
     if (this.grpc) return Promise.resolve(this.grpc);
     if (this.grpcReady) return this.grpcReady;
     const ep = this.endpoints[0];
     if (ep && typeof ep === 'object' && ep.grpc) {
-      this.grpcReady = import('./grpc.ts').then((m) => {
-        this.grpc = new m.GrpcConfigClient({ grpc: ep.grpc, token: this.token }) as GrpcClientLike;
-        return this.grpc;
-      });
+      this.grpcReady = import('./grpc.ts')
+        .then((m) => {
+          this.grpc = new m.GrpcConfigClient({ grpc: ep.grpc, token: this.token }) as GrpcClientLike;
+          return this.grpc;
+        })
+        .catch((e) => {
+          console.warn('gRPC 通道加载失败，回落 HTTP/SSE：', e?.message ?? e);
+          this.grpcReady = null; // 允许下次重试
+          return null;
+        });
     } else {
       this.grpcReady = Promise.resolve(null);
     }
@@ -108,9 +118,16 @@ export class ConfigClient {
       try {
         const headers: Record<string, string> = {};
         if (this.token) headers['Authorization'] = 'Bearer ' + this.token;
-        const r = await fetch(ep + path, { headers });
-        if (!r.ok) throw new ConfigError('HTTP_' + r.status, 'GET ' + path + ' -> ' + r.status);
-        return (await r.json()) as T;
+        // F-SDK：请求超时（默认 10s），挂死端点不再永久 pending
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+        try {
+          const r = await fetch(ep + path, { headers, signal: ctrl.signal });
+          if (!r.ok) throw new ConfigError('HTTP_' + r.status, 'GET ' + path + ' -> ' + r.status);
+          return (await r.json()) as T;
+        } finally {
+          clearTimeout(timer);
+        }
       } catch (e) {
         if (e instanceof ConfigError) throw e;
         await new Promise((res) => setTimeout(res, 200 * (i + 1)));
@@ -182,6 +199,9 @@ export class ConfigClient {
       } else {
         this.watchHttp(project, branch, listener, signal);
       }
+    }).catch(() => {
+      // ensureGrpc 已自捕获；此处兜底防未处理 rejection
+      this.watchHttp(project, branch, listener, signal);
     });
     return;
   }
@@ -201,7 +221,9 @@ export class ConfigClient {
       signal?.addEventListener('abort', onAbort);
       // 断线重连带 after_version 续传（design §6.2）
       const resume = lastVersion > 0 ? '?after_version=' + lastVersion : '';
-      fetch(this.httpEndpoint(this.endpoints[0]) + path + resume, { signal: ctrl.signal })
+      const headers: Record<string, string> = {};
+      if (this.token) headers['Authorization'] = 'Bearer ' + this.token;
+      fetch(this.httpEndpoint(this.endpoints[0]) + path + resume, { signal: ctrl.signal, headers })
         .then(async (r) => {
           if (!r.ok || !r.body) throw new ConfigError('HTTP_' + r.status, 'watch failed');
           const reader = r.body.getReader();
@@ -218,7 +240,8 @@ export class ConfigClient {
               if (line.startsWith('data:')) {
                 try {
                   const ev = JSON.parse(line.slice(5).trim()) as WatchEvent;
-                  if (ev.version > lastVersion) lastVersion = ev.version;
+                  if (ev.version <= lastVersion) continue; // F-SDK：重放/重连重复投递去重
+                  lastVersion = ev.version;
                   listener(ev);
                 } catch {
                   /* 忽略坏帧 */
@@ -238,6 +261,10 @@ export class ConfigClient {
   }
 
   close(): void {
-    this.ensureGrpc().then((g) => g?.close());
+    this.ensureGrpc()
+      .then((g) => g?.close())
+      .catch(() => {
+        /* close 失败忽略 */
+      });
   }
 }

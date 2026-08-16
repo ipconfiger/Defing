@@ -18,13 +18,15 @@ server/target/debug/dsh --dev-single --admin-password admin123 --http-addr 127.0
 ### 集群（3 节点）
 
 ```bash
-dsh --node-id 1 --bootstrap --http-addr 127.0.0.1:8384 --raft-addr 127.0.0.1:8385 --data-dir ./n1 --admin-password admin123
-dsh --node-id 2 --join http://127.0.0.1:8384 --http-addr 127.0.0.1:8386 --raft-addr 127.0.0.1:8387 --data-dir ./n2 --admin-password admin123
-dsh --node-id 3 --join http://127.0.0.1:8384 --http-addr 127.0.0.1:8388 --raft-addr 127.0.0.1:8389 --data-dir ./n3 --admin-password admin123
+dsh --node-id 1 --bootstrap --http-addr 127.0.0.1:8384 --raft-addr 127.0.0.1:8385 --data-dir ./n1 --admin-password admin123 --join-token demo --raft-token demo
+dsh --node-id 2 --join http://127.0.0.1:8384 --http-addr 127.0.0.1:8386 --raft-addr 127.0.0.1:8387 --data-dir ./n2 --admin-password admin123 --join-token demo --raft-token demo
+dsh --node-id 3 --join http://127.0.0.1:8384 --http-addr 127.0.0.1:8388 --raft-addr 127.0.0.1:8389 --data-dir ./n3 --admin-password admin123 --join-token demo --raft-token demo
 # 提升为 voter：
 # POST /api/v1/cluster/promote {"node_id": 2} / {"node_id": 3}（需管理员 Bearer）
 # 重启自动恢复：同 data-dir 直接启动（无需 --bootstrap/--join）
 ```
+> 安全（F3）：集群模式强制要求 `--join-token`（join 端点鉴权）与 `--raft-token`（raft RPC 鉴权），
+> 集群内所有节点须传相同值；生产环境请使用强随机值。
 
 ### SDK（TS / Go / Python）
 
@@ -45,7 +47,8 @@ gRPC 契约测试：`bash scripts/sdk-grpc-contract-test.sh`（依赖：npm inst
 - **集群**：Raft 强一致、join/promote、leader 击杀容错、节点重启自动恢复
 - **配置模型**：项目→分支→分组→item；结构强一致（仅值按分支）
 - **发布闭环**：草稿 → 版本（不可变）→ 发布 → 通知；回滚；共享配置项与级联
-- **安全**：secret 项 AES-256-GCM 信封加密（主密钥 env/文件）、单管理员会话、审计、CSP
+- **安全**：secret 项 AES-256-GCM 信封加密（主密钥 env/文件）、单管理员会话、审计、CSP、
+  join/raft 集群令牌（--join-token/--raft-token 集群模式强制）、HTTP 数据面令牌（--data-plane-token）
 - **多格式**：YAML / TOML / JSON 渲染
 - **可观测**：/healthz、/readyz、/metrics（Prometheus）、审计 API
 - **Admin UI**：内嵌 /admin（项目/配置/watch）

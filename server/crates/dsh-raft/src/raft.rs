@@ -86,13 +86,15 @@ pub async fn wait_until<F: Fn() -> bool>(cond: F, timeout: std::time::Duration) 
 }
 
 /// 客户端写（重试直至成功/超时）。
-/// 返回 `Ok(Ok(version))` = 已生效；`Ok(Err(e))` = 状态机 apply 拒绝（带 ErrorKind，可映射 HTTP/gRPC 错误码）；
+/// 返回 `Ok(Ok(ack))` = 已生效（ack 含版本号与本命令 apply 产出的事件，F6）；
+/// `Ok(Err(e))` = 状态机 apply 拒绝（带 ErrorKind，可映射 HTTP/gRPC 错误码）；
 /// `Err(e)` = Raft 层失败（未提交/超时，可重试）。
 pub async fn client_write(
     raft: &RaftHandle,
     cmd: dsh_core::command::Command,
     timeout: std::time::Duration,
-) -> Result<Result<u64, dsh_core::Error>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Result<crate::types::WriteAck, dsh_core::Error>, Box<dyn std::error::Error + Send + Sync>>
+{
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match raft.client_write(cmd.clone()).await {
@@ -119,12 +121,12 @@ pub enum WriteError {
     Other(String),
 }
 
-/// 单次客户端写（不重试）：`Ok(Ok(version))` 已生效；`Ok(Err(e))` 状态机拒绝；
+/// 单次客户端写（不重试）：`Ok(Ok(ack))` 已生效；`Ok(Err(e))` 状态机拒绝；
 /// `Err(WriteError)` 为 Raft 层失败（含 leader 转发提示）。
 pub async fn try_client_write(
     raft: &RaftHandle,
     cmd: dsh_core::command::Command,
-) -> Result<Result<u64, dsh_core::Error>, WriteError> {
+) -> Result<Result<crate::types::WriteAck, dsh_core::Error>, WriteError> {
     match raft.client_write(cmd).await {
         Ok(resp) => Ok(resp.data),
         Err(openraft::error::RaftError::APIError(
@@ -186,10 +188,12 @@ pub async fn write_command(
             loop {
                 match try_client_write(raft, cmd.clone()).await {
                     Ok(r) => {
+                        // F6：ack 携带事件（changes/affected），dev-single 与集群行为一致
+                        let ack = r?;
                         return Ok(WriteOutcome {
-                            version: r?,
-                            events: vec![],
-                        })
+                            version: ack.version,
+                            events: ack.events,
+                        });
                     }
                     Err(WriteError::ForwardToLeader { http_addr, .. }) => {
                         // leader_node 可能为空（learner 不知 leader NodeInfo）→ 从本节点 metrics 兜底解析

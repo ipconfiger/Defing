@@ -18,8 +18,18 @@ async function main() {
   console.log('[ts-grpc] getItem ok: ' + item);
   if (item !== host) throw new Error('getItem mismatch');
 
-  const members = await c.listMembers().catch(() => [] as any[]);
-  console.log('[ts-grpc] listMembers ok: ' + members.length + ' members (dev-single 可为空)');
+  // D-TEST：ListMembers 真断言——dev-single 下应为 FailedPrecondition（gRPC code 9）
+  try {
+    const members = await c.listMembers();
+    if (members.length) throw new Error('dev-single 不应有成员，got ' + members.length);
+    console.log('[ts-grpc] listMembers dev-single 返回空列表（契约语义：非集群可用）');
+  } catch (e: any) {
+    if (e && (e.code === 'GRPC_9' || e.code === 'GRPC_FAILED_PRECONDITION')) {
+      console.log('[ts-grpc] listMembers dev-single → FailedPrecondition ✅');
+    } else {
+      throw e;
+    }
+  }
 
   await new Promise<void>((resolve, reject) => {
     const ctrl = new AbortController();

@@ -3,8 +3,8 @@
 set -u
 BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/dsh}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
-BASE=http://127.0.0.1:8384
-PORT=8384
+BASE=${BASE:-http://127.0.0.1:8384}
+PORT=${PORT:-8384}
 PROJECT=sdk-project
 
 cleanup() { [ -n "${PID:-}" ] && kill $PID 2>/dev/null || true; pkill -x dsh 2>/dev/null || true; }

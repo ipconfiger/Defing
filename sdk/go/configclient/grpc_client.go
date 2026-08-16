@@ -21,6 +21,12 @@ type Endpoint struct {
 	GRPC string
 }
 
+// 固定超时/重连参数（跨语言对齐见 docs/design-modules/12-sdk.md）
+const (
+	// gRPC 流重连退避：1s 固定（MVP；与 TS 对齐）
+	grpcReconnectDelay = time.Second
+)
+
 // GrpcClient — gRPC 数据面客户端（Get/GetItem/Watch/ListMembers）。
 type GrpcClient struct {
 	stub  configv1.ConfigServiceClient
@@ -42,8 +48,9 @@ func NewGrpc(grpcAddr, token string) (*GrpcClient, error) {
 	}, nil
 }
 
-func (g *GrpcClient) ctx() context.Context {
-	ctx := context.Background()
+// ctx 以调用方 ctx 为基座，附加数据面 token（F-SDK：此前用 context.Background 导致
+// Watch 无法被取消、goroutine 泄漏）。
+func (g *GrpcClient) ctx(ctx context.Context) context.Context {
 	if g.token != "" {
 		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+g.token)
 	}
@@ -67,8 +74,12 @@ func valueFromProto(v *configv1.Value) any {
 		return v.GetJsonValue()
 	case configv1.ValueType_ARRAY:
 		return v.GetListValue().GetValues()
+	case configv1.ValueType_SECRET:
+		// secret 数据面恒脱敏（服务器 grpc.rs:58-61）：掩码展示
+		return "***"
 	default:
-		return "***" // secret 脱敏
+		// 未知类型（协议扩展后旧客户端）：显式 nil 而非静默误判为 secret
+		return nil
 	}
 }
 
@@ -90,9 +101,9 @@ func snapshotFromProto(s *configv1.ConfigSnapshot) *Snapshot {
 	}
 }
 
-// Get 拉取 (project, branch) 快照；version=0 为活动版本。
+// Get 拉取 (project, branch) 快照；version=0 为活动版本。ctx 贯穿（取消/超时生效）。
 func (g *GrpcClient) Get(ctx context.Context, project, branch string, version int64) (*Snapshot, error) {
-	resp, err := g.stub.GetConfig(g.ctx(), &configv1.GetConfigRequest{
+	resp, err := g.stub.GetConfig(g.ctx(ctx), &configv1.GetConfigRequest{
 		Project: project, Branch: branch, Version: version,
 	})
 	if err != nil {
@@ -117,7 +128,7 @@ func (g *GrpcClient) GetItem(ctx context.Context, project, branch, group, key st
 
 // ListMembers 集群成员（dev-single → FailedPrecondition）。
 func (g *GrpcClient) ListMembers(ctx context.Context) ([]Member, error) {
-	resp, err := g.stub.ListMembers(g.ctx(), &configv1.ListMembersRequest{})
+	resp, err := g.stub.ListMembers(g.ctx(ctx), &configv1.ListMembersRequest{})
 	if err != nil {
 		return nil, err
 	}
@@ -137,16 +148,17 @@ func (g *GrpcClient) ListMembers(ctx context.Context) ([]Member, error) {
 
 // Watch 订阅 (project, branch) 发布事件；断线以 after_version 续传重连；
 // 阻塞直至 ctx 取消或 stop 关闭。事件含 SnapshotRequired 标志。
+// F-SDK：流的创建使用调用方 ctx——ctx 取消会关闭流并返回 ctx.Err()（不再泄漏 goroutine）。
 func (g *GrpcClient) Watch(ctx context.Context, project, branch string, afterVersion int64, listener func(WatchEvent)) error {
 	for {
-		stream, err := g.stub.Watch(g.ctx(), &configv1.WatchRequest{
+		stream, err := g.stub.Watch(g.ctx(ctx), &configv1.WatchRequest{
 			Project: project, Branch: branch, AfterVersion: afterVersion,
 		})
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			time.Sleep(time.Second)
+			time.Sleep(grpcReconnectDelay)
 			continue
 		}
 		for {
@@ -158,7 +170,7 @@ func (g *GrpcClient) Watch(ctx context.Context, project, branch string, afterVer
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				time.Sleep(time.Second)
+				time.Sleep(grpcReconnectDelay)
 				break // 重连（after_version 续传）
 			}
 			if e.GetVersion() > afterVersion {

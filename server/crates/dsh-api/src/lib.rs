@@ -8,7 +8,7 @@ pub mod grpc;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{ConnectInfo, Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, Sse};
 use axum::routing::{delete, get, post, put};
@@ -16,6 +16,7 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use dsh_core::command::{Command, DraftUpdateItem};
 use dsh_core::model::{BranchName, GroupDef, ProjectId, RefBinding, SharedItem, Value, ValueType};
+use dsh_core::wire::masked_value;
 use dsh_core::{ErrorKind, StateMachine};
 use dsh_crypto::Cipher;
 use dsh_observability::{cluster_members_json, is_ready, metrics_text, AuditLog};
@@ -57,6 +58,11 @@ pub struct ApiState {
     pub join_token: Option<std::sync::Arc<str>>,
     /// 登录失败节流（S6：进程内、按节点独立；集群需前置 LB 层限流）
     login_throttle: std::sync::Arc<LoginThrottle>,
+    /// 可信代理 CIDR（F4）：仅来自这些网段的请求才信任 X-Forwarded-For；空 = 一律忽略 XFF。
+    trusted_proxies: std::sync::Arc<TrustedProxies>,
+    /// HTTP 数据面访问令牌（D2）：配置时 /v1/* 需 Bearer 或 ?token=（兼容 SSE EventSource）；
+    /// 未配置开放（与 gRPC data_plane_interceptor 同语义）。
+    data_plane_token: Option<std::sync::Arc<str>>,
 }
 
 impl ApiState {
@@ -83,6 +89,8 @@ impl ApiState {
             0,
             0,
             None,
+            std::sync::Arc::new(TrustedProxies::empty()),
+            None,
         )
     }
 
@@ -99,6 +107,8 @@ impl ApiState {
         version_retention: u64,
         audit_retention: u64,
         join_token: Option<std::sync::Arc<str>>,
+        trusted_proxies: std::sync::Arc<TrustedProxies>,
+        data_plane_token: Option<std::sync::Arc<str>>,
     ) -> Self {
         let publish = PublishService::new(
             sm.clone(),
@@ -122,6 +132,8 @@ impl ApiState {
             audit_retention,
             join_token,
             login_throttle: std::sync::Arc::new(LoginThrottle::new()),
+            trusted_proxies,
+            data_plane_token,
         }
     }
 
@@ -150,6 +162,11 @@ pub struct ApiErrorBody {
 
 pub struct ApiError(pub dsh_core::Error);
 
+/// F13：状态机锁中毒 → 500 错误而非请求级 panic。
+fn lock_err<E>(_: std::sync::PoisonError<E>) -> ApiError {
+    ApiError(dsh_core::Error::internal("state machine lock poisoned"))
+}
+
 impl From<dsh_core::Error> for ApiError {
     fn from(e: dsh_core::Error) -> Self {
         Self(e)
@@ -169,7 +186,10 @@ impl From<ApiError> for (StatusCode, Json<ApiErrorBody>) {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
             ErrorKind::LimitExceeded => StatusCode::TOO_MANY_REQUESTS,
-            ErrorKind::LeaderRedirect => StatusCode::CONFLICT,
+            // D-STATUS：LeaderRedirect 使用独立状态码 428（Precondition Required），
+            // 不再与真实 409 Conflict 混淆；响应体仍携带 ERR_LEADER_REDIRECT + leader_hint，
+            // SDK/CLI 按 body code 判断，不受状态码变化影响。
+            ErrorKind::LeaderRedirect => StatusCode::PRECONDITION_REQUIRED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (
@@ -285,10 +305,26 @@ async fn admin_static(
     axum::extract::Path(path): axum::extract::Path<String>,
 ) -> axum::response::Response {
     match AdminAssets::get(&path) {
-        Some(f) => axum::response::Response::builder()
-            .header("content-type", "application/octet-stream")
-            .body(axum::body::Body::from(f.data.into_owned()))
-            .expect("asset"),
+        Some(f) => {
+            // D-CSP：按扩展名设 content-type（app.js 需正确 MIME 才会执行）
+            let ct = if path.ends_with(".js") {
+                "application/javascript; charset=utf-8"
+            } else if path.ends_with(".css") {
+                "text/css; charset=utf-8"
+            } else if path.ends_with(".html") {
+                "text/html; charset=utf-8"
+            } else if path.ends_with(".svg") {
+                "image/svg+xml"
+            } else if path.ends_with(".png") {
+                "image/png"
+            } else {
+                "application/octet-stream"
+            };
+            axum::response::Response::builder()
+                .header("content-type", ct)
+                .body(axum::body::Body::from(f.data.into_owned()))
+                .expect("asset")
+        }
         None => axum::response::Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(axum::body::Body::empty())
@@ -313,8 +349,10 @@ async fn security_headers(
     );
     h.insert(
         "content-security-policy",
+        // D-CSP：Admin 脚本已外置（app.js），移除 script-src 'unsafe-inline'
+        //（内联 style 属性仍存在，style-src 保留 unsafe-inline；XSS 即 RCE 纵深被消除）
         axum::http::HeaderValue::from_static(
-            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; font-src 'self'",
         ),
     );
     resp
@@ -326,7 +364,7 @@ fn resolve_principal(app: &ApiState, auth_header: Option<&str>) -> Result<dsh_co
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(())?;
     let hash = dsh_core::token_hash(token);
-    let sm = app.sm.lock().expect("sm lock");
+    let sm = app.sm.lock().map_err(|_| ())?;
     // token 前缀路由（§3）：pa.{username}.{secret} → sess/pa/{username}；
     // adm.{secret} 或无前缀（旧格式 fallback）→ sess/admin。
     let (_, session) = if let Some(rest) = token.strip_prefix("pa.") {
@@ -467,6 +505,39 @@ async fn auth_middleware(
             ));
         }
         req.extensions_mut().insert(principal);
+    } else if path.starts_with("/v1/") {
+        // D2：HTTP 数据面 token（配置时校验；Authorization Bearer 或 ?token= 查询参数，
+        // 后者兼容 SSE EventSource 无法携带自定义头的限制）。未配置 → 开放（与 gRPC 同语义）。
+        if let Some(tok) = &app.data_plane_token {
+            let header_ok = req
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|a| a.strip_prefix("Bearer "))
+                .map(|t| t == tok.as_ref())
+                .unwrap_or(false);
+            let query_ok = req
+                .uri()
+                .query()
+                .map(|q| {
+                    q.split('&').any(|kv| {
+                        kv.strip_prefix("token=")
+                            .map(|t| t == tok.as_ref())
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            if !header_ok && !query_ok {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(ApiErrorBody {
+                        code: "ERR_UNAUTHORIZED".into(),
+                        message: "data-plane token required".into(),
+                        detail: None,
+                    }),
+                ));
+            }
+        }
     }
     Ok(next.run(req).await)
 }
@@ -506,7 +577,7 @@ async fn list_projects(
     State(app): State<ApiState>,
     principal: axum::Extension<dsh_core::Principal>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().expect("sm lock");
+    let sm = app.sm.lock().map_err(lock_err)?;
     let mut projects = sm
         .list_projects()
         .map_err(ApiError::from)?
@@ -524,7 +595,7 @@ async fn list_branches(
     State(app): State<ApiState>,
     AxumPath(pid): AxumPath<String>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().expect("sm lock");
+    let sm = app.sm.lock().map_err(lock_err)?;
     let id = ProjectId(pid);
     let branches = sm
         .list_branches(&id)
@@ -580,7 +651,7 @@ async fn get_structure_draft(
     State(app): State<ApiState>,
     AxumPath(pid): AxumPath<String>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().expect("sm lock");
+    let sm = app.sm.lock().map_err(lock_err)?;
     let draft = sm
         .get_structure_draft(&ProjectId(pid))
         .map_err(ApiError::from)?;
@@ -667,6 +738,13 @@ async fn update_draft(
     AxumPath((pid, branch)): AxumPath<(String, String)>,
     Json(req): Json<DraftUpdateReq>,
 ) -> ApiResult<serde_json::Value> {
+    // D-DEL：deletes 条目须为 "group/key" 形式（此前无 '/' 的条目被 filter_map 静默丢弃）
+    if let Some(bad) = req.deletes.iter().find(|s| !s.contains('/')) {
+        return Err(ApiError(dsh_core::Error::validation(format!(
+            "delete 条目须为 group/key 形式: {bad:?}"
+        )))
+        .into());
+    }
     let deletes: Vec<(String, String)> = req
         .deletes
         .iter()
@@ -782,7 +860,7 @@ async fn project_detail(
     State(app): State<ApiState>,
     AxumPath(pid): AxumPath<String>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().expect("sm lock");
+    let sm = app.sm.lock().map_err(lock_err)?;
     let p = sm
         .get_project(&ProjectId(pid.clone()))
         .map_err(ApiError::from)?
@@ -844,7 +922,7 @@ async fn branch_detail(
     State(app): State<ApiState>,
     AxumPath((pid, branch)): AxumPath<(String, String)>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().expect("sm lock");
+    let sm = app.sm.lock().map_err(lock_err)?;
     let id = ProjectId(pid.clone());
     let bname = BranchName(branch.clone());
     let st = sm
@@ -918,7 +996,7 @@ async fn branch_diff(
     AxumPath(pid): AxumPath<String>,
     axum::extract::Query(q): axum::extract::Query<DiffQuery>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().expect("sm lock");
+    let sm = app.sm.lock().map_err(lock_err)?;
     let id = ProjectId(pid);
     let a = sm
         .get_config(&id, &BranchName(q.branch_a), 0)
@@ -944,8 +1022,9 @@ async fn branch_diff(
         let vb = b.groups.get(&g).and_then(|m| m.get(&k));
         match (va, vb) {
             (Some(x), Some(y)) if x != y => {
+                // F2：secret 密文不得出网 —— 统一经 masked_value 掩码（其余值原样）
                 diffs.push(serde_json::json!({
-                    "group": g, "key": k, "branch_a": x, "branch_b": y,
+                    "group": g, "key": k, "branch_a": masked_value(x), "branch_b": masked_value(y),
                 }));
             }
             (Some(_), None) | (None, Some(_)) => missing.push(format!("{g}/{k}")),
@@ -988,7 +1067,7 @@ async fn promote(
             .collect()
     });
     let (updates, applied, skipped, missing_from) = {
-        let sm = app.sm.lock().expect("sm lock");
+        let sm = app.sm.lock().map_err(lock_err)?;
         let src = sm
             .get_config(&pid_obj, &from_b, 0)
             .map_err(ApiError::from)?;
@@ -1102,17 +1181,36 @@ async fn write_shared_draft(
 ) -> Result<serde_json::Value, (StatusCode, Json<ApiErrorBody>)> {
     let mut value = req.value;
     if req.secret {
-        if let Value::String(plain) = &value {
-            let cipher = app.cipher.as_ref().ok_or_else(|| {
-                ApiError(dsh_core::Error::validation(
-                    "secret 共享项需要主密钥（--master-key-file 或 DSH_MASTER_KEY）",
-                ))
-            })?;
-            let ct = cipher
-                .encrypt_secret(plain.as_bytes())
-                .map_err(|e| ApiError(dsh_core::Error::internal(format!("encrypt: {e}"))))?;
-            value = Value::Secret(ct);
+        // F9：secret 共享项只接受 secret 类型的字符串值——非字符串值无法加密，
+        // 明文落库后会经 SharedPublish 级联进项目分支并在数据面明文暴露。
+        if req.r#type != ValueType::Secret {
+            return Err(ApiError(dsh_core::Error::validation(
+                "secret 共享项 type 必须为 secret",
+            ))
+            .into());
         }
+        let plain = match &value {
+            Value::String(s) => s.clone(),
+            _ => {
+                return Err(
+                    ApiError(dsh_core::Error::validation("secret 共享项值必须为字符串")).into(),
+                )
+            }
+        };
+        let cipher = app.cipher.as_ref().ok_or_else(|| {
+            ApiError(dsh_core::Error::validation(
+                "secret 共享项需要主密钥（--master-key-file 或 DSH_MASTER_KEY）",
+            ))
+        })?;
+        let ct = cipher
+            .encrypt_secret(plain.as_bytes())
+            .map_err(|e| ApiError(dsh_core::Error::internal(format!("encrypt: {e}"))))?;
+        value = Value::Secret(ct);
+    } else if req.r#type == ValueType::Secret {
+        return Err(ApiError(dsh_core::Error::validation(
+            "type=secret 的共享项必须标记 secret=true",
+        ))
+        .into());
     }
     let item = SharedItem {
         group: req.group.clone(),
@@ -1169,7 +1267,7 @@ async fn update_shared_draft(
 }
 
 async fn list_shared(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().expect("sm lock");
+    let sm = app.sm.lock().map_err(lock_err)?;
     let items = sm
         .list_shared_published()
         .map_err(ApiError::from)?
@@ -1180,7 +1278,7 @@ async fn list_shared(State(app): State<ApiState>) -> ApiResult<serde_json::Value
 }
 
 async fn list_shared_drafts(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().expect("sm lock");
+    let sm = app.sm.lock().map_err(lock_err)?;
     let items = sm
         .list_shared_drafts()
         .map_err(ApiError::from)?
@@ -1224,7 +1322,7 @@ async fn publish_shared(
         }
     }
     let max_version = {
-        let sm = app.sm.lock().expect("sm lock");
+        let sm = app.sm.lock().map_err(lock_err)?;
         sm.list_shared_published()
             .map_err(ApiError::from)?
             .iter()
@@ -1353,7 +1451,7 @@ async fn list_refs(
     if let dsh_core::Principal::ProjectAdmin { project, .. } = principal.0 {
         q.project = project.0;
     }
-    let sm = app.sm.lock().expect("sm lock");
+    let sm = app.sm.lock().map_err(lock_err)?;
     let refs = sm
         .list_refs(&ProjectId(q.project))
         .map_err(ApiError::from)?;
@@ -1398,7 +1496,7 @@ async fn admin_config(
     axum::extract::Query(q): axum::extract::Query<ConfigQuery>,
 ) -> ApiResult<ConfigResp> {
     let (version, project, branch_name, structure_version, mut groups) = {
-        let sm = app.sm.lock().expect("sm lock");
+        let sm = app.sm.lock().map_err(lock_err)?;
         let snap = sm
             .get_config(&ProjectId(pid.clone()), &BranchName(branch.clone()), 0)
             .map_err(ApiError::from)?;
@@ -1535,7 +1633,7 @@ async fn list_project_admins(
     State(app): State<ApiState>,
     AxumPath(pid): AxumPath<String>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().expect("sm lock");
+    let sm = app.sm.lock().map_err(lock_err)?;
     let accounts = sm
         .list_project_admins(&pid)
         .map_err(ApiError::from)?
@@ -1636,7 +1734,7 @@ async fn snapshot(
     AxumPath((pid, branch)): AxumPath<(String, String)>,
 ) -> ApiResult<ConfigResp> {
     let (version, project, branch_name, structure_version, mut groups) = {
-        let sm = app.sm.lock().expect("sm lock");
+        let sm = app.sm.lock().map_err(lock_err)?;
         let snap = sm
             .get_config(&ProjectId(pid.clone()), &BranchName(branch.clone()), 0)
             .map_err(ApiError::from)?;
@@ -1662,7 +1760,7 @@ async fn version_history(
     State(app): State<ApiState>,
     AxumPath((pid, branch)): AxumPath<(String, String)>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().expect("sm lock");
+    let sm = app.sm.lock().map_err(lock_err)?;
     let versions = sm
         .version_history(&ProjectId(pid), &BranchName(branch))
         .map_err(ApiError::from)?;
@@ -1771,7 +1869,7 @@ async fn render_config(
     }
     let _ = session_ok;
     let (version, mut groups) = {
-        let sm = app.sm.lock().expect("sm lock");
+        let sm = app.sm.lock().map_err(lock_err)?;
         let snap = sm
             .get_config(
                 &ProjectId(pid.clone()),
@@ -1837,20 +1935,15 @@ fn new_pa_token(username: &str) -> String {
 }
 
 async fn login(
+    PeerAddr(peer): PeerAddr,
     State(app): State<ApiState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> Result<Json<LoginResp>, (StatusCode, Json<ApiErrorBody>)> {
-    // 登录节流（S6）：按来源 IP（X-Forwarded-For 首值，缺省 "direct"）固定窗口限次。
-    // 进程内、按节点独立计数（集群需前置 LB 层限流）；窗口 600s、窗口内失败 ≥5 即 429。
-    let ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("direct")
-        .to_string();
+    // 登录节流（S6/F4）：节流键 = 对端 socket 地址（不可伪造）；仅当对端命中可信代理
+    // CIDR（--trusted-proxy）时才采用 X-Forwarded-For 首值（直连场景忽略 XFF，防伪造绕过/
+    // 受害 IP 锁定 DoS）。窗口 600s、窗口内失败 ≥5 即 429；进程内、按节点独立计数。
+    let ip = login_throttle_key(&app, &headers, peer);
     if app.login_throttle.blocked(&ip) {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
@@ -1869,11 +1962,11 @@ async fn login(
         .filter(|u| !u.is_empty())
         .map(str::to_string);
     if let Some(username) = pa_username {
-        return pa_login(app, req, username, &ip).await;
+        return pa_login(app, req, username, &ip, &headers).await;
     }
     // 密码校验：set-password 落状态机后优先；未设置时回退节点配置（--admin-password）。
     let sm_pw_ok = {
-        let sm = app.sm.lock().expect("sm lock");
+        let sm = app.sm.lock().map_err(lock_err)?;
         match sm.get_admin_password_hash().ok().flatten() {
             Some(hash) => verify_password(&req.password, &hash, ""),
             None => req.password == app.admin_password.as_ref(),
@@ -1949,18 +2042,13 @@ async fn login(
                     } else {
                         format!("http://{hint}")
                     };
-                    let client = reqwest::Client::new();
+                    let client = forward_request(&base, "/api/v1/login", &headers);
                     // N1：转发体透传 username（PA 登录不能在非 leader 节点被当 admin 路径）
                     let fwd = LoginReq {
                         password: req.password.clone(),
                         username: req.username.clone(),
                     };
-                    match client
-                        .post(format!("{base}/api/v1/login"))
-                        .json(&fwd)
-                        .send()
-                        .await
-                    {
+                    match client.json(&fwd).send().await {
                         Ok(resp) => {
                             let status = resp.status();
                             let body: serde_json::Value =
@@ -2034,10 +2122,11 @@ async fn pa_login(
     req: LoginReq,
     username: String,
     ip: &str,
+    headers: &axum::http::HeaderMap,
 ) -> Result<Json<LoginResp>, (StatusCode, Json<ApiErrorBody>)> {
     // 校验账号与密码（统一 401，防枚举）
     let account = {
-        let sm = app.sm.lock().expect("sm lock");
+        let sm = app.sm.lock().map_err(lock_err)?;
         sm.get_project_admin(&username).ok().flatten()
     };
     let ok = account
@@ -2110,7 +2199,7 @@ async fn pa_login(
             Err(ApiError(e)) if e.kind == ErrorKind::SessionInUse => {
                 // N13：已有会话已过期 → 先登出再重试一轮（仅一次）
                 let expired = {
-                    let sm = app.sm.lock().expect("sm lock");
+                    let sm = app.sm.lock().map_err(lock_err)?;
                     sm.get_pa_session(&username)
                         .ok()
                         .flatten()
@@ -2148,17 +2237,12 @@ async fn pa_login(
                     } else {
                         format!("http://{hint}")
                     };
-                    let client = reqwest::Client::new();
+                    let client = forward_request(&base, "/api/v1/login", headers);
                     let fwd = LoginReq {
                         password: req.password.clone(),
                         username: Some(username.clone()),
                     };
-                    if let Ok(resp) = client
-                        .post(format!("{base}/api/v1/login"))
-                        .json(&fwd)
-                        .send()
-                        .await
-                    {
+                    if let Ok(resp) = client.json(&fwd).send().await {
                         let status = resp.status();
                         let body: serde_json::Value =
                             resp.json().await.unwrap_or(serde_json::json!({}));
@@ -2328,7 +2412,7 @@ async fn audit_list(
     principal: axum::Extension<dsh_core::Principal>,
     axum::extract::Query(q): axum::extract::Query<AuditQuery>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().expect("sm lock");
+    let sm = app.sm.lock().map_err(lock_err)?;
     // PA 强制下推 project 过滤到状态机（§4 + R2：先截断后过滤会让 PA 视图被全局条目冲空）
     let project_filter = match principal.0 {
         dsh_core::Principal::Admin => None,
@@ -2386,6 +2470,37 @@ async fn cluster_join(
         .raft
         .as_ref()
         .ok_or_else(|| ApiError(dsh_core::Error::not_found("cluster mode")))?;
+    // F14：node_id 未占用 + 地址可解析（防重复 node_id 扰乱成员表 / 恶意 raft_addr 触发出站连接）
+    {
+        let metrics = raft.metrics().borrow().clone();
+        let existing: Vec<u64> = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(id, _)| *id)
+            .collect();
+        if existing.contains(&req.node_id) {
+            return Err(ApiError(dsh_core::Error::conflict(format!(
+                "node_id {} 已在集群中",
+                req.node_id
+            )))
+            .into());
+        }
+        for (label, addr) in [("http_addr", &req.http_addr), ("raft_addr", &req.raft_addr)] {
+            let a = addr.trim();
+            if a.is_empty() {
+                return Err(
+                    ApiError(dsh_core::Error::validation(format!("{label} 不能为空"))).into(),
+                );
+            }
+            if a.split(':').count() != 2 {
+                return Err(ApiError(dsh_core::Error::validation(format!(
+                    "{label} 须为 host:port 形式"
+                )))
+                .into());
+            }
+        }
+    }
     let node = RaftNodeInfo {
         grpc_addr: String::new(),
         http_addr: req.http_addr,
@@ -2508,6 +2623,7 @@ struct RotateKeyReq {
 ///   时拒绝轮换，避免"内存轮换、重启丢失新 KEK、新密文永久不可解"。
 async fn rotate_master_key(
     State(app): State<ApiState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<RotateKeyReq>,
 ) -> ApiResult<serde_json::Value> {
     let cipher = app
@@ -2533,10 +2649,27 @@ async fn rotate_master_key(
 
     // ---------------- 集群模式：经 Raft 复制（各节点 apply 时更新本地 keyring + ring 文件） ----------------
     if app.raft.is_some() {
+        // F7b：新 KEK 用当前 KEK 自加密后进命令载荷（Raft 日志不含明文主密钥）
+        let kek_enc = match app.cipher.as_ref() {
+            Some(c) => {
+                dsh_crypto::Cipher::wrap_master_key(c.keyring().current(), &kek).map_err(|e| {
+                    ApiError(dsh_core::Error::internal(format!(
+                        "wrap new master key: {e}"
+                    )))
+                })?
+            }
+            None => return Err(ApiError(dsh_core::Error::validation("集群轮换需要主密钥")).into()),
+        };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let res = app
-                .write(&Command::RotateMasterKey { kek: kek.to_vec() }, now_ms())
+                .write(
+                    &Command::RotateMasterKey {
+                        kek: Vec::new(), // 新命令不留明文（旧日志路径）
+                        kek_enc: kek_enc.clone(),
+                    },
+                    now_ms(),
+                )
                 .await;
             match res {
                 Ok(_) => break,
@@ -2549,10 +2682,10 @@ async fn rotate_master_key(
                         } else {
                             format!("http://{hint}")
                         };
-                        let client = reqwest::Client::new();
+                        let client =
+                            forward_request(&base, "/api/v1/admin/rotate-master-key", &headers);
                         // 转发体原样：{"new_key": ...}（leader 侧完成校验/轮换/审计）
                         match client
-                            .post(format!("{base}/api/v1/admin/rotate-master-key"))
                             .json(&serde_json::json!({ "new_key": req.new_key.clone() }))
                             .send()
                             .await
@@ -2754,7 +2887,7 @@ async fn admin_set_password(
 /// 触发备份快照：返回状态机全量 KV dump（`dsh admin snapshot` 备份用；恢复走 dump/restore）。
 async fn admin_snapshot(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
     let pairs = {
-        let sm = app.sm.lock().expect("sm lock");
+        let sm = app.sm.lock().map_err(lock_err)?;
         sm.dump_all().map_err(ApiError::from)?
     };
     let entries: Vec<serde_json::Value> = pairs
@@ -2787,7 +2920,7 @@ async fn admin_snapshot(State(app): State<ApiState>) -> ApiResult<serde_json::Va
 /// 保留策略状态（`dsh admin version-retention-status`）：配置值 + 当前版本/审计计数。
 async fn admin_retention_status(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
     let (projects, versions, audits) = {
-        let sm = app.sm.lock().expect("sm lock");
+        let sm = app.sm.lock().map_err(lock_err)?;
         let projects = sm.list_projects().map(|p| p.len()).unwrap_or(0);
         let mut versions = 0u64;
         if let Ok(plist) = sm.list_projects() {
@@ -2832,13 +2965,23 @@ async fn watch_branch(
     axum::extract::Query(q): axum::extract::Query<WatchQuery>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     // after_version > 0：按版本链合成历史事件（相邻快照 diff；与 gRPC Watch 重放一致）
-    let replay = {
+    // D-PRUNED：起点已被版本保留策略裁剪 → force_snapshot（SSE 发 snapshot_required 事件并结束）
+    let (replay, force_snapshot) = {
         let mut out: Vec<dsh_core::model::PublishEvent> = Vec::new();
+        let mut force = false;
         if q.after_version > 0 {
-            let sm = app.sm.lock().expect("sm lock");
+            // F13：watch 返回 Sse（不可 ?），锁中毒时取内部值继续（只读重放）
+            let sm = app.sm.lock().unwrap_or_else(|e| e.into_inner());
             let pid = ProjectId(pid.clone());
             let bname = BranchName(branch.clone());
             if let Ok(hist) = sm.version_history(&pid, &bname) {
+                if let (Some(min), Some(active)) =
+                    (hist.first().map(|r| r.no), hist.last().map(|r| r.no))
+                {
+                    if q.after_version < min && q.after_version < active {
+                        force = true;
+                    }
+                }
                 let mut prev: dsh_core::model::SnapshotMap = Default::default();
                 for rec in hist {
                     if rec.no <= q.after_version {
@@ -2847,15 +2990,17 @@ async fn watch_branch(
                     if let Ok(cur) = sm.snapshot_of(&pid, &bname, rec.no) {
                         let diff = dsh_core::diff::compute_diff(&prev, &cur);
                         prev = cur;
+                        // D-TYPE：事件类型保真（结构发布/级联不再被标为 value_publish）
+                        let ty = rec.event_ty.unwrap_or(if rec.rollback_of.is_some() {
+                            dsh_core::model::EventType::Rollback
+                        } else {
+                            dsh_core::model::EventType::ValuePublish
+                        });
                         out.push(dsh_core::model::PublishEvent {
                             project: pid.clone(),
                             branch: bname.clone(),
                             version: rec.no,
-                            ty: if rec.rollback_of.is_some() {
-                                dsh_core::model::EventType::Rollback
-                            } else {
-                                dsh_core::model::EventType::ValuePublish
-                            },
+                            ty,
                             structure_version: rec.structure_version,
                             comment: rec.comment,
                             request_id: String::new(),
@@ -2865,12 +3010,153 @@ async fn watch_branch(
                 }
             }
         }
-        out
+        (out, force)
     };
-    watch_sse(app.hub.subscribe(), &pid, &branch, replay)
+    watch_sse(app.hub.subscribe(), &pid, &branch, replay, force_snapshot)
 }
 
 // ---------------- 工具 ----------------
+
+/// 对端地址提取器（F4）：生产环境经 `into_make_service_with_connect_info` 注入
+/// `ConnectInfo<SocketAddr>` 扩展，此处取其对端 IP；单测 oneshot 无该扩展时返回 None
+/// （登录节流键回落 "direct"）。避免依赖 axum 对 `Option<Extractor>` 的 FromRequestParts 支持。
+#[derive(Debug, Clone, Copy)]
+pub struct PeerAddr(pub Option<std::net::IpAddr>);
+
+impl<S: std::marker::Sync> axum::extract::FromRequestParts<S> for PeerAddr {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let ip = parts
+            .extensions
+            .get::<ConnectInfo<std::net::SocketAddr>>()
+            .map(|c| c.0.ip());
+        Ok(PeerAddr(ip))
+    }
+}
+
+/// 构建到 leader 的转发请求（F8/F4 修复）：客户端带 connect 3s + total 10s 超时
+/// （黑洞 leader 不再挂起至 OS TCP 超时）；透传 `X-Forwarded-For` 供 leader 侧按
+/// 可信代理策略继续对真实客户端限流。
+fn forward_request(
+    base: &str,
+    path: &str,
+    headers: &axum::http::HeaderMap,
+) -> reqwest::RequestBuilder {
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("reqwest client 构建失败");
+    let mut req = client.post(format!("{base}{path}"));
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        req = req.header("x-forwarded-for", xff);
+    }
+    req
+}
+
+/// 登录节流键（F4）：对端命中可信代理 CIDR → 用 X-Forwarded-For 首值（经代理转发场景）；
+/// 否则用对端 socket IP（直连/不可信代理——伪造 XFF 无效）；对端不可得（如单测 oneshot）→ "direct"。
+fn login_throttle_key(
+    app: &ApiState,
+    headers: &axum::http::HeaderMap,
+    peer_ip: Option<std::net::IpAddr>,
+) -> String {
+    if let Some(ip) = peer_ip {
+        if !app.trusted_proxies.is_empty() && app.trusted_proxies.contains(&ip) {
+            if let Some(xff) = headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split(',').next())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return xff.to_string();
+            }
+        }
+        return ip.to_string();
+    }
+    "direct".to_string()
+}
+
+/// 可信代理 CIDR 集（F4）：仅当请求对端 IP 命中这些网段时，才信任 `X-Forwarded-For` 首值
+/// 作为登录节流键；未配置（空集）时一律忽略 XFF，直接用对端 socket 地址（不可伪造）。
+#[derive(Debug, Clone, Default)]
+pub struct TrustedProxies {
+    nets: Vec<(std::net::IpAddr, u8)>,
+}
+
+impl TrustedProxies {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// 解析逗号分隔的 CIDR 列表（如 "10.0.0.0/8,192.168.1.0/24"；无前缀 = /32 或 /128）。
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let mut nets = Vec::new();
+        for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let (ip_str, prefix) = match part.split_once('/') {
+                Some((ip, p)) => {
+                    let p: u8 = p.parse().map_err(|e| format!("{part}: 前缀 {e}"))?;
+                    (ip, Some(p))
+                }
+                None => (part, None),
+            };
+            let ip: std::net::IpAddr =
+                ip_str.parse().map_err(|e| format!("{part}: 非法 IP {e}"))?;
+            // 按地址族校验前缀范围；缺省前缀 = 单地址
+            let prefix = match prefix {
+                Some(p) => {
+                    let max = match ip {
+                        std::net::IpAddr::V4(_) => 32,
+                        std::net::IpAddr::V6(_) => 128,
+                    };
+                    if p > max {
+                        return Err(format!("{part}: 前缀须 ≤{max}"));
+                    }
+                    p
+                }
+                None => match ip {
+                    std::net::IpAddr::V4(_) => 32,
+                    std::net::IpAddr::V6(_) => 128,
+                },
+            };
+            nets.push((ip, prefix));
+        }
+        Ok(Self { nets })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nets.is_empty()
+    }
+
+    /// 对端 IP 是否命中任一可信代理网段（按地址族计算掩码）。
+    pub fn contains(&self, ip: &std::net::IpAddr) -> bool {
+        self.nets.iter().any(|(net, prefix)| match (ip, net) {
+            (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
+                let mask: u32 = if *prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - *prefix as u32)
+                };
+                (u32::from(*a) ^ u32::from(*b)) & mask == 0
+            }
+            (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => {
+                let mask: u128 = if *prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - *prefix as u32)
+                };
+                (u128::from(*a) ^ u128::from(*b)) & mask == 0
+            }
+            // v4-mapped v6 简化为不匹配（配置时用同族地址即可）
+            _ => false,
+        })
+    }
+}
 
 /// 登录失败节流（进程内；集群各节点独立计数，MVP 足够）。固定窗口：窗口内失败 ≥ max 即 429。
 /// 窗口 600s、上限 5 次；成功登录 reset。集群多节点需前置 LB 层限流（各节点计数独立）。
@@ -3075,6 +3361,8 @@ mod join_token_tests {
             0,
             0,
             token,
+            std::sync::Arc::new(super::TrustedProxies::empty()),
+            None,
         )
     }
 
@@ -3203,5 +3491,84 @@ mod security_tests {
         assert!(!verify_password("wrong", &stored, salt));
         // 盐不匹配（如空盐）→ legacy 分支同样不通过
         assert!(!verify_password("old-pw", &stored, ""));
+    }
+
+    // ---------------- F4：可信代理 CIDR 与节流键 ----------------
+
+    #[test]
+    fn trusted_proxies_match_cidr() {
+        use std::net::IpAddr;
+        let tp = super::TrustedProxies::parse("10.0.0.0/8,192.168.1.0/24").unwrap();
+        assert!(tp.contains(&"10.1.2.3".parse::<IpAddr>().unwrap()));
+        assert!(tp.contains(&"192.168.1.9".parse::<IpAddr>().unwrap()));
+        assert!(!tp.contains(&"192.168.2.9".parse::<IpAddr>().unwrap()));
+        assert!(!tp.contains(&"8.8.8.8".parse::<IpAddr>().unwrap()));
+        assert!(super::TrustedProxies::empty().is_empty());
+        assert!(super::TrustedProxies::parse("bad-ip").is_err());
+        assert!(super::TrustedProxies::parse("10.0.0.0/33").is_err());
+        // 单 IP（无前缀 = /32）
+        let single = super::TrustedProxies::parse("203.0.113.7").unwrap();
+        assert!(single.contains(&"203.0.113.7".parse::<IpAddr>().unwrap()));
+        assert!(!single.contains(&"203.0.113.8".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn throttle_key_ignores_xff_without_trusted_proxy() {
+        use axum::http::HeaderMap;
+        // 未配置可信代理：即使伪造 XFF，节流键也是对端 IP（不可伪造）
+        let app = super::ApiState::with_retention(
+            std::sync::Arc::new(std::sync::Mutex::new(dsh_core::StateMachine::new(
+                Box::new(dsh_core::InMemoryStore::new()),
+            ))),
+            dsh_watch::WatchHub::new(),
+            None,
+            None,
+            None,
+            std::time::Duration::from_secs(86400),
+            "admin-pw".into(),
+            None,
+            0,
+            0,
+            None,
+            std::sync::Arc::new(super::TrustedProxies::empty()),
+            None,
+        );
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        let key = super::login_throttle_key(&app, &h, Some("203.0.113.9".parse().unwrap()));
+        assert_eq!(key, "203.0.113.9", "无可信代理时不得信任 XFF");
+        // 对端不可得（单测 oneshot）→ "direct"
+        let key2 = super::login_throttle_key(&app, &h, None);
+        assert_eq!(key2, "direct");
+    }
+
+    #[test]
+    fn throttle_key_trusts_xff_from_trusted_proxy() {
+        use axum::http::HeaderMap;
+        let app = super::ApiState::with_retention(
+            std::sync::Arc::new(std::sync::Mutex::new(dsh_core::StateMachine::new(
+                Box::new(dsh_core::InMemoryStore::new()),
+            ))),
+            dsh_watch::WatchHub::new(),
+            None,
+            None,
+            None,
+            std::time::Duration::from_secs(86400),
+            "admin-pw".into(),
+            None,
+            0,
+            0,
+            None,
+            std::sync::Arc::new(super::TrustedProxies::parse("10.0.0.0/8").unwrap()),
+            None,
+        );
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "198.51.100.7".parse().unwrap());
+        // 对端是可信代理 → 采用 XFF 首值
+        let key = super::login_throttle_key(&app, &h, Some("10.1.1.1".parse().unwrap()));
+        assert_eq!(key, "198.51.100.7");
+        // 对端不是可信代理 → 忽略 XFF
+        let key2 = super::login_throttle_key(&app, &h, Some("203.0.113.9".parse().unwrap()));
+        assert_eq!(key2, "203.0.113.9");
     }
 }

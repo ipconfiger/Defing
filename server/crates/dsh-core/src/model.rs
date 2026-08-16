@@ -275,6 +275,9 @@ pub struct VersionRecord {
     pub snapshot_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_ref: Option<String>,
+    /// 产生本版本的事件类型（D-TYPE：watch 重放保真；旧日志无此字段 → 按 rollback_of 推断）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_ty: Option<EventType>,
 }
 
 /// 变更种类（diff 与事件共用）。

@@ -75,7 +75,10 @@ impl PublishService {
         let Some(cipher) = &self.cipher else {
             return Ok(());
         };
-        let sm = self.sm.lock().expect("sm lock");
+        let sm = self
+            .sm
+            .lock()
+            .map_err(|e| dsh_core::Error::internal(e.to_string()))?;
         let structure = sm.get_structure(project)?;
         let secret_keys: std::collections::HashSet<(String, String)> = structure
             .map(|s| {
@@ -156,7 +159,10 @@ impl PublishService {
         let version = if wr.version > 0 {
             wr.version
         } else {
-            let sm = self.sm.lock().expect("sm lock");
+            let sm = self
+                .sm
+                .lock()
+                .map_err(|e| dsh_core::Error::internal(e.to_string()))?;
             sm.get_branch_state(project, branch)?
                 .map(|s| s.active_version)
                 .unwrap_or(0)
@@ -197,7 +203,10 @@ impl PublishService {
         if wr.version > 0 {
             return Ok(wr.version);
         }
-        let sm = self.sm.lock().expect("sm lock");
+        let sm = self
+            .sm
+            .lock()
+            .map_err(|e| dsh_core::Error::internal(e.to_string()))?;
         Ok(sm
             .get_branch_state(project, branch)?
             .map(|s| s.active_version)

@@ -131,11 +131,14 @@ export class GrpcConfigClient {
    */
   watch(project: string, branch: string, listener: (e: any) => void, signal?: AbortSignal): void {
     let after = 0;
+    let lastEmitted = 0;
     const connect = () => {
       if (signal?.aborted) return;
       const call = this.client.watch({ project, branch, after_version: after }, this.meta);
       call.on('data', (e: any) => {
         after = Math.max(after, e.version);
+        if (e.version <= lastEmitted) return; // F-SDK：重放/重连重复投递去重
+        lastEmitted = e.version;
         listener(eventFromProto(e));
       });
       call.on('error', () => schedule());

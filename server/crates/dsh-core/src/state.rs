@@ -586,7 +586,7 @@ impl StateMachine {
                 self.apply_admin_set_password(password_hash)
             }
             Command::AuditAppend { entry } => self.apply_audit_append(entry),
-            Command::RotateMasterKey { kek } => self.apply_rotate_master_key(kek),
+            Command::RotateMasterKey { .. } => self.apply_rotate_master_key(),
         }
     }
 
@@ -832,6 +832,7 @@ impl StateMachine {
                 kind: VersionKind::Full,
                 snapshot_ref: None,
                 diff_ref: None,
+                event_ty: Some(EventType::StructurePublish),
             };
             save(&*self.store, &version_key(id, branch, vno), &record)?;
             save(&*self.store, &snapshot_key(id, branch, vno), &values)?;
@@ -1040,6 +1041,7 @@ impl StateMachine {
             kind: VersionKind::Full,
             snapshot_ref: None,
             diff_ref: None,
+            event_ty: Some(EventType::ValuePublish),
         };
         save(&*self.store, &version_key(id, branch, vno), &record)?;
         save(&*self.store, &snapshot_key(id, branch, vno), &resolved)?;
@@ -1104,6 +1106,7 @@ impl StateMachine {
             kind: VersionKind::Full,
             snapshot_ref: None,
             diff_ref: None,
+            event_ty: Some(EventType::Rollback),
         };
         save(&*self.store, &version_key(project, branch, vno), &record)?;
         save(&*self.store, &snapshot_key(project, branch, vno), &snap)?;
@@ -1131,6 +1134,16 @@ impl StateMachine {
         if !validator::valid_key_name(&item.group) || !validator::valid_key_name(&item.key) {
             return Err(Error::validation(
                 "shared group/key 须为 1-128 位 [A-Za-z0-9._-]",
+            ));
+        }
+        // F9（状态机兜底，防绕过 API 层校验）：secret 标志与类型一致性——
+        // secret 项只能是 Secret 类型（密文）；Secret 类型必须标记 secret=true。
+        if item.secret && item.ty != ValueType::Secret {
+            return Err(Error::validation("secret 共享项 type 必须为 secret"));
+        }
+        if !item.secret && item.ty == ValueType::Secret {
+            return Err(Error::validation(
+                "type=secret 的共享项必须标记 secret=true",
             ));
         }
         let size = serde_json::to_vec(item)
@@ -1333,6 +1346,7 @@ impl StateMachine {
                 kind: VersionKind::Full,
                 snapshot_ref: None,
                 diff_ref: None,
+                event_ty: Some(EventType::SharedCascade),
             };
             save(&*self.store, &version_key(project, &branch, vno), &record)?;
             save(
@@ -1722,7 +1736,7 @@ impl StateMachine {
 
     /// 密钥轮换：副作用（更新 Cipher/写 ring 文件）由 dsh-raft 的 apply 钩子执行，
     /// 状态机本身不落任何数据（保证确定性，跨节点重放结果一致）。
-    fn apply_rotate_master_key(&mut self, _kek: &[u8]) -> ApplyOutcome {
+    fn apply_rotate_master_key(&mut self) -> ApplyOutcome {
         Ok(vec![])
     }
 }

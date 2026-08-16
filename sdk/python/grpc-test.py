@@ -5,6 +5,8 @@ import sys
 import threading
 import time
 
+import grpc
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config_client import ConfigClient
@@ -27,11 +29,19 @@ def main():
     if item != host:
         raise SystemExit("[py-grpc] FAIL get_item mismatch")
 
+    # D-TEST：ListMembers 真断言——dev-single 下应为 FailedPrecondition（gRPC code 9）
     try:
         members = c.list_members()
-        print("[py-grpc] list_members ok: %d (dev-single 可为空)" % len(members))
+        if members:
+            raise SystemExit("[py-grpc] FAIL list_members 不应在 dev-single 返回成员: %r" % members)
+        print("[py-grpc] list_members dev-single 返回空列表（契约语义：非集群可用）")
     except Exception as e:
-        print("[py-grpc] list_members skipped: %s" % e)
+        # grpc.RpcError：code() 方法返回 StatusCode 枚举（跨版本 .value 形状不一，直接枚举比较）
+        code_fn = getattr(e, "code", None)
+        if callable(code_fn) and code_fn() == grpc.StatusCode.FAILED_PRECONDITION:
+            print("[py-grpc] list_members dev-single → FailedPrecondition ✅")
+        else:
+            raise SystemExit("[py-grpc] FAIL list_members unexpected: %r" % e)
 
     stop = threading.Event()
     got = []

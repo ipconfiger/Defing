@@ -604,7 +604,7 @@ paths:
           description: HTML 页面
   /v1/projects/{p}/branches/{b}/snapshot:
     get:
-      summary: SDK 数据面快照（纯值输出；secret 解密为真实值，面向应用经 TLS 拉取）
+      summary: SDK 数据面快照（纯值输出；secret 恒脱敏为掩码 "***"，面向应用经 TLS 拉取）
       security: []
       parameters:
         - { $ref: '#/components/parameters/ProjectPath' }
@@ -642,6 +642,65 @@ paths:
           description: 渲染文档（Content-Type 按 format）
           content:
             application/octet-stream: {}
+        '404': { $ref: '#/components/responses/NotFound' }
+  # F10（P3-④ 补全）：项目管理员（PA）账号管理面（admin-only；global admin 管理）
+  /api/v1/projects/{p}/admins:
+    get:
+      summary: 项目管理员账号列表（该项目的 PA；global admin 会话）
+      security: [AdminSession: []]
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+      responses:
+        '200':
+          description: 账号列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ProjectAdminAccount' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      summary: 创建项目管理员账号（用户名 [A-Za-z0-9_-]{2,64} 且 ≠ admin）
+      security: [AdminSession: []]
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PAUpsertRequest' }
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectAdminAccount' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Validation' }
+  /api/v1/projects/{p}/admins/{u}:
+    put:
+      summary: 修改项目管理员密码（旧会话即时失效）
+      security: [AdminSession: []]
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { name: u, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PAUpsertRequest' }
+      responses:
+        '200':
+          description: 修改成功
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      summary: 删除项目管理员账号（级联删除其会话）
+      security: [AdminSession: []]
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { name: u, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: 删除成功 }
         '404': { $ref: '#/components/responses/NotFound' }
 
 components:
@@ -965,6 +1024,20 @@ components:
         is_leader: { type: boolean }
         is_voter: { type: boolean }
         committed_index: { type: integer, format: int64 }
+    ProjectAdminAccount:
+      type: object
+      required: [username, project, created_at]
+      properties:
+        username: { type: string, description: "全局唯一，[A-Za-z0-9_-]{2,64}，≠ admin" }
+        project: { type: string }
+        created_at: { type: integer, format: int64, description: 墙钟 ms }
+        # 密码哈希不外泄：账号列表不含 salt/password_hash 明文（服务端自行省略）
+    PAUpsertRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string, description: "[A-Za-z0-9_-]{2,64}，≠ admin" }
+        password: { type: string, minLength: 6, description: 新密码（≥6 位） }
     MemberList:
       type: object
       properties:

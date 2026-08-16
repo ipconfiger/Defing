@@ -8,7 +8,7 @@ trap cleanup EXIT
 
 for id in 1 2 3; do
   if [ $id = 1 ]; then FLAG="--bootstrap"; else FLAG="--join http://127.0.0.1:8611"; fi
-  $BIN --node-id $id --http-addr 127.0.0.1:861$id --raft-addr 127.0.0.1:871$id --grpc-addr 127.0.0.1:881$id --data-dir $W/n$id --admin-password admin123 $FLAG >$W/n$id.log 2>&1 &
+  $BIN --node-id $id --http-addr 127.0.0.1:861$id --raft-addr 127.0.0.1:871$id --grpc-addr 127.0.0.1:881$id --data-dir $W/n$id --admin-password admin123 --join-token demo --raft-token demo $FLAG >$W/n$id.log 2>&1 &
 done
 sleep 3
 # 集群级单会话（I7）：登录一次，token 全集群共享
@@ -36,7 +36,7 @@ echo "new leader: node$NEWL"
 curl -s -H "Authorization: Bearer ${T[$NEWL]}" -X POST http://127.0.0.1:861$NEWL/api/v1/projects -H 'Content-Type: application/json' -d '{"name":"after-kill"}' >/dev/null
 echo "write after kill ok"
 
-$BIN --node-id 1 --http-addr 127.0.0.1:8611 --raft-addr 127.0.0.1:8711 --grpc-addr 127.0.0.1:8811 --data-dir $W/n1 --admin-password admin123 >$W/n1r.log 2>&1 &
+$BIN --node-id 1 --http-addr 127.0.0.1:8611 --raft-addr 127.0.0.1:8711 --grpc-addr 127.0.0.1:8811 --data-dir $W/n1 --admin-password admin123 --join-token demo --raft-token demo >$W/n1r.log 2>&1 &
 sleep 10
 
 echo "--- node1 members after restart ---"

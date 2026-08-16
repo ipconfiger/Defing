@@ -55,6 +55,10 @@ def _snapshot_from_proto(s) -> dict:
 
 class ConfigClient:
     def __init__(self, endpoints, *, tls: bool = False, token=None):
+        # F-SDK：tls 参数保留仅为兼容签名——urllib 的 https 请求默认即校验证书，
+        # 该参数为 no-op（见 _request）；如需自定义 CA 请传环境变量 SSL_CERT_FILE。
+        if not endpoints:
+            raise ConfigError("NO_ENDPOINT", "endpoints 不能为空")
         self.endpoints = endpoints
         self.token = token
         self._grpc_stub = None
@@ -150,8 +154,11 @@ class ConfigClient:
         from config import v1_pb2
 
         after = 0
+        last_emitted = 0
+        attempt = 0
         while not (stop and stop.is_set()):
             try:
+                attempt = 0  # 连接成功 → 退避计数清零
                 for e in self._grpc().Watch(
                     v1_pb2.WatchRequest(project=project, branch=branch, after_version=after),
                     metadata=self._meta,
@@ -159,6 +166,9 @@ class ConfigClient:
                     if stop and stop.is_set():
                         return
                     after = max(after, e.version)
+                    if e.version <= last_emitted:
+                        continue  # F-SDK：重放/重连重复投递去重
+                    last_emitted = e.version
                     listener(
                         {
                             "version": e.version,
@@ -181,7 +191,9 @@ class ConfigClient:
             except Exception:
                 if stop and stop.is_set():
                     return
-                time.sleep(min(BACKOFF_BASE_MS * 2, 15000) / 1000)
+                # F-SDK：指数退避（200ms → 15s 封顶），与 HTTP 通道一致
+                attempt += 1
+                time.sleep(min(BACKOFF_BASE_MS * (2 ** attempt), 15000) / 1000)
 
     def _watch_http(self, project, branch, listener, stop):
         path = "/v1/projects/%s/branches/%s/watch" % (project, branch)
@@ -194,14 +206,19 @@ class ConfigClient:
             try:
                 resume = ("?after_version=%d" % last_version) if last_version > 0 else ""
                 url = self.endpoints[0] if isinstance(self.endpoints[0], str) else self.endpoints[0].get("http")
-                with urllib.request.urlopen(url + path + resume, timeout=None) as r:
+                headers = {}
+                if self.token:
+                    headers["Authorization"] = "Bearer " + self.token
+                req = urllib.request.Request(url + path + resume, headers=headers)
+                with urllib.request.urlopen(req, timeout=None) as r:
                     for raw in r:
                         line = raw.decode().strip()
                         if line.startswith("data:"):
                             try:
                                 ev = json.loads(line[5:].strip())
-                                if ev.get("version", 0) > last_version:
-                                    last_version = ev["version"]
+                                if ev.get("version", 0) <= last_version:
+                                    continue  # F-SDK：重放/重连重复投递去重
+                                last_version = ev["version"]
                                 listener(ev)
                             except ValueError:
                                 pass

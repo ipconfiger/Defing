@@ -404,8 +404,9 @@ pub struct StateMachineStore {
     /// 发布事件广播（集群 watch：apply 时向本地订阅者推送）
     events: tokio::sync::broadcast::Sender<PublishEvent>,
     /// 主密钥轮换钩子：apply 到 `Command::RotateMasterKey` 成功时调用（更新本地 Cipher keyring + 持久化 ring 文件）。
+    /// 入参为整个命令（F7b：新命令 kek_enc 自加密、旧日志 kek 明文），解密由钩子实现方负责。
     /// 状态机本身不落数据（确定性），此钩子是集群一致的密钥轮换副作用出口。
-    rotation_hook: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    rotation_hook: Option<Arc<dyn Fn(&dsh_core::command::Command) + Send + Sync>>,
 }
 
 impl StateMachineStore {
@@ -417,7 +418,7 @@ impl StateMachineStore {
     pub fn new_with_rotation(
         sm: Arc<Mutex<StateMachine>>,
         db: DbHandle,
-        hook: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+        hook: Option<Arc<dyn Fn(&dsh_core::command::Command) + Send + Sync>>,
     ) -> Self {
         let (tx, _rx) = tokio::sync::broadcast::channel(1024);
         Self {
@@ -535,7 +536,10 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         Ok((last_applied, membership))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<Result<u64, DshError>>, ErrOf>
+    async fn apply<I>(
+        &mut self,
+        entries: I,
+    ) -> Result<Vec<Result<crate::types::WriteAck, DshError>>, ErrOf>
     where
         I: IntoIterator<Item = EntryOf> + OptionalSend,
         I::IntoIter: OptionalSend,
@@ -551,24 +555,30 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                 let stored = StoredMembership::new(Some(log_id), m.clone());
                 self.write_membership(&stored)?;
             }
-            let mut resp = Ok(0u64);
+            let mut resp = Ok(crate::types::WriteAck::default());
             if let EntryPayload::Normal(cmd) = &entry.payload {
                 // 确定性时间：用日志序号（避免墙钟导致跨节点状态发散，D16）
                 let now_ms = log_id.index as i64;
                 match sm.apply(cmd, now_ms) {
                     Ok(events) => {
-                        resp = Ok(events.first().map(|e| e.version).unwrap_or(0));
                         // 事件广播（watch）：所有节点本地 apply 时推送，语义一致
                         for e in &events {
                             let _ = self.events.send(e.clone());
                         }
                         // 主密钥轮换副作用（更新本地 keyring + 持久化 ring 文件）：
                         // 状态机 apply 成功后才触发（钩子幂等，重放/多节点安全）。
-                        if let dsh_core::command::Command::RotateMasterKey { kek } = cmd {
+                        // F7b：新命令 kek 为空、kek_enc 为当前 KEK 自加密的新 KEK（日志无明文）；
+                        // 钩子负责解密（旧日志 kek 明文 → 直接使用）。
+                        if matches!(cmd, dsh_core::command::Command::RotateMasterKey { .. }) {
                             if let Some(h) = &self.rotation_hook {
-                                h(kek.clone());
+                                h(cmd);
                             }
                         }
+                        // F6：事件随响应返回（dev-single 与集群行为一致，changes/affected 不再缺失）
+                        resp = Ok(crate::types::WriteAck {
+                            version: events.first().map(|e| e.version).unwrap_or(0),
+                            events,
+                        });
                     }
                     Err(e) => {
                         tracing::warn!("apply command failed (logged but state unchanged): {e}");
@@ -820,13 +830,16 @@ mod tests {
         let mut store = StateMachineStore::new_with_rotation(
             sm.clone(),
             storage.raw_db(),
-            Some(Arc::new(move |kek: Vec<u8>| {
+            Some(Arc::new(move |cmd: &dsh_core::command::Command| {
                 hook_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                hook_received.lock().unwrap().push(kek);
+                // 记录命令携带的明文 KEK（旧日志路径 kek；kek_enc 解密由钩子实现方负责）
+                if let dsh_core::command::Command::RotateMasterKey { kek, .. } = cmd {
+                    hook_received.lock().unwrap().push(kek.clone());
+                }
             })),
         );
 
-        // RotateMasterKey 条目 → 钩子被调用且收到正确 kek
+        // RotateMasterKey 条目 → 钩子被调用且收到正确 kek（旧日志明文路径）
         let kek = vec![1u8; 32];
         let rotate = Entry {
             log_id: LogId {
@@ -835,6 +848,7 @@ mod tests {
             },
             payload: EntryPayload::Normal(dsh_core::command::Command::RotateMasterKey {
                 kek: kek.clone(),
+                kek_enc: vec![],
             }),
         };
         store.apply([rotate]).await.unwrap();

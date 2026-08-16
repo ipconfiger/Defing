@@ -186,8 +186,14 @@ pub enum Command {
     /// 审计落库（seq 由状态机单调分配并覆写；经 Raft 复制，集群一致）。
     AuditAppend { entry: crate::model::AuditEntry },
     /// 主密钥轮换（集群一致）：新 KEK 经 Raft 复制到全部节点；各节点 apply 时更新本地 keyring 并持久化 ring 文件。
+    /// F7b：新命令 `kek` 置空、`kek_enc` 携带「当前 KEK 自加密的新 KEK」（Raft 日志无明文）；
+    /// 旧日志仅含 `kek` 明文（`#[serde(default)]` 兼容重放），钩子实现方按字段选择解密路径。
     RotateMasterKey {
-        /// 新 KEK（32 字节原样）
+        /// 明文新 KEK（32B；旧日志路径，新命令置空）
+        #[serde(default)]
         kek: Vec<u8>,
+        /// 自加密的新 KEK（AES-256-GCM，用提交时刻的当前 KEK 加密；F7b）
+        #[serde(default)]
+        kek_enc: Vec<u8>,
     },
 }

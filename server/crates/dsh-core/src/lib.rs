@@ -13,6 +13,7 @@ pub mod model;
 pub mod state;
 pub mod store;
 pub mod validator;
+pub mod wire;
 
 pub use command::{Command, DraftUpdateItem};
 pub use error::{Error, ErrorKind};

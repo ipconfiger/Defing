@@ -189,6 +189,7 @@ impl config_service_server::ConfigService for ConfigGrpcService {
 
         // 1) 重放 after_version 之后的历史版本（合成为事件；changes 由相邻快照 diff 得出）
         let mut replay: Vec<WatchEvent> = Vec::new();
+        let mut snapshot_required = false;
         if after > 0 {
             let pid = ProjectId(project.clone());
             let bname = BranchName(branch.clone());
@@ -200,6 +201,15 @@ impl config_service_server::ConfigService for ConfigGrpcService {
             let hist = sm
                 .version_history(&pid, &bname)
                 .map_err(|e| Status::internal(e.to_string()))?;
+            // D-PRUNED：断线起点已被版本保留策略裁剪（最早保留版本 > after 且未到活动版本）
+            // → 客户端缓存已失效，发 snapshot_required 并关流（不再静默丢事件）。
+            if let (Some(min), Some(active)) =
+                (hist.first().map(|r| r.no), hist.last().map(|r| r.no))
+            {
+                if (after as u64) < min && (after as u64) < active {
+                    snapshot_required = true;
+                }
+            }
             let mut prev: SnapshotMap = SnapshotMap::new();
             for rec in hist {
                 if (rec.no as i64) <= after {
@@ -210,13 +220,17 @@ impl config_service_server::ConfigService for ConfigGrpcService {
                     .map_err(|e| Status::internal(e.to_string()))?;
                 let diff = compute_diff(&prev, &cur);
                 prev = cur;
-                replay.push(WatchEvent {
-                    version: rec.no as i64,
-                    r#type: if rec.rollback_of.is_some() {
+                // D-TYPE：事件类型保真（结构发布/级联不再被标为 value_publish；旧日志回退推断）
+                let ty = rec.event_ty.map(event_type_to_proto).unwrap_or_else(|| {
+                    if rec.rollback_of.is_some() {
                         EventType::Rollback.into()
                     } else {
                         EventType::ValuePublish.into()
-                    },
+                    }
+                });
+                replay.push(WatchEvent {
+                    version: rec.no as i64,
+                    r#type: ty,
                     structure_version: rec.structure_version as i64,
                     comment: rec.comment,
                     request_id: String::new(),
@@ -230,6 +244,19 @@ impl config_service_server::ConfigService for ConfigGrpcService {
         let mut rx = self.state.hub.subscribe();
         let stream = async_stream::stream! {
             let mut last = after;
+            // D-PRUNED：起点被裁剪 → 直接发 snapshot_required 并结束（客户端重拉全量后重订阅）
+            if snapshot_required {
+                yield Ok(WatchEvent {
+                    version: last,
+                    r#type: EventType::ValuePublish.into(),
+                    structure_version: 0,
+                    comment: "snapshot required (start pruned)".into(),
+                    request_id: String::new(),
+                    changes: vec![],
+                    snapshot_required: true,
+                });
+                return;
+            }
             for e in replay {
                 last = e.version;
                 yield Ok(e);

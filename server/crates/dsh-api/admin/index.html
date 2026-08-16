@@ -19,6 +19,7 @@ button.primary { background:#0ea5e9; border-color:#0ea5e9; color:#fff; }
 button.danger { background:#7f1d1d; border-color:#991b1b; }
 input, select, textarea { background:#0f172a; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 8px; font-size:13px; }
 textarea { font-family:ui-monospace,monospace; width:100%; min-height:120px; }
+pre { background:#0f172a; border:1px solid var(--line); border-radius:8px; padding:10px; overflow:auto; font-size:12px; font-family:ui-monospace,monospace; max-height:320px; }
 .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:14px; }
 .card h3 { margin:0 0 10px; font-size:14px; color:var(--acc); }
 .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
@@ -56,17 +57,18 @@ code { background:#0f172a; padding:1px 5px; border-radius:4px; }
   <div id="view-login" class="card hidden">
     <h3>管理员登录</h3>
     <div class="row">
-      <input id="login-pw" type="password" placeholder="管理员密码" onkeydown="if(event.key==='Enter')doLogin()">
-      <button class="primary" onclick="doLogin()">登录</button>
+      <input id="login-pw" type="password" placeholder="管理员密码">
+      <button class="primary" data-act="doLogin">登录</button>
     </div>
   </div>
 
   <!-- 主视图 -->
   <div id="view-main" class="hidden">
     <div class="tabs">
-      <button data-tab="projects" class="active" onclick="showTab('projects')">项目</button>
-      <button data-tab="shared" onclick="showTab('shared')">共享库</button>
-      <button data-tab="audit" onclick="showTab('audit')">审计</button>
+      <button data-tab="projects" class="active" data-act="showTab" data-arg="projects">项目</button>
+      <button data-tab="shared" data-act="showTab" data-arg="shared">共享库</button>
+      <button data-tab="audit" data-act="showTab" data-arg="audit">审计</button>
+      <button data-tab="cluster" data-act="showTab" data-arg="cluster">集群</button>
     </div>
 
     <!-- 项目 -->
@@ -75,9 +77,9 @@ code { background:#0f172a; padding:1px 5px; border-radius:4px; }
         <h3>项目</h3>
         <div class="row">
           <input id="new-proj" placeholder="新项目名（小写字母/数字/连字符）">
-          <button class="primary" onclick="createProject()">创建项目</button>
-          <select id="sel-proj" onchange="loadProject()"><option value="">选择项目…</option></select>
-          <button class="danger" onclick="deleteProject()">删除项目</button>
+          <button class="primary" data-act="createProject">创建项目</button>
+          <select id="sel-proj" data-act="loadProject"><option value="">选择项目…</option></select>
+          <button class="danger" data-act="deleteProject">删除项目</button>
         </div>
       </div>
 
@@ -85,22 +87,25 @@ code { background:#0f172a; padding:1px 5px; border-radius:4px; }
         <div class="card">
           <h3 id="proj-title">项目详情</h3>
           <div class="row">
-            <select id="sel-branch" onchange="loadBranch()"></select>
+            <select id="sel-branch" data-act="loadBranch"></select>
             <input id="new-branch" placeholder="新分支名">
-            <button onclick="createBranch()">建分支</button>
-            <button class="danger" onclick="deleteBranch()">删分支</button>
-            <button onclick="toggleWatch()" id="btn-watch">订阅变更</button>
+            <button data-act="createBranch">建分支</button>
+            <button class="danger" data-act="deleteBranch">删分支</button>
+            <button data-act="toggleWatch" id="btn-watch">订阅变更</button>
+            <button data-act="viewConfig">查看配置</button>
+            <label><input type="checkbox" id="cfg-reveal"> reveal（明文，审计）</label>
           </div>
           <div id="events" class="hidden"></div>
+          <pre id="cfg-out" class="hidden"></pre>
         </div>
 
         <div class="card">
           <h3>结构草稿（JSON：{"base_version":N,"groups":[{"name","items":[{"key","type","required","secret"}]}]}）</h3>
           <textarea id="struct-draft" placeholder='{"base_version":1,"groups":[]}'></textarea>
           <div class="row" style="margin-top:8px">
-            <button onclick="loadStructDraft()">载入当前</button>
-            <button class="primary" onclick="saveStructDraft()">保存结构草稿</button>
-            <button onclick="publishStruct()">发布结构</button>
+            <button data-act="loadStructDraft">载入当前</button>
+            <button class="primary" data-act="saveStructDraft">保存结构草稿</button>
+            <button data-act="publishStruct">发布结构</button>
             <span class="muted">发布结构 = 全部分支版本推进（I3/I5）</span>
           </div>
         </div>
@@ -114,11 +119,11 @@ code { background:#0f172a; padding:1px 5px; border-radius:4px; }
           <h3>版本历史 / 回滚 / 对比 / 提升</h3>
           <div class="row">
             <select id="diff-a"></select> vs <select id="diff-b"></select>
-            <button onclick="showDiff()">对比</button>
+            <button data-act="showDiff">对比</button>
             <span style="width:12px"></span>
             提升 <select id="promote-from"></select> → <select id="promote-to"></select>
             <label><input type="checkbox" id="promote-force"> force</label>
-            <button class="primary" onclick="doPromote()">提升</button>
+            <button class="primary" data-act="doPromote">提升</button>
           </div>
           <div id="diff-out"></div>
           <table id="versions" style="margin-top:10px">
@@ -144,8 +149,8 @@ code { background:#0f172a; padding:1px 5px; border-radius:4px; }
           <label><input type="checkbox" id="sh-secret"> secret</label>
           <label><input type="checkbox" id="sh-required"> required</label>
           <input id="sh-value" placeholder='{"type":"string","str_value":"x"}' style="width:300px">
-          <button class="primary" onclick="saveShared()">保存草稿</button>
-          <button onclick="publishShared()">发布共享</button>
+          <button class="primary" data-act="saveShared">保存草稿</button>
+          <button data-act="publishShared">发布共享</button>
         </div>
         <div class="row" style="margin-top:8px">
           <b class="muted">引用绑定：</b>
@@ -154,7 +159,7 @@ code { background:#0f172a; padding:1px 5px; border-radius:4px; }
           <input id="ref-item" placeholder="item key（空=整组）" style="width:140px">
           <input id="ref-sg" placeholder="共享组" style="width:100px">
           <input id="ref-sk" placeholder="共享 key" style="width:120px">
-          <button onclick="bindRef()">绑定</button>
+          <button data-act="bindRef">绑定</button>
         </div>
       </div>
       <div class="card">
@@ -169,9 +174,17 @@ code { background:#0f172a; padding:1px 5px; border-radius:4px; }
         <h3>审计（最近 200 条）</h3>
         <div class="row">
           <input id="audit-filter" placeholder="action 过滤（如 publish）">
-          <button onclick="loadAudit()">刷新</button>
+          <button data-act="loadAudit">刷新</button>
         </div>
         <table id="audit"><thead><tr><th>seq</th><th>时间</th><th>action</th><th>项目/分支</th><th>版本</th><th>request_id</th><th>明细</th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+
+    <!-- 集群（P3-⑦：集群管理入口；admin-only） -->
+    <div id="tab-cluster" class="hidden">
+      <div class="card">
+        <h3>集群成员 / 提升 / 移除</h3>
+        <div id="cluster-out">（加载中…）</div>
       </div>
     </div>
   </div>
@@ -190,309 +203,7 @@ code { background:#0f172a; padding:1px 5px; border-radius:4px; }
   </div>
 </div>
 
-<script>
-'use strict';
-let TOKEN = localStorage.getItem('dsh_admin_token') || '';
-let curProject = '', curBranch = '', watchES = null;
-
-const $ = (id) => document.getElementById(id);
-function auth() { return TOKEN ? { 'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' }; }
-function msg(text, ok) { const m = $('msg'); m.className = 'msg ' + (ok ? 'ok' : 'err'); m.textContent = text; setTimeout(() => { m.className = 'msg'; }, 5000); }
-async function j(method, url, body) {
-  const r = await fetch(url, { method, headers: auth(), body: body ? JSON.stringify(body) : undefined });
-  if (!r.ok) {
-    let detail = '';
-    try { detail = (await r.json()).message || ''; } catch (_) {}
-    throw new Error('HTTP ' + r.status + ' ' + detail);
-  }
-  if (r.status === 204) return null;
-  return r.json();
-}
-const rid = () => 'ui-' + Date.now() + '-' + Math.floor(Math.random() * 1e6);
-let modalCb = null;
-function askModal(title, placeholder, cb) {
-  $('modal-title').textContent = title;
-  $('modal-input').value = '';
-  $('modal-input').placeholder = placeholder || '';
-  modalCb = cb;
-  $('modal').classList.remove('hidden');
-  $('modal-input').focus();
-}
-function closeModal() { $('modal').classList.add('hidden'); modalCb = null; }
-$('modal-ok').onclick = () => { const v = $('modal-input').value; const cb = modalCb; closeModal(); if (cb) cb(v); };
-$('modal-cancel').onclick = closeModal;
-
-// ---------- 登录 ----------
-function doLogin() {
-  j('POST', '/api/v1/login', { password: $('login-pw').value })
-    .then((r) => { TOKEN = r.token; localStorage.setItem('dsh_admin_token', TOKEN); enterMain(); msg('登录成功', true); })
-    .catch((e) => msg(e.message, false));
-}
-function doLogout() {
-  j('POST', '/api/v1/logout', {}).catch(() => {});
-  TOKEN = ''; localStorage.removeItem('dsh_admin_token'); location.reload();
-}
-function enterMain() {
-  $('view-login').classList.add('hidden');
-  $('view-main').classList.remove('hidden');
-  $('btn-logout').classList.remove('hidden');
-  loadProjects(); loadShared(); loadAudit();
-}
-function showTab(t) {
-  document.querySelectorAll('.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === t));
-  $('tab-projects').classList.toggle('hidden', t !== 'projects');
-  $('tab-shared').classList.toggle('hidden', t !== 'shared');
-  $('tab-audit').classList.toggle('hidden', t !== 'audit');
-  if (t === 'audit') loadAudit();
-  if (t === 'shared') loadShared();
-}
-
-// ---------- 项目 ----------
-function loadProjects() {
-  j('GET', '/api/v1/projects').then((ps) => {
-    const sel = $('sel-proj');
-    sel.innerHTML = '<option value="">选择项目…</option>' + ps.map((p) => `<option value="${p.id}">${p.name}</option>`).join('');
-    if (curProject) sel.value = curProject;
-    if (curProject) loadProject();
-  }).catch((e) => msg(e.message, false));
-}
-function createProject() {
-  const n = $('new-proj').value.trim();
-  if (!n) return msg('请输入项目名', false);
-  j('POST', '/api/v1/projects', { name: n }).then(() => { $('new-proj').value = ''; loadProjects(); msg('项目已创建', true); }).catch((e) => msg(e.message, false));
-}
-function deleteProject() {
-  if (!curProject) return;
-  askModal('确认删除项目 ' + curProject + '？（force=true）', '', (v) => {
-    j('DELETE', '/api/v1/projects/' + curProject + '?force=true').then(() => { curProject = ''; loadProjects(); msg('项目已删除', true); }).catch((e) => msg(e.message, false));
-  });
-}
-function loadProject() {
-  curProject = $('sel-proj').value;
-  if (!curProject) { $('proj-detail').classList.add('hidden'); return; }
-  $('proj-detail').classList.remove('hidden');
-  $('proj-title').textContent = '项目：' + curProject;
-  Promise.all([j('GET', `/api/v1/projects/${curProject}/branches`), j('GET', `/api/v1/projects/${curProject}/structure-draft`)])
-    .then(([bs]) => {
-      $('sel-branch').innerHTML = bs.map((b) => `<option value="${b.name}">${b.name} (v${b.active_version})</option>`).join('');
-      $('diff-a').innerHTML = bs.map((b) => `<option>${b.name}</option>`).join('');
-      $('diff-b').innerHTML = bs.map((b) => `<option>${b.name}</option>`).join('');
-      $('promote-from').innerHTML = bs.map((b) => `<option>${b.name}</option>`).join('');
-      $('promote-to').innerHTML = bs.map((b) => `<option>${b.name}</option>`).join('');
-      if (bs.length) { curBranch = bs[0].name; $('sel-branch').value = curBranch; loadBranch(); }
-    }).catch((e) => msg(e.message, false));
-}
-function createBranch() {
-  const n = $('new-branch').value.trim();
-  if (!n || !curProject) return msg('请输入分支名', false);
-  j('POST', `/api/v1/projects/${curProject}/branches`, { name: n }).then(() => { $('new-branch').value = ''; loadProject(); msg('分支已创建', true); }).catch((e) => msg(e.message, false));
-}
-function deleteBranch() {
-  if (!curBranch) return;
-  askModal('确认删除分支 ' + curBranch + '？', '', () => {
-    j('DELETE', `/api/v1/projects/${curProject}/branches/${curBranch}`).then(() => { loadProject(); msg('分支已删除', true); }).catch((e) => msg(e.message, false));
-  });
-}
-
-// ---------- 结构 ----------
-function loadStructDraft() {
-  j('GET', `/api/v1/projects/${curProject}/structure-draft`).then((d) => { $('struct-draft').value = JSON.stringify(d, null, 2); }).catch((e) => msg(e.message, false));
-}
-function saveStructDraft() {
-  let d; try { d = JSON.parse($('struct-draft').value); } catch (e) { return msg('结构 JSON 非法: ' + e.message, false); }
-  j('PUT', `/api/v1/projects/${curProject}/structure-draft`, d).then(() => msg('结构草稿已保存', true)).catch((e) => msg(e.message, false));
-}
-function publishStruct() {
-  askModal('发布结构备注', '备注（可选）', (comment) => {
-    j('POST', `/api/v1/projects/${curProject}/structure-draft/publish`, { comment, request_id: rid() })
-      .then((r) => { msg('结构已发布：' + JSON.stringify(r), true); loadProject(); }).catch((e) => msg(e.message, false));
-  });
-}
-
-// ---------- 分支草稿 ----------
-function loadBranch() {
-  curBranch = $('sel-branch').value;
-  if (!curBranch) return;
-  $('branch-title').textContent = '分支草稿编辑：' + curBranch;
-  Promise.all([j('GET', `/api/v1/projects/${curProject}/branches/${curBranch}`), loadVersions()])
-    .then(([b]) => renderDraftEditor(b))
-    .catch((e) => msg(e.message, false));
-}
-function renderDraftEditor(b) {
-  const box = $('draft-editor');
-  const groups = Object.keys(b.draft || {});
-  let html = '';
-  if (!groups.length) html = '<span class="muted">当前分支无草稿项（先改结构发布，或直接添加下方值）</span><br>';
-  for (const g of groups) {
-    html += `<b>${esc(g)}</b><table><thead><tr><th>key</th><th>值</th><th>删除</th></tr></thead><tbody>`;
-    for (const [k, dv] of Object.entries(b.draft[g] || {})) {
-      const v = dv.value; const type = v && v.type ? v.type : typeof v;
-      const input = type === 'bool'
-        ? `<input type="checkbox" data-g="${esc(g)}" data-k="${esc(k)}" ${v === true || v === 'true' ? 'checked' : ''}>`
-        : `<input data-g="${esc(g)}" data-k="${esc(k)}" data-ty="${esc(type)}" value="${esc(v && v.str_value !== undefined ? v.str_value : v)}">`;
-      html += `<tr><td class="mono">${esc(k)}</td><td>${input}</td><td><button class="danger" onclick="delDraftItem('${esc(g)}','${esc(k)}')">删</button></td></tr>`;
-    }
-    html += '</tbody></table>';
-  }
-  html += `<div class="row" style="margin-top:10px">
-    <input id="new-item-group" placeholder="组" style="width:100px">
-    <input id="new-item-key" placeholder="key" style="width:140px">
-    <select id="new-item-type"><option value="string">string</option><option value="int">int</option><option value="float">float</option><option value="bool">bool</option><option value="json">json</option><option value="array">array</option><option value="secret">secret</option></select>
-    <input id="new-item-val" placeholder="值" style="width:200px">
-    <button onclick="addDraftItem()">添加</button>
-  </div>`;
-  html += `<div class="row"><button class="primary" onclick="saveDraft()">保存草稿</button>
-    <button onclick="doPublish()">发布版本</button>
-    <span class="muted">发布后 SDK watch 收到事件</span></div>`;
-  box.innerHTML = html;
-}
-function esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/'/g,'&#39;'); }
-function addDraftItem() {
-  const g = $('new-item-group').value.trim(), k = $('new-item-key').value.trim(), ty = $('new-item-type').value, raw = $('new-item-val').value;
-  if (!g || !k) return msg('组和 key 必填', false);
-  const value = buildValue(ty, raw);
-  j('PUT', `/api/v1/projects/${curProject}/branches/${curBranch}/draft`, { updates: [{ group: g, key: k, value }], deletes: [] })
-    .then(() => { loadBranch(); msg('草稿项已添加', true); }).catch((e) => msg(e.message, false));
-}
-function delDraftItem(g, k) {
-  j('PUT', `/api/v1/projects/${curProject}/branches/${curBranch}/draft`, { updates: [], deletes: [g + '/' + k] })
-    .then(() => { loadBranch(); msg('草稿项已删除', true); }).catch((e) => msg(e.message, false));
-}
-function buildValue(ty, raw) {
-  switch (ty) {
-    case 'int': return { type: 'int', int_value: parseInt(raw, 10) || 0 };
-    case 'float': return { type: 'float', float_value: parseFloat(raw) || 0 };
-    case 'bool': return { type: 'bool', bool_value: raw === 'true' || raw === 'on' };
-    case 'json': return { type: 'json', json_value: raw };
-    case 'array': return { type: 'array', list_value: raw.split(',').map((s) => s.trim()).filter(Boolean) };
-    case 'secret': return { type: 'string', str_value: raw };
-    default: return { type: 'string', str_value: raw };
-  }
-}
-function saveDraft() {
-  const updates = [];
-  document.querySelectorAll('#draft-editor input[data-g][data-k]:not([type=checkbox])').forEach((inp) => {
-    const ty = inp.dataset.ty || 'string';
-    updates.push({ group: inp.dataset.g, key: inp.dataset.k, value: buildValue(ty, inp.value) });
-  });
-  document.querySelectorAll('#draft-editor input[type=checkbox][data-g][data-k]').forEach((inp) => {
-    updates.push({ group: inp.dataset.g, key: inp.dataset.k, value: { type: 'bool', bool_value: inp.checked } });
-  });
-  j('PUT', `/api/v1/projects/${curProject}/branches/${curBranch}/draft`, { updates, deletes: [] })
-    .then(() => msg('草稿已保存', true)).catch((e) => msg(e.message, false));
-}
-function doPublish() {
-  askModal('发布版本备注', '备注（可选）', (comment) => {
-    j('POST', `/api/v1/projects/${curProject}/branches/${curBranch}/publish`, { comment, request_id: rid() })
-      .then((r) => { msg('已发布 version=' + r.version, true); loadProject(); }).catch((e) => msg(e.message, false));
-  });
-}
-
-// ---------- 版本历史 / 回滚 ----------
-function loadVersions() {
-  if (!curProject) return Promise.resolve();
-  return j('GET', `/api/v1/projects/${curProject}/branches/${curBranch}/versions`).then((vs) => {
-    const tb = document.querySelector('#versions tbody');
-    if (!tb) return;
-    tb.innerHTML = (vs || []).map((v) => `<tr>
-      <td>v${v.no}</td><td>${v.rollback_of ? '回滚←v' + v.rollback_of : (v.kind || 'full')}</td>
-      <td>${esc(v.comment || '')}</td><td>sv${v.structure_version}</td><td class="muted">${new Date(v.created_at).toLocaleString()}</td>
-      <td><button onclick="doRollback(${v.no})">回滚到此处</button></td></tr>`).join('');
-  });
-}
-function doRollback(toVersion) {
-  askModal('回滚备注（回滚 = 以旧内容创建新版本，历史不可变 I6）', '', (comment) => {
-    j('POST', `/api/v1/projects/${curProject}/branches/${curBranch}/rollback`, { to_version: toVersion, comment, request_id: rid() })
-      .then((r) => { msg('已回滚，新版本 v' + r.new_version, true); loadProject(); }).catch((e) => msg(e.message, false));
-  });
-}
-
-// ---------- 对比 / 提升 ----------
-function showDiff() {
-  const a = $('diff-a').value, b = $('diff-b').value;
-  if (!a || !b) return msg('请选择对比分支', false);
-  j('GET', `/api/v1/projects/${curProject}/diff?branch_a=${a}&branch_b=${b}`).then((d) => {
-    let html = '<table><thead><tr><th>key</th><th>' + esc(a) + '</th><th>' + esc(b) + '</th></tr></thead><tbody>';
-    for (const x of d.diffs || []) html += `<tr><td class="mono">${esc(x.group)}/${esc(x.key)}</td><td>${esc(JSON.stringify(x.branch_a))}</td><td>${esc(JSON.stringify(x.branch_b))}</td></tr>`;
-    for (const m of d.missing || []) html += `<tr><td class="mono">${esc(m)}</td><td colspan="2" class="muted">仅一侧有值</td></tr>`;
-    html += '</tbody></table>';
-    if (!(d.diffs || []).length && !(d.missing || []).length) html = '<span class="muted">两个分支完全一致</span>';
-    $('diff-out').innerHTML = html;
-  }).catch((e) => msg(e.message, false));
-}
-function doPromote() {
-  const from = $('promote-from').value, to = $('promote-to').value;
-  if (!from || !to) return msg('请选择提升源/目标', false);
-  j('POST', `/api/v1/projects/${curProject}/promote`, { from, to, force: $('promote-force').checked })
-    .then((r) => { msg('提升完成：applied=' + r.applied.length + ' skipped=' + r.skipped.length + ' missing=' + r.missing_from.length, true); loadBranch(); })
-    .catch((e) => msg(e.message, false));
-}
-
-// ---------- watch ----------
-function toggleWatch() {
-  if (watchES) { watchES.close(); watchES = null; $('events').classList.add('hidden'); $('btn-watch').textContent = '订阅变更'; return; }
-  if (!curProject || !curBranch) return;
-  $('events').classList.remove('hidden');
-  $('events').textContent = '订阅 ' + curProject + '/' + curBranch + ' ...\n';
-  watchES = new EventSource(`/v1/projects/${curProject}/branches/${curBranch}/watch`);
-  watchES.onmessage = (ev) => { $('events').textContent += ev.data + '\n'; $('events').scrollTop = $('events').scrollHeight; };
-  watchES.onerror = () => { $('events').textContent += '（断线重连…）\n'; };
-  $('btn-watch').textContent = '停止订阅';
-}
-
-// ---------- 共享库 ----------
-function loadShared() {
-  Promise.all([j('GET', '/api/v1/shared').catch(() => []), j('GET', '/api/v1/shared-draft').catch(() => [])]).then(([pub, draft]) => {
-    const tb = document.querySelector('#shared tbody');
-    if (!tb) return;
-    const rows = (draft.map((s) => ({ ...s, __draft: true }))).concat(pub.map((s) => ({ ...s, __draft: false })));
-    tb.innerHTML = rows.map((s) => `<tr>
-      <td class="mono">${esc(s.group)}</td><td class="mono">${esc(s.key)}</td><td>${esc(s.type)}</td>
-      <td>${s.__draft ? '<span class="badge">草稿</span>' : 'v' + s.version}</td>
-      <td class="mono">${esc(JSON.stringify(s.value))}</td><td>${s.secret ? '🔒' : ''}</td></tr>`).join('');
-  }).catch(() => {});
-}
-function saveShared() {
-  let value; try { value = JSON.parse($('sh-value').value); } catch (e) { return msg('值 JSON 非法: ' + e.message, false); }
-  const body = { group: $('sh-group').value.trim(), key: $('sh-key').value.trim(), type: $('sh-type').value, secret: $('sh-secret').checked, required: $('sh-required').checked, value };
-  if (!body.group || !body.key) return msg('组和 key 必填', false);
-  j('POST', '/api/v1/shared', body).then(() => { loadShared(); msg('共享草稿已保存', true); }).catch((e) => msg(e.message, false));
-}
-function publishShared() {
-  askModal('发布共享备注（auto 级联引用项目）', '', (comment) => {
-    j('POST', '/api/v1/shared/publish', { comment, request_id: rid() }).then((r) => {
-      msg('共享已发布，受影响分支：' + (r.affected || []).length, true); loadShared();
-    }).catch((e) => msg(e.message, false));
-  });
-}
-function bindRef() {
-  const body = {
-    project: $('ref-project').value.trim(), group: $('ref-group').value.trim(),
-    item_key: $('ref-item').value.trim() || null,
-    shared_group: $('ref-sg').value.trim(), shared_key: $('ref-sk').value.trim(),
-  };
-  if (!body.project || !body.group || !body.shared_group || !body.shared_key) return msg('引用字段不完整', false);
-  j('POST', '/api/v1/shared/refs', body).then(() => msg('引用已绑定', true)).catch((e) => msg(e.message, false));
-}
-
-// ---------- 审计 ----------
-function loadAudit() {
-  const f = $('audit-filter').value.trim();
-  j('GET', '/api/v1/audit?limit=200' + (f ? '&action=' + f : '')).then((es) => {
-    const tb = document.querySelector('#audit tbody');
-    if (!tb) return;
-    tb.innerHTML = es.map((e) => `<tr>
-      <td>${e.seq}</td><td class="muted">${new Date(e.ts).toLocaleString()}</td><td>${esc(e.action)}</td>
-      <td class="mono">${esc(e.project || '')}${e.branch ? '/' + esc(e.branch) : ''}</td><td>${esc(e.version ?? '')}</td>
-      <td class="mono">${esc(e.request_id || '')}</td><td class="mono">${esc(JSON.stringify(e.detail || {}))}</td></tr>`).join('');
-  }).catch((e) => msg(e.message, false));
-}
-
-// ---------- 初始化 ----------
-if (TOKEN) { enterMain(); } else { $('view-login').classList.remove('hidden'); }
-$('btn-login').onclick = () => { $('view-login').classList.remove('hidden'); $('view-main').classList.add('hidden'); };
-$('btn-logout').onclick = doLogout;
-setInterval(() => { if (TOKEN) j('POST', '/api/v1/heartbeat', {}).catch(() => {}); }, 300000);
-</script>
+<!-- D-CSP：脚本外置（无 inline script / onclick，CSP 可移除 unsafe-inline） -->
+<script src="/admin/app.js" defer></script>
 </body>
 </html>

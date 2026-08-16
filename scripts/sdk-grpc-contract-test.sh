@@ -4,15 +4,16 @@
 set -u
 BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/dsh}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
-BASE=http://127.0.0.1:8384
-PORT=8384
+BASE=${BASE:-http://127.0.0.1:8384}
+PORT=${PORT:-8384}
+GRPC_PORT=${GRPC_PORT:-8383}
 PROJECT=sdk-project
 
 cleanup() { [ -n "${PID:-}" ] && kill $PID 2>/dev/null || true; pkill -x dsh 2>/dev/null || true; }
 trap cleanup EXIT
 
-echo "== 启动 dev-single（HTTP :8384 / gRPC :8383）=="
-$BIN --dev-single --admin-password admin123 --http-addr 127.0.0.1:$PORT >/tmp/dsh-sdk-grpc.log 2>&1 &
+echo "== 启动 dev-single (HTTP :$PORT / gRPC :$GRPC_PORT) =="
+$BIN --dev-single --admin-password admin123 --http-addr 127.0.0.1:$PORT --grpc-addr 127.0.0.1:$GRPC_PORT >/tmp/dsh-sdk-grpc.log 2>&1 &
 PID=$!
 sleep 1
 curl -sf $BASE/healthz >/dev/null || { echo "FAIL healthz"; cat /tmp/dsh-sdk-grpc.log; exit 1; }
@@ -31,10 +32,18 @@ publish_change() { # $1=新值
   curl -sf -H "$AUTH" -X POST $BASE/api/v1/projects/$PROJECT/branches/dev/publish -H 'Content-Type: application/json' -d "{\"comment\":\"next\",\"request_id\":\"n-$(date +%s%N)\"}" >/dev/null
 }
 
+echo "== D-TEST：after_version 断线续传（HTTP watch 重放）+ 事件字段断言 =="
+# 当前活动版本 v2（结构 v1 + 发布 r1 = v2）；after_version=1 → 应重放 v2 事件
+RV=$(curl -sN --max-time 3 "$BASE/v1/projects/$PROJECT/branches/dev/watch?after_version=1" | grep '^data:' | head -1)
+echo "  重放事件: $RV"
+echo "$RV" | grep -q '"version":2' && echo "  after_version 重放 v2 OK ✅" || { echo "  FAIL: 期望重放 v2"; exit 1; }
+echo "$RV" | grep -q '"ty":"value_publish"' && echo "$RV" | grep -q '"request_id"' && echo "$RV" | grep -q '"structure_version"' \
+  && echo "  事件字段断言（ty/request_id/structure_version）OK ✅" || { echo "  FAIL: 事件字段缺失"; exit 1; }
+
 run_lang() { # $1=名称 $2=命令
   echo "== $1 SDK gRPC =="
   publish_change "10.0.0.9"
-  DSH_GRPC=127.0.0.1:8383 DSH_HTTP=$BASE DSH_PROJECT=$PROJECT sh -c "$2" > /tmp/sdk-grpc-$1.out 2>&1 &
+  DSH_GRPC=127.0.0.1:$GRPC_PORT DSH_HTTP=$BASE DSH_PROJECT=$PROJECT sh -c "$2" > /tmp/sdk-grpc-$1.out 2>&1 &
   local TP=$!
   # 持续发布直到测试进程退出（消除编译/启动窗口竞态）
   for i in $(seq 1 60); do
@@ -59,7 +68,7 @@ pip install --quiet --disable-pip-version-check -r $REPO/sdk/python/requirements
 
 run_lang "ts"   "cd $REPO/sdk/ts && node --experimental-strip-types grpc-test.ts"
 run_lang "go"   "export GOCACHE=/tmp/dsh-gocache && cd $REPO/sdk/go && go run ./grpc-test"
-run_lang "py"   "cd $REPO/sdk/python && python3 grpc-test.py"
+run_lang "py"   "cd $REPO/sdk/python && ${PYTHON:-python3} grpc-test.py"
 
 echo
 echo "======== P1 SDK gRPC 契约测试全部通过 ========"

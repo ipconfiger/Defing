@@ -114,6 +114,10 @@ struct Cli {
     /// Raft 内部 RPC 共享令牌（缺省不校验；启用后集群内所有节点必须传相同值）
     #[arg(long)]
     raft_token: Option<String>,
+    /// 可信代理 CIDR 列表（逗号分隔，如 "10.0.0.0/8,192.168.0.0/16"）：
+    /// 仅信任来自这些网段的 X-Forwarded-For 作为登录节流键；未配置时忽略 XFF 用对端地址（F4）
+    #[arg(long)]
+    trusted_proxy: Option<String>,
     /// 生成新主密钥（base64 32B）并退出
     #[arg(long)]
     gen_master_key: bool,
@@ -327,20 +331,49 @@ async fn join_cluster(
     }
 }
 
+/// 集群主密钥轮换钩子类型（F7b：入参为 RotateMasterKey 命令，解密由实现方负责）。
+type RotationHook = Arc<dyn Fn(&dsh_core::command::Command) + Send + Sync>;
+
 /// 集群轮换钩子：Raft apply 到 RotateMasterKey 时更新本节点 keyring 并持久化 ring 文件
 /// （幂等：已含该 KEK 则跳过，重放安全；持久化失败不切换内存，保持可解）。
+/// F7b：新命令载荷为 kek_enc（当前 KEK 自加密）——逐个尝试 keyring 内 KEK 解开；
+/// 旧日志为 kek 明文，直接使用。
 fn cluster_rotation_hook(
     key_file: Option<&str>,
     cipher: Option<Arc<Cipher>>,
-) -> Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>> {
+) -> Option<RotationHook> {
     let cipher = cipher?;
     let ring_path = key_file.map(dsh_crypto::ring_file_path);
-    Some(Arc::new(move |kek: Vec<u8>| {
-        if kek.len() != 32 {
+    Some(Arc::new(move |cmd: &dsh_core::command::Command| {
+        let dsh_core::command::Command::RotateMasterKey { kek, kek_enc } = cmd else {
+            return;
+        };
+        // 解析明文 KEK（32B）
+        let plain: Vec<u8> = if !kek_enc.is_empty() {
+            let ring = cipher.keyring();
+            // kek_enc 用「提交时刻的当前 KEK」加密；从最新到最旧逐个尝试（节点可能落后/追赶）
+            let mut resolved: Option<[u8; 32]> = None;
+            for k in ring.entries().iter().rev() {
+                if let Ok(kk) = dsh_crypto::Cipher::unwrap_master_key(k, kek_enc) {
+                    resolved = Some(kk);
+                    break;
+                }
+            }
+            match resolved {
+                Some(k) => k.to_vec(),
+                None => {
+                    tracing::error!("rotate: cannot unwrap kek_enc with any known KEK");
+                    return;
+                }
+            }
+        } else {
+            kek.clone()
+        };
+        if plain.len() != 32 {
             return;
         }
         let mut arr = [0u8; 32];
-        arr.copy_from_slice(&kek);
+        arr.copy_from_slice(&plain);
         let ring = cipher.keyring();
         if ring.entries().iter().any(|k| k == &arr) {
             return; // 幂等（重放/多节点）
@@ -381,6 +414,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return run_admin_cmd(&cli, cmd).await;
     }
     let hub = WatchHub::new();
+    // 可信代理（F4）：解析失败直接报错退出
+    let trusted_proxies = std::sync::Arc::new(match &cli.trusted_proxy {
+        Some(s) => {
+            dsh_api::TrustedProxies::parse(s).map_err(|e| format!("--trusted-proxy: {e}"))?
+        }
+        None => dsh_api::TrustedProxies::empty(),
+    });
     // 主密钥（secret 项加密/解密；I8）
     let master_key = load_master_key(
         std::env::var("DSH_MASTER_KEY").ok().as_deref(),
@@ -481,18 +521,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cli.version_retention,
             cli.audit_retention,
             cli.join_token.clone().map(Arc::from),
+            trusted_proxies.clone(),
+            cli.data_plane_token.clone().map(Arc::from),
         );
         spawn_grpc(&cli, app.clone());
         let router = dsh_api::build_router(app);
         let listener = tokio::net::TcpListener::bind(&cli.http_addr).await?;
         eprintln!("dsh --dev-single listening on http://{}", cli.http_addr);
-        axum::serve(listener, router).await?;
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await?;
         return Ok(());
     }
 
     // ---------- 集群模式 ----------
     let data_dir = cli.data_dir.clone().ok_or("集群模式需要 --data-dir")?;
     let node_id = cli.node_id.ok_or("集群模式需要 --node-id")?;
+    // F3：集群模式强制引导令牌（S2 修复默认生效）——否则任意网络可达者可注册 learner
+    // 拉走全量 Raft 日志（含密码哈希/会话哈希/密文）。dev-single 无 raft，不要求。
+    let join_token = cli
+        .join_token
+        .clone()
+        .ok_or("集群模式需要 --join-token（join 端点鉴权；集群内所有节点传相同值）")?;
+    // S5：raft 内部 RPC 端口同样要求共享令牌（纵深防御；防伪造 vote/append 制造选举抖动）
+    let raft_token = cli
+        .raft_token
+        .clone()
+        .ok_or("集群模式需要 --raft-token（raft RPC 鉴权；集群内所有节点传相同值）")?;
 
     let storage = RedbStorage::open(&data_dir)?;
     let db = storage.raw_db();
@@ -518,10 +575,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         http_addr: cli.http_addr.clone(),
         raft_addr: cli.raft_addr.clone(),
     };
-    let network = match &cli.raft_token {
-        Some(t) => HttpNetworkFactory::with_token(Some(t.clone())),
-        None => HttpNetworkFactory::new(),
-    };
+    let network = HttpNetworkFactory::with_token(Some(raft_token.clone()));
     let raft = dsh_raft::new_raft_node(
         node_id,
         node_info.clone(),
@@ -541,7 +595,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             node_id,
             node_info.clone(),
             join_url,
-            cli.join_token.as_deref(),
+            Some(join_token.as_str()),
         )
         .await?;
         eprintln!("node {node_id} join requested -> {join_url}");
@@ -576,10 +630,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // Raft RPC 服务（raft_addr）
-    let raft_state = match &cli.raft_token {
-        Some(t) => RaftServerState::with_token(raft.clone(), Some(Arc::from(t.as_str()))),
-        None => RaftServerState::new(raft.clone()),
-    };
+    let raft_state =
+        RaftServerState::with_token(raft.clone(), Some(Arc::from(raft_token.as_str())));
     let raft_router = dsh_raft::raft_router(raft_state);
     let raft_addr = cli.raft_addr.clone();
     tokio::spawn(async move {
@@ -605,7 +657,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .map(dsh_crypto::ring_file_path),
         cli.version_retention,
         cli.audit_retention,
-        cli.join_token.clone().map(Arc::from),
+        Some(Arc::from(join_token.as_str())),
+        trusted_proxies,
+        cli.data_plane_token.clone().map(Arc::from),
     );
     spawn_grpc(&cli, app.clone());
     let router = dsh_api::build_router(app);
@@ -614,7 +668,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "dsh node {node_id} listening on http://{} (raft {})",
         cli.http_addr, cli.raft_addr
     );
-    axum::serve(listener, router).await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

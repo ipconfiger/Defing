@@ -90,6 +90,15 @@ impl RedbStorage {
             }
         }
 
+        // F7a：数据库文件含全部密文/密码哈希/会话哈希 —— 权限收紧 0600
+        //（含存量 0644 文件一并修复，对齐 crypto::save_ring 的 ring 文件处理）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| redb_error("set db file permissions", e))?;
+        }
+
         Ok(Self {
             db: Arc::new(db),
             db_path,
@@ -227,6 +236,17 @@ mod tests {
         let dir = tmpdir("basic");
         let _ = std::fs::remove_dir_all(&dir);
         let store = RedbStorage::open(&dir.display().to_string()).unwrap();
+        // F7a：数据库文件权限必须为 0600（仅 Unix 断言）
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dir.join("dsh.redb"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "db 文件权限必须为 0600");
+        }
         // B1 回归：空库未写入前，读路径不得报 TableDoesNotExist
         assert!(store.get_prefix(b"").unwrap().is_empty());
         assert!(store.get(b"missing").unwrap().is_none());

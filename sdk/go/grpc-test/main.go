@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/defing/config-go/configclient"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func main() {
@@ -42,10 +44,17 @@ func main() {
 	}
 	fmt.Println("[go-grpc] get_item ok:", item)
 
+	// D-TEST：ListMembers 真断言——dev-single 下应为 FailedPrecondition（gRPC code 9）
 	if _, err := c.ListMembers(ctx); err != nil {
-		fmt.Println("[go-grpc] list_members skipped (dev-single):", err)
+		if status.Code(err) == codes.FailedPrecondition {
+			fmt.Println("[go-grpc] list_members dev-single → FailedPrecondition ✅")
+		} else {
+			fmt.Println("[go-grpc] FAIL list_members unexpected:", err)
+			os.Exit(1)
+		}
 	} else {
-		fmt.Println("[go-grpc] list_members ok")
+		fmt.Println("[go-grpc] FAIL list_members 不应在 dev-single 成功")
+		os.Exit(1)
 	}
 
 	stop, cancel := context.WithCancel(ctx)

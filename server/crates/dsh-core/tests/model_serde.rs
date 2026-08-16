@@ -96,6 +96,7 @@ fn version_record_kind_serde() {
         kind: VersionKind::Diff,
         snapshot_ref: None,
         diff_ref: Some("d".into()),
+        event_ty: Some(EventType::Rollback),
     };
     let json = serde_json::to_string(&v).unwrap();
     let back: VersionRecord = serde_json::from_str(&json).unwrap();

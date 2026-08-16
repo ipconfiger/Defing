@@ -144,6 +144,42 @@ impl Cipher {
         B64.encode(random_bytes::<32>())
     }
 
+    /// 用指定 KEK 自加密一个新主密钥（F7b：RotateMasterKey 命令载荷，避免 Raft 日志明文）。
+    /// 输出 = 12B nonce ‖ AEAD(KEK, new_kek)（32B 明文 + 16B tag）。
+    pub fn wrap_master_key(kek: &[u8; 32], new_kek: &[u8; 32]) -> Result<Vec<u8>, CryptoError> {
+        let nonce: [u8; 12] = random_bytes();
+        let kc = Aes256Gcm::new_from_slice(kek).map_err(CryptoError::from)?;
+        let ct = kc
+            .encrypt(Nonce::from_slice(&nonce), new_kek.as_slice())
+            .map_err(CryptoError::from)?;
+        let mut out = Vec::with_capacity(12 + ct.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+
+    /// 解出自加密的新主密钥（wrap_master_key 的逆）。
+    pub fn unwrap_master_key(kek: &[u8; 32], enc: &[u8]) -> Result<[u8; 32], CryptoError> {
+        if enc.len() < 13 {
+            return Err(CryptoError::Msg(
+                "wrap_master_key: payload too short".into(),
+            ));
+        }
+        let (nonce, ct) = enc.split_at(12);
+        let kc = Aes256Gcm::new_from_slice(kek).map_err(CryptoError::from)?;
+        let plain = kc
+            .decrypt(Nonce::from_slice(nonce), ct)
+            .map_err(CryptoError::from)?;
+        let mut out = [0u8; 32];
+        if plain.len() != 32 {
+            return Err(CryptoError::Msg(
+                "wrap_master_key: bad plaintext length".into(),
+            ));
+        }
+        out.copy_from_slice(&plain);
+        Ok(out)
+    }
+
     /// 加密：生成 DEK → 加密数据 → 当前 KEK 包装 DEK（dek_v = 当前代际）。
     pub fn encrypt_secret(&self, plain: &[u8]) -> Result<Ciphertext, CryptoError> {
         let ring = self.keyring();
@@ -317,6 +353,26 @@ mod tests {
         let loaded = load_master_key(Some(&k), None).unwrap().unwrap();
         assert_eq!(loaded.len(), 32);
         assert!(load_master_key(None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn wrap_unwrap_master_key_roundtrip() {
+        // F7b：自加密的新 KEK 可被持有旧 KEK 的节点解开
+        let old: [u8; 32] = [7u8; 32];
+        let new: [u8; 32] = [9u8; 32];
+        let enc = Cipher::wrap_master_key(&old, &new).unwrap();
+        assert_eq!(
+            enc.len(),
+            12 + 32 + 16,
+            "nonce(12) + plaintext(32) + AEAD tag(16)"
+        );
+        let back = Cipher::unwrap_master_key(&old, &enc).unwrap();
+        assert_eq!(back, new);
+        // 错误 KEK 解不开（AEAD 认证失败）
+        let wrong: [u8; 32] = [8u8; 32];
+        assert!(Cipher::unwrap_master_key(&wrong, &enc).is_err());
+        // 截断载荷拒绝
+        assert!(Cipher::unwrap_master_key(&old, &enc[..10]).is_err());
     }
 }
 

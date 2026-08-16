@@ -52,7 +52,14 @@ impl AuditLog {
         };
         let res = match &self.raft {
             None => {
-                let mut sm = self.sm.lock().expect("sm lock");
+                // F13：审计尽力而为——锁中毒仅告警不 panic
+                let mut sm = match self.sm.lock() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        tracing::warn!("audit append: state machine lock poisoned: {e:?}");
+                        return;
+                    }
+                };
                 sm.apply(&cmd, now_ms())
                     .map(|_| ())
                     .map_err(|e| e.to_string())
@@ -85,7 +92,8 @@ pub fn metrics_text(
     raft: Option<&RaftHandle>,
     master_key_ok: bool,
 ) -> String {
-    let guard = sm.lock().expect("sm lock");
+    // F13：指标为只读，锁中毒时取内部值继续（PoisonError::into_inner）
+    let guard = sm.lock().unwrap_or_else(|e| e.into_inner());
     let projects = guard.list_projects().map(|p| p.len()).unwrap_or(0);
     let mut out = String::new();
     out.push_str("# HELP dsh_projects 项目数\n");

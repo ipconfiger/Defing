@@ -37,7 +37,7 @@ enum ValueType {
   BOOL    = 4;
   JSON    = 5;   // 存规范化 JSON 文本
   ARRAY   = 6;   // 字符串数组（元素类型约束见文档）
-  SECRET  = 7;   // 敏感项：传输时按需解密，展示/导出脱敏
+  SECRET  = 7;   // 敏感项：数据面恒脱敏（masked=true），展示/导出脱敏
 }
 
 message Value {
