@@ -143,7 +143,7 @@ pub enum Command {
         issued_at: i64,
         expires_at: Option<i64>,
     },
-    /// 登出：清除会话（幂等）。
+    /// 登出：清除会话（幂等）。unit 变体保持原状（旧日志 wire 兼容）。
     SessionLogout,
     /// 心跳续期：更新 expires_at；无会话 → ERR_SESSION_EXPIRED。
     SessionHeartbeat { expires_at: Option<i64> },
@@ -157,9 +157,9 @@ pub enum Command {
         #[serde(default)]
         ts: i64,
     },
-    /// 删除项目管理员账号（级联删除其会话）。
+    /// 删除项目管理员账号（级联删除其全部会话）。
     ProjectAdminDelete { username: String },
-    /// 修改项目管理员密码（级联删除其会话，需重新登录）。
+    /// 修改项目管理员密码（级联删除其全部会话，需重新登录）。
     ProjectAdminSetPassword {
         username: String,
         salt: String,
@@ -183,6 +183,47 @@ pub enum Command {
     },
     /// 修改管理员密码（哈希落状态机，集群一致；登录优先用它校验，回退节点配置）。
     AdminSetPassword { password_hash: String },
+
+    // ---------------- 多会话变体（multisession 改造，纯新增，B1/N10：既有变体不动） ----------------
+    /// 多会话管理员登录：写 sess/admin/{session_id}（多会话并存，不检查已存在、不 409）。
+    /// 仅新代码使用；旧节点反序列化本变体失败 → 升级纪律：全集群升级后启用多会话。
+    MultiSessionLogin {
+        token_hash: String,
+        issued_at: i64,
+        expires_at: Option<i64>,
+        session_id: String,
+    },
+    /// 多会话管理员登出：删 sess/admin/{session_id}（幂等）。
+    MultiSessionLogout { session_id: String },
+    /// 多会话管理员心跳：续期 sess/admin/{session_id}（无该会话 → ERR_SESSION_EXPIRED）。
+    MultiSessionHeartbeat {
+        session_id: String,
+        expires_at: Option<i64>,
+    },
+    /// 多会话 PA 登录：写 sess/pa/{username}/{session_id}（多会话并存，不 409）。
+    MultiPaSessionLogin {
+        username: String,
+        token_hash: String,
+        issued_at: i64,
+        expires_at: Option<i64>,
+        device_id: String,
+        session_id: String,
+    },
+    /// 多会话 PA 登出：删 sess/pa/{username}/{session_id}（幂等）。
+    MultiPaSessionLogout {
+        username: String,
+        session_id: String,
+    },
+    /// 多会话 PA 心跳：续期 sess/pa/{username}/{session_id}。
+    MultiPaSessionHeartbeat {
+        username: String,
+        session_id: String,
+        expires_at: Option<i64>,
+    },
+    /// 踢全部管理员会话（multisession：删旧 key + 前缀扫全部；force-logout 批量）。
+    MultiSessionLogoutAll,
+    /// 踢某 PA 账号全部会话（multisession：删旧 key + 前缀扫全部）。
+    MultiPaSessionLogoutAll { username: String },
     /// 审计落库（seq 由状态机单调分配并覆写；经 Raft 复制，集群一致）。
     AuditAppend { entry: crate::model::AuditEntry },
     /// 主密钥轮换（集群一致）：新 KEK 经 Raft 复制到全部节点；各节点 apply 时更新本地 keyring 并持久化 ring 文件。

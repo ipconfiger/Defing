@@ -219,6 +219,11 @@ impl StateMachine {
         self.load_merged(session_key())
     }
 
+    /// 多会话管理员会话：读 sess/admin/{session_id}（multisession 改造）。
+    pub fn get_session_with(&self, session_id: &str) -> Result<Option<AdminSession>, Error> {
+        self.load_merged(&session_key_with(session_id))
+    }
+
     /// 审计查询：按 action 过滤、since（ts ≥ since，墙钟 ms）过滤、按 seq 倒序、limit 截断。
     pub fn get_audit(
         &self,
@@ -849,6 +854,47 @@ impl StateMachine {
             Command::AdminSetPassword { password_hash } => {
                 self.apply_admin_set_password(password_hash)
             }
+            Command::MultiSessionLogin {
+                token_hash,
+                issued_at,
+                expires_at,
+                session_id,
+            } => self.apply_multi_session_login(token_hash, *issued_at, *expires_at, session_id),
+            Command::MultiSessionLogout { session_id } => {
+                self.apply_multi_session_logout(session_id)
+            }
+            Command::MultiSessionHeartbeat {
+                session_id,
+                expires_at,
+            } => self.apply_multi_session_heartbeat(session_id, *expires_at),
+            Command::MultiPaSessionLogin {
+                username,
+                token_hash,
+                issued_at,
+                expires_at,
+                device_id,
+                session_id,
+            } => self.apply_multi_pa_session_login(
+                username,
+                token_hash,
+                *issued_at,
+                *expires_at,
+                device_id,
+                session_id,
+            ),
+            Command::MultiPaSessionLogout {
+                username,
+                session_id,
+            } => self.apply_multi_pa_session_logout(username, session_id),
+            Command::MultiPaSessionHeartbeat {
+                username,
+                session_id,
+                expires_at,
+            } => self.apply_multi_pa_session_heartbeat(username, session_id, *expires_at),
+            Command::MultiSessionLogoutAll => self.apply_multi_session_logout_all(),
+            Command::MultiPaSessionLogoutAll { username } => {
+                self.apply_multi_pa_session_logout_all(username)
+            }
             Command::AuditAppend { entry } => self.apply_audit_append(entry),
             Command::RotateMasterKey { .. } => self.apply_rotate_master_key(),
         }
@@ -896,12 +942,10 @@ impl StateMachine {
             self.delete_pending(&k)?;
         }
         self.delete_pending(idx_pname(&project.name).as_bytes())?;
-        // 级联删除该项目全部项目管理员账号及其会话（设计 §5）
+        // 级联删除该项目全部项目管理员账号及其会话（设计 §5；多会话双删）
         for acct in self.list_project_admins(&id.0)? {
-            self.store
-                .delete(pa_session_key(&acct.username).as_bytes())?;
-            self.store
-                .delete(project_admin_key(&acct.username).as_bytes())?;
+            self.delete_all_pa_sessions(&acct.username)?;
+            self.delete_pending(project_admin_key(&acct.username).as_bytes())?;
         }
         // N1：清理孤儿全局引用索引（共享项发布级联扫描会命中已删项目，索引脏数据需一并清除）。
         // 共享 group/key 与项目名/组名均受 valid_key_name 字符集约束（无 `/`），按 `/` 切分可靠。
@@ -1798,6 +1842,110 @@ impl StateMachine {
         Ok(vec![])
     }
 
+    // ---------------- 多会话（multisession 改造，纯新增变体） ----------------
+
+    /// 多会话管理员登录：写 sess/admin/{session_id}（多会话并存，不检查已存在、不 409）。
+    fn apply_multi_session_login(
+        &mut self,
+        token_hash: &str,
+        issued_at: i64,
+        expires_at: Option<i64>,
+        session_id: &str,
+    ) -> ApplyOutcome {
+        let session = AdminSession {
+            token_hash: token_hash.to_string(),
+            issued_at,
+            expires_at,
+            device_id: "cli".into(),
+            principal: Principal::Admin,
+        };
+        self.save_pending(&session_key_with(session_id), &session)?;
+        Ok(vec![])
+    }
+
+    /// 多会话管理员登出：删 sess/admin/{session_id}（幂等）。
+    fn apply_multi_session_logout(&mut self, session_id: &str) -> ApplyOutcome {
+        self.delete_pending(session_key_with(session_id).as_bytes())?;
+        Ok(vec![])
+    }
+
+    /// 多会话管理员心跳：续期 sess/admin/{session_id}（无该会话 → ERR_SESSION_EXPIRED）。
+    fn apply_multi_session_heartbeat(
+        &mut self,
+        session_id: &str,
+        expires_at: Option<i64>,
+    ) -> ApplyOutcome {
+        let key = session_key_with(session_id);
+        let mut session: AdminSession = self
+            .load_merged(&key)?
+            .ok_or_else(|| Error::new(ErrorKind::SessionExpired, "会话不存在或已过期"))?;
+        session.expires_at = expires_at;
+        self.save_pending(&key, &session)?;
+        Ok(vec![])
+    }
+
+    /// 多会话 PA 登录：写 sess/pa/{username}/{session_id}（多会话并存，不 409）。
+    #[allow(clippy::too_many_arguments)]
+    fn apply_multi_pa_session_login(
+        &mut self,
+        username: &str,
+        token_hash: &str,
+        issued_at: i64,
+        expires_at: Option<i64>,
+        device_id: &str,
+        session_id: &str,
+    ) -> ApplyOutcome {
+        let session = AdminSession {
+            token_hash: token_hash.to_string(),
+            issued_at,
+            expires_at,
+            device_id: device_id.to_string(),
+            principal: Principal::ProjectAdmin {
+                username: username.to_string(),
+                project: self
+                    .get_project_admin(username)?
+                    .map(|a| a.project)
+                    .ok_or_else(|| Error::new(ErrorKind::NotFound, "账号不存在"))?,
+            },
+        };
+        self.save_pending(&pa_session_key_with(username, session_id), &session)?;
+        Ok(vec![])
+    }
+
+    /// 多会话 PA 登出：删 sess/pa/{username}/{session_id}（幂等）。
+    fn apply_multi_pa_session_logout(&mut self, username: &str, session_id: &str) -> ApplyOutcome {
+        self.delete_pending(pa_session_key_with(username, session_id).as_bytes())?;
+        Ok(vec![])
+    }
+
+    /// 多会话 PA 心跳：续期 sess/pa/{username}/{session_id}。
+    fn apply_multi_pa_session_heartbeat(
+        &mut self,
+        username: &str,
+        session_id: &str,
+        expires_at: Option<i64>,
+    ) -> ApplyOutcome {
+        let key = pa_session_key_with(username, session_id);
+        let mut session: AdminSession = self
+            .load_merged(&key)?
+            .ok_or_else(|| Error::new(ErrorKind::SessionExpired, "会话不存在或已过期"))?;
+        session.expires_at = expires_at;
+        self.save_pending(&key, &session)?;
+        Ok(vec![])
+    }
+
+    /// 踢全部管理员会话（multisession：旧 key + 前缀双删）。
+    fn apply_multi_session_logout_all(&mut self) -> ApplyOutcome {
+        self.delete_all_admin_sessions()?;
+        Ok(vec![])
+    }
+
+    /// 踢某 PA 账号全部会话（multisession：旧 key + 前缀双删）。
+    fn apply_multi_pa_session_logout_all(&mut self, username: &str) -> ApplyOutcome {
+        self.delete_all_pa_sessions(username)?;
+        Ok(vec![])
+    }
+
     // ---------------- 项目管理员（Project Admin）----------------
     // 设计文档 docs/design/project-admin.md §3.1/§6。
     // 会话判定只看 is_some()，不读墙钟（D16 确定性）。
@@ -1847,12 +1995,35 @@ impl StateMachine {
         Ok(vec![])
     }
 
+    /// 删除某 PA 账号的全部会话（multisession 改造）：旧格式单 key + 多会话前缀双删。
+    fn delete_all_pa_sessions(&mut self, username: &str) -> Result<(), Error> {
+        // 旧格式单 key（sess/pa/{username}，旧客户端/旧日志产生）——显式删
+        self.delete_pending(pa_session_key(username).as_bytes())?;
+        // 多会话前缀（sess/pa/{username}/...）——前缀扫全部删
+        let prefix = pa_session_prefix(username);
+        let rows = self.get_prefix_merged(prefix.as_bytes())?;
+        for (k, _) in rows {
+            self.delete_pending(&k)?;
+        }
+        Ok(())
+    }
+
+    /// 删除全部管理员会话（multisession 改造）：旧 key + 前缀双删。
+    fn delete_all_admin_sessions(&mut self) -> Result<(), Error> {
+        self.delete_pending(session_key().as_bytes())?;
+        let rows = self.get_prefix_merged(K_SESSION_PREFIX.as_bytes())?;
+        for (k, _) in rows {
+            self.delete_pending(&k)?;
+        }
+        Ok(())
+    }
+
     fn apply_project_admin_delete(&mut self, username: &str) -> ApplyOutcome {
         let key = project_admin_key(username);
         if load::<ProjectAdminAccount>(&*self.store, &key)?.is_none() {
             return Err(Error::new(ErrorKind::NotFound, "账号不存在"));
         }
-        self.delete_pending(pa_session_key(username).as_bytes())?;
+        self.delete_all_pa_sessions(username)?;
         self.delete_pending(key.as_bytes())?;
         Ok(vec![])
     }
@@ -1870,8 +2041,8 @@ impl StateMachine {
         acct.salt = salt.to_string();
         acct.password_hash = password_hash.to_string();
         self.save_pending(&key, &acct)?;
-        // 改密即时收回会话（权限立即生效）
-        self.delete_pending(pa_session_key(username).as_bytes())?;
+        // 改密即时收回全部会话（权限立即生效；旧+新格式双删）
+        self.delete_all_pa_sessions(username)?;
         Ok(vec![])
     }
 
@@ -1945,6 +2116,27 @@ impl StateMachine {
 
     pub fn get_pa_session(&self, username: &str) -> Result<Option<AdminSession>, Error> {
         self.load_merged(&pa_session_key(username))
+    }
+
+    /// 多会话 PA 会话：读 sess/pa/{username}/{session_id}（multisession 改造）。
+    pub fn get_pa_session_with(
+        &self,
+        username: &str,
+        session_id: &str,
+    ) -> Result<Option<AdminSession>, Error> {
+        self.load_merged(&pa_session_key_with(username, session_id))
+    }
+
+    /// 列出全部管理员会话（multisession：前缀扫 sess/admin/；force-logout 批量/审计用）。
+    pub fn list_admin_sessions(&self) -> Result<Vec<AdminSession>, Error> {
+        let rows = self.get_prefix_merged(K_SESSION_PREFIX.as_bytes())?;
+        let mut out = Vec::new();
+        for (_, v) in rows {
+            if let Ok(s) = serde_json::from_slice::<AdminSession>(&v) {
+                out.push(s);
+            }
+        }
+        Ok(out)
     }
 
     fn apply_admin_set_password(&mut self, password_hash: &str) -> ApplyOutcome {

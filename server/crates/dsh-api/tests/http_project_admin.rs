@@ -159,16 +159,23 @@ async fn pa_login_flow_and_role_response() {
         "token 前缀路由格式: {token}"
     );
 
-    // 重复登录 → 409 ERR_SESSION_IN_USE（每账号单会话）
-    let (code, body) = pa_login(&s.base, "alice", "alicepw").await;
-    assert_eq!(code, 409);
-    assert_eq!(body["code"], "ERR_SESSION_IN_USE");
+    // 重复登录 → 200（multisession：多会话并存，不再 409）
+    let (code, body2) = pa_login(&s.base, "alice", "alicepw").await;
+    assert_eq!(code, 200, "多会话并存：重复登录应成功: {body2}");
+    let token2 = body2["token"].as_str().unwrap().to_string();
+    assert_ne!(token, token2, "两个会话 token 应不同");
 
-    // 登出后可重登
+    // 会话独立：登出仅影响自己
     let (code, _) = req(&s.base, "POST", "/api/v1/logout", Some(token), None).await;
     assert_eq!(code, 204);
+    let (code, _) = req(&s.base, "POST", "/api/v1/heartbeat", Some(token), None).await;
+    assert_eq!(code, 401, "登出的会话已失效");
+    let (code, _) = req(&s.base, "POST", "/api/v1/heartbeat", Some(&token2), None).await;
+    assert_eq!(code, 200, "另一会话不受影响（独立管理）");
+    let (code, _) = req(&s.base, "POST", "/api/v1/logout", Some(&token2), None).await;
+    assert_eq!(code, 204);
     let (code, _) = pa_login(&s.base, "alice", "alicepw").await;
-    assert_eq!(code, 200);
+    assert_eq!(code, 200, "登出后可重登");
 
     // 错误密码与不存在账号 → 同码同文案（防枚举）
     let (c1, b1) = pa_login(&s.base, "alice", "wrong").await;
@@ -610,18 +617,23 @@ async fn expired_session_relogin_and_heartbeat_ttl() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_login_single_session() {
+async fn concurrent_login_multi_session() {
     let s = start().await;
-    // 并发两路登录同一账号（N13：最坏一路 409，恰一会话成立）
+    // multisession：并发两路登录同一账号 → 均成功，两个独立会话
     let (r1, r2) = tokio::join!(
         pa_login(&s.base, "alice", "alicepw"),
         pa_login(&s.base, "alice", "alicepw"),
     );
     let codes = [r1.0, r2.0];
     let ok = codes.iter().filter(|&&c| c == 200).count();
-    let conflict = codes.iter().filter(|&&c| c == 409).count();
-    assert_eq!(ok, 1, "并发登录恰一成功: {codes:?}");
-    assert_eq!(conflict, 1, "另一路 409: {codes:?}");
+    assert_eq!(ok, 2, "多会话并存：并发登录应均成功: {codes:?}");
+    let t1 = r1.1["token"].as_str().unwrap();
+    let t2 = r2.1["token"].as_str().unwrap();
+    assert_ne!(t1, t2, "两个会话 token 应不同");
+    // 两个 token 均有效（独立会话）
+    let (c1, _) = req(&s.base, "POST", "/api/v1/heartbeat", Some(t1), None).await;
+    let (c2, _) = req(&s.base, "POST", "/api/v1/heartbeat", Some(t2), None).await;
+    assert_eq!((c1, c2), (200, 200), "两个会话均有效");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

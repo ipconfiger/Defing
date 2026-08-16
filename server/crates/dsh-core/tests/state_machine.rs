@@ -1522,3 +1522,303 @@ fn rewrap_deks_covers_diff_secrets() {
         other => panic!("应为 Secret: {other:?}"),
     }
 }
+
+// ---------------- 多会话（multisession 改造，纯新增变体） ----------------
+
+/// T1: 多会话并存——同账号连续登录多次均成功，多个 key 各自独立。
+#[test]
+fn multi_session_coexists() {
+    let mut s = sm();
+
+    // 管理员多会话
+    for i in 0..3 {
+        let sid = format!("sid{i}");
+        s.apply(
+            &Command::MultiSessionLogin {
+                token_hash: format!("hash{i}"),
+                issued_at: 100 + i,
+                expires_at: None,
+                session_id: sid.clone(),
+            },
+            10 + i,
+        )
+        .unwrap();
+        assert!(
+            s.get_session_with(&sid).unwrap().is_some(),
+            "sess/admin/{sid} 应存在"
+        );
+    }
+    assert_eq!(
+        s.list_admin_sessions().unwrap().len(),
+        3,
+        "3 个管理员会话并存"
+    );
+    // PA 多会话（先建项目）
+    s.apply(
+        &Command::ProjectCreate {
+            name: "p".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        19,
+    )
+    .unwrap();
+    s.apply(
+        &Command::ProjectAdminCreate {
+            project: "p".into(),
+            username: "alice".into(),
+            salt: "salt".into(),
+            password_hash: "ph".into(),
+            ts: 0,
+        },
+        20,
+    )
+    .unwrap();
+    for i in 0..2 {
+        let sid = format!("pasid{i}");
+        s.apply(
+            &Command::MultiPaSessionLogin {
+                username: "alice".into(),
+                token_hash: format!("phash{i}"),
+                issued_at: 200 + i,
+                expires_at: None,
+                device_id: "cli".into(),
+                session_id: sid.clone(),
+            },
+            30 + i,
+        )
+        .unwrap();
+        assert!(
+            s.get_pa_session_with("alice", &sid).unwrap().is_some(),
+            "sess/pa/alice/{sid} 应存在"
+        );
+    }
+}
+
+/// T2: 每会话独立登出——删一个不影响另一个。
+#[test]
+fn multi_session_independent_logout() {
+    let mut s = sm();
+    for i in 0..2 {
+        s.apply(
+            &Command::MultiSessionLogin {
+                token_hash: format!("h{i}"),
+                issued_at: 100 + i,
+                expires_at: None,
+                session_id: format!("s{i}"),
+            },
+            10 + i,
+        )
+        .unwrap();
+    }
+    s.apply(
+        &Command::MultiSessionLogout {
+            session_id: "s0".into(),
+        },
+        20,
+    )
+    .unwrap();
+    assert!(s.get_session_with("s0").unwrap().is_none(), "s0 已登出");
+    assert!(s.get_session_with("s1").unwrap().is_some(), "s1 不受影响");
+}
+
+/// T3: 每会话独立心跳——仅续期指定会话。
+#[test]
+fn multi_session_independent_heartbeat() {
+    let mut s = sm();
+    s.apply(
+        &Command::MultiSessionLogin {
+            token_hash: "h0".into(),
+            issued_at: 100,
+            expires_at: None,
+            session_id: "s0".into(),
+        },
+        10,
+    )
+    .unwrap();
+    s.apply(
+        &Command::MultiSessionLogin {
+            token_hash: "h1".into(),
+            issued_at: 100,
+            expires_at: None,
+            session_id: "s1".into(),
+        },
+        11,
+    )
+    .unwrap();
+    s.apply(
+        &Command::MultiSessionHeartbeat {
+            session_id: "s0".into(),
+            expires_at: Some(9999),
+        },
+        12,
+    )
+    .unwrap();
+    assert_eq!(
+        s.get_session_with("s0").unwrap().unwrap().expires_at,
+        Some(9999),
+        "s0 已续期"
+    );
+    assert_eq!(
+        s.get_session_with("s1").unwrap().unwrap().expires_at,
+        None,
+        "s1 未受影响"
+    );
+    // 不存在会话心跳 → SessionExpired
+    let e = s
+        .apply(
+            &Command::MultiSessionHeartbeat {
+                session_id: "ghost".into(),
+                expires_at: Some(1),
+            },
+            13,
+        )
+        .unwrap_err();
+    assert_eq!(e.kind, dsh_core::ErrorKind::SessionExpired);
+}
+
+/// T4/T5: force-logout 单个与批量。
+#[test]
+fn multi_session_force_logout_single_and_all() {
+    let mut s = sm();
+    for i in 0..3 {
+        s.apply(
+            &Command::MultiSessionLogin {
+                token_hash: format!("h{i}"),
+                issued_at: 100 + i,
+                expires_at: None,
+                session_id: format!("s{i}"),
+            },
+            10 + i,
+        )
+        .unwrap();
+    }
+    // 单个踢
+    s.apply(
+        &Command::MultiSessionLogout {
+            session_id: "s1".into(),
+        },
+        20,
+    )
+    .unwrap();
+    assert!(s.get_session_with("s1").unwrap().is_none());
+    assert!(s.get_session_with("s0").unwrap().is_some());
+    // 批量踢全部
+    s.apply(&Command::MultiSessionLogoutAll, 21).unwrap();
+    assert_eq!(s.list_admin_sessions().unwrap().len(), 0, "全部会话已清");
+    // 旧格式单 key 也被批量清（兼容）
+    s.apply(
+        &Command::SessionLogin {
+            token_hash: "old".into(),
+            issued_at: 1,
+            expires_at: None,
+        },
+        22,
+    )
+    .unwrap();
+    s.apply(&Command::MultiSessionLogoutAll, 23).unwrap();
+    assert!(s.get_session().unwrap().is_none(), "旧格式会话也被清");
+}
+
+/// T6: 旧格式兼容——无 sid 的旧命令/旧日志走单会话语义。
+#[test]
+fn multi_session_legacy_compat() {
+    let mut s = sm();
+    // 旧 SessionLogin（无 sid）→ 单会话：第二次 409
+    s.apply(
+        &Command::SessionLogin {
+            token_hash: "a".into(),
+            issued_at: 1,
+            expires_at: None,
+        },
+        1,
+    )
+    .unwrap();
+    let e = s
+        .apply(
+            &Command::SessionLogin {
+                token_hash: "b".into(),
+                issued_at: 2,
+                expires_at: None,
+            },
+            2,
+        )
+        .unwrap_err();
+    assert_eq!(e.kind, dsh_core::ErrorKind::SessionInUse, "旧命令仍单会话");
+    // 新 MultiSessionLogin 不受旧会话影响（并存）
+    s.apply(
+        &Command::MultiSessionLogin {
+            token_hash: "c".into(),
+            issued_at: 3,
+            expires_at: None,
+            session_id: "n1".into(),
+        },
+        3,
+    )
+    .unwrap();
+    assert!(s.get_session().unwrap().is_some(), "旧会话仍在");
+    assert!(s.get_session_with("n1").unwrap().is_some(), "新会话并存");
+}
+
+/// T7: 改密/删号级联清全部会话（旧+新格式双删）。
+#[test]
+fn multi_session_cascade_clears_all() {
+    let mut s = sm();
+    s.apply(
+        &Command::ProjectCreate {
+            name: "p".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        1,
+    )
+    .unwrap();
+    s.apply(
+        &Command::ProjectAdminCreate {
+            project: "p".into(),
+            username: "bob".into(),
+            salt: "s".into(),
+            password_hash: "h".into(),
+            ts: 0,
+        },
+        1,
+    )
+    .unwrap();
+    // 旧格式 + 新格式两个会话
+    s.apply(
+        &Command::PaSessionLogin {
+            username: "bob".into(),
+            token_hash: "old".into(),
+            issued_at: 1,
+            expires_at: None,
+            device_id: "cli".into(),
+        },
+        2,
+    )
+    .unwrap();
+    s.apply(
+        &Command::MultiPaSessionLogin {
+            username: "bob".into(),
+            token_hash: "new".into(),
+            issued_at: 3,
+            expires_at: None,
+            device_id: "cli".into(),
+            session_id: "n1".into(),
+        },
+        3,
+    )
+    .unwrap();
+    // 删号 → 全部会话清
+    s.apply(
+        &Command::ProjectAdminDelete {
+            username: "bob".into(),
+        },
+        4,
+    )
+    .unwrap();
+    assert!(s.get_pa_session("bob").unwrap().is_none(), "旧格式会话已清");
+    assert!(
+        s.get_pa_session_with("bob", "n1").unwrap().is_none(),
+        "新格式会话已清"
+    );
+}

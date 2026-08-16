@@ -365,11 +365,18 @@ fn resolve_principal(app: &ApiState, auth_header: Option<&str>) -> Result<dsh_co
         .ok_or(())?;
     let hash = dsh_core::token_hash(token);
     let sm = app.sm.read().map_err(|_| ())?;
-    // token 前缀路由（§3）：pa.{username}.{secret} → sess/pa/{username}；
-    // adm.{secret} 或无前缀（旧格式 fallback）→ sess/admin。
+    // token 前缀路由（multisession 改造）：adm.{sid}.{secret} → sess/admin/{sid}；
+    // pa.{username}.{sid}.{secret} → sess/pa/{username}/{sid}；旧格式（无 sid）fallback 旧 key。
     let (_, session) = if let Some(rest) = token.strip_prefix("pa.") {
-        let username = rest.split('.').next().unwrap_or("");
-        let session = sm.get_pa_session(username).ok().flatten();
+        let parts: Vec<&str> = rest.split('.').collect();
+        let username = parts.first().copied().unwrap_or("");
+        let session = if parts.len() >= 3 {
+            // 新格式 pa.{username}.{sid}.{secret}
+            sm.get_pa_session_with(username, parts[1]).ok().flatten()
+        } else {
+            // 旧格式 pa.{username}.{secret}
+            sm.get_pa_session(username).ok().flatten()
+        };
         (
             dsh_core::Principal::ProjectAdmin {
                 username: username.to_string(),
@@ -377,7 +384,18 @@ fn resolve_principal(app: &ApiState, auth_header: Option<&str>) -> Result<dsh_co
             },
             session,
         )
+    } else if let Some(rest) = token.strip_prefix("adm.") {
+        let parts: Vec<&str> = rest.split('.').collect();
+        let session = if parts.len() >= 2 {
+            // 新格式 adm.{sid}.{secret}
+            sm.get_session_with(parts[0]).ok().flatten()
+        } else {
+            // 旧格式 adm.{secret}
+            sm.get_session().ok().flatten()
+        };
+        (dsh_core::Principal::Admin, session)
     } else {
+        // 无前缀旧格式 fallback
         (dsh_core::Principal::Admin, sm.get_session().ok().flatten())
     };
     match session {
@@ -392,6 +410,26 @@ fn resolve_principal(app: &ApiState, auth_header: Option<&str>) -> Result<dsh_co
         }
         None => Err(()),
     }
+}
+
+/// 从 Authorization 头提取当前会话的 session_id（multisession 改造）：
+/// 新格式 adm.{sid}.{secret} / pa.{username}.{sid}.{secret} → 第 2 段；
+/// 旧格式（无 sid）→ None（走旧单会话路径）。
+/// 与 resolve_principal 同一 token 解析纪律（N15），logout/heartbeat 用。
+fn token_session_id(auth_header: Option<&str>) -> Option<String> {
+    let token = auth_header?.strip_prefix("Bearer ")?;
+    if let Some(rest) = token.strip_prefix("pa.") {
+        let parts: Vec<&str> = rest.split('.').collect();
+        if parts.len() >= 3 {
+            return Some(parts[1].to_string());
+        }
+    } else if let Some(rest) = token.strip_prefix("adm.") {
+        let parts: Vec<&str> = rest.split('.').collect();
+        if parts.len() >= 2 {
+            return Some(parts[0].to_string());
+        }
+    }
+    None
 }
 
 /// 从未解码 path 提取 /api/v1/projects/{p}/... 的 {p} 段（N2：URL 编码/大写/特殊字符
@@ -1929,9 +1967,19 @@ struct LoginResp {
     project: Option<String>,
 }
 
-/// 生成项目管理员 token：pa.{username}.{secret}（§3 token 前缀路由）。
-fn new_pa_token(username: &str) -> String {
-    format!("pa.{username}.{}", new_token())
+/// 会话标识（multisession 改造）：随机 32B hex，作会话 key 的一部分 + token 内嵌。
+fn new_session_id() -> String {
+    new_token()
+}
+
+/// 生成管理员 token：adm.{session_id}.{secret}（multisession：sid 内嵌，O(1) 路由到 sess/admin/{sid}）。
+fn new_admin_token(session_id: &str) -> String {
+    format!("adm.{session_id}.{}", new_token())
+}
+
+/// 生成项目管理员 token：pa.{username}.{session_id}.{secret}（multisession）。
+fn new_pa_token(username: &str, session_id: &str) -> String {
+    format!("pa.{username}.{session_id}.{}", new_token())
 }
 
 async fn login(
@@ -1996,19 +2044,22 @@ async fn login(
         ));
     }
     // 会话落 Raft 状态机（I7）：token 明文只在响应中返回一次，状态机仅存 SHA-256 哈希。
+    // multisession 改造：token 带 session_id（adm.{sid}.{secret}），MultiSessionLogin 多会话并存（不 409）。
     // 非 leader 时跟随 leader_hint 转发到 leader 的公开 login 端点（跨节点唯一）。
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let token = new_token();
+        let session_id = new_session_id();
+        let token = new_admin_token(&session_id);
         let hash = dsh_core::token_hash(&token);
         let ttl = app.session_ttl;
         let now = now_ms();
         let res = app
             .write(
-                &Command::SessionLogin {
+                &Command::MultiSessionLogin {
                     token_hash: hash,
                     issued_at: now,
                     expires_at: (ttl.as_secs() > 0).then(|| now + ttl.as_secs() as i64),
+                    session_id,
                 },
                 now,
             )
@@ -2158,20 +2209,22 @@ async fn pa_login(
     let project = account.map(|a| a.project.0).unwrap_or_default();
     let operator = format!("pa:{username}");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut retried_expired = false;
     loop {
-        let token = new_pa_token(&username);
+        // multisession 改造：token 带 sid（pa.{username}.{sid}.{secret}），MultiPaSessionLogin 多会话并存（不 409）
+        let session_id = new_session_id();
+        let token = new_pa_token(&username, &session_id);
         let hash = dsh_core::token_hash(&token);
         let ttl = app.session_ttl;
         let now = now_ms();
         let res = app
             .write(
-                &Command::PaSessionLogin {
+                &Command::MultiPaSessionLogin {
                     username: username.clone(),
                     token_hash: hash,
                     issued_at: now,
                     expires_at: (ttl.as_secs() > 0).then(|| now + ttl.as_secs() as i64),
                     device_id: "cli".into(),
+                    session_id,
                 },
                 now,
             )
@@ -2195,38 +2248,6 @@ async fn pa_login(
                     role: Some("project_admin".into()),
                     project: Some(project),
                 }));
-            }
-            Err(ApiError(e)) if e.kind == ErrorKind::SessionInUse => {
-                // N13：已有会话已过期 → 先登出再重试一轮（仅一次）
-                let expired = {
-                    let sm = app.sm.read().map_err(lock_err)?;
-                    sm.get_pa_session(&username)
-                        .ok()
-                        .flatten()
-                        .and_then(|s| s.expires_at)
-                        .map(|exp| now_ms() >= exp)
-                        .unwrap_or(false)
-                };
-                if expired && !retried_expired {
-                    retried_expired = true;
-                    let _ = app
-                        .write(
-                            &Command::PaSessionLogout {
-                                username: username.clone(),
-                            },
-                            now_ms(),
-                        )
-                        .await;
-                    continue;
-                }
-                return Err((
-                    StatusCode::CONFLICT,
-                    Json(ApiErrorBody {
-                        code: "ERR_SESSION_IN_USE".into(),
-                        message: "该账号已有会话在线".into(),
-                        detail: None,
-                    }),
-                ));
             }
             Err(ApiError(e)) if e.kind == ErrorKind::LeaderRedirect => {
                 // 非 leader：转发到 leader（透传 username）
@@ -2304,22 +2325,47 @@ async fn pa_login(
 
 async fn logout(
     State(app): State<ApiState>,
+    headers: axum::http::HeaderMap,
     principal: axum::Extension<dsh_core::Principal>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiErrorBody>)> {
     let operator = principal_op(&principal);
+    // multisession：token 带 sid → 只删自己的会话；旧格式（无 sid）→ 旧单会话命令
+    let sid = token_session_id(
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+    );
     match principal.0 {
-        dsh_core::Principal::Admin => {
-            app.write(&Command::SessionLogout, now_ms()).await?;
-        }
-        dsh_core::Principal::ProjectAdmin { ref username, .. } => {
-            app.write(
-                &Command::PaSessionLogout {
-                    username: username.clone(),
-                },
-                now_ms(),
-            )
-            .await?;
-        }
+        dsh_core::Principal::Admin => match sid {
+            Some(sid) => {
+                app.write(&Command::MultiSessionLogout { session_id: sid }, now_ms())
+                    .await?;
+            }
+            None => {
+                app.write(&Command::SessionLogout, now_ms()).await?;
+            }
+        },
+        dsh_core::Principal::ProjectAdmin { ref username, .. } => match sid {
+            Some(sid) => {
+                app.write(
+                    &Command::MultiPaSessionLogout {
+                        username: username.clone(),
+                        session_id: sid,
+                    },
+                    now_ms(),
+                )
+                .await?;
+            }
+            None => {
+                app.write(
+                    &Command::PaSessionLogout {
+                        username: username.clone(),
+                    },
+                    now_ms(),
+                )
+                .await?;
+            }
+        },
     }
     app.audit
         .append(
@@ -2345,31 +2391,63 @@ fn principal_op(p: &dsh_core::Principal) -> String {
 
 async fn heartbeat(
     State(app): State<ApiState>,
+    headers: axum::http::HeaderMap,
     principal: axum::Extension<dsh_core::Principal>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiErrorBody>)> {
     let ttl = app.session_ttl;
     let now = now_ms();
     let expires = (ttl.as_secs() > 0).then(|| now + ttl.as_secs() as i64);
+    // multisession：token 带 sid → 续期自己的会话；旧格式 → 旧单会话命令
+    let sid = token_session_id(
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+    );
     match principal.0 {
-        dsh_core::Principal::Admin => {
-            app.write(
-                &Command::SessionHeartbeat {
-                    expires_at: expires,
-                },
-                now,
-            )
-            .await?;
-        }
-        dsh_core::Principal::ProjectAdmin { ref username, .. } => {
-            app.write(
-                &Command::PaSessionHeartbeat {
-                    username: username.clone(),
-                    expires_at: expires,
-                },
-                now,
-            )
-            .await?;
-        }
+        dsh_core::Principal::Admin => match sid {
+            Some(sid) => {
+                app.write(
+                    &Command::MultiSessionHeartbeat {
+                        session_id: sid,
+                        expires_at: expires,
+                    },
+                    now,
+                )
+                .await?;
+            }
+            None => {
+                app.write(
+                    &Command::SessionHeartbeat {
+                        expires_at: expires,
+                    },
+                    now,
+                )
+                .await?;
+            }
+        },
+        dsh_core::Principal::ProjectAdmin { ref username, .. } => match sid {
+            Some(sid) => {
+                app.write(
+                    &Command::MultiPaSessionHeartbeat {
+                        username: username.clone(),
+                        session_id: sid,
+                        expires_at: expires,
+                    },
+                    now,
+                )
+                .await?;
+            }
+            None => {
+                app.write(
+                    &Command::PaSessionHeartbeat {
+                        username: username.clone(),
+                        expires_at: expires,
+                    },
+                    now,
+                )
+                .await?;
+            }
+        },
     }
     Ok(Json(serde_json::json!({ "expires_at": expires })))
 }
@@ -2803,34 +2881,67 @@ async fn rotate_master_key(
 
 #[derive(Deserialize, Default)]
 struct ForceLogoutReq {
-    /// 缺省 = 踢全局管理员会话；指定 username = 踢对应项目管理员会话（N16）。
+    /// 指定 username = 踢对应项目管理员账号的全部会话（N16）。
     #[serde(default)]
     username: Option<String>,
+    /// 精确踢单个会话（multisession）：管理员会话用管理员 token 的 sid；
+    /// 与 username 同时给定时优先按 username+session_id 踢 PA 单会话。
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 /// 强制下线会话（CLI `dsh admin force-logout` 兜底，design §9.3/I7）。
+/// multisession 改造：缺省 = 踢全部管理员会话；username = 踢该 PA 全部会话；
+/// session_id = 踢单个管理员会话；username+session_id = 踢该 PA 单个会话。
 async fn admin_force_logout(
     State(app): State<ApiState>,
     axum::extract::Json(req): axum::extract::Json<ForceLogoutReq>,
 ) -> ApiResult<serde_json::Value> {
-    match req
+    let username = req
         .username
         .as_deref()
         .map(str::trim)
-        .filter(|u| !u.is_empty())
-    {
-        None => {
-            app.write(&Command::SessionLogout, now_ms()).await?;
-        }
-        Some(username) => {
-            // 踢 PA 会话（账号本体不动；不存在账号也幂等成功——会话本就无）
+        .filter(|u| !u.is_empty());
+    let sid = req
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match (username, sid) {
+        // 精确踢单个管理员会话
+        (None, Some(sid)) => {
             app.write(
-                &Command::PaSessionLogout {
+                &Command::MultiSessionLogout {
+                    session_id: sid.to_string(),
+                },
+                now_ms(),
+            )
+            .await?;
+        }
+        // 精确踢单个 PA 会话
+        (Some(username), Some(sid)) => {
+            app.write(
+                &Command::MultiPaSessionLogout {
+                    username: username.to_string(),
+                    session_id: sid.to_string(),
+                },
+                now_ms(),
+            )
+            .await?;
+        }
+        // 踢该 PA 账号全部会话
+        (Some(username), None) => {
+            app.write(
+                &Command::MultiPaSessionLogoutAll {
                     username: username.to_string(),
                 },
                 now_ms(),
             )
             .await?;
+        }
+        // 缺省：踢全部管理员会话
+        (None, None) => {
+            app.write(&Command::MultiSessionLogoutAll, now_ms()).await?;
         }
     }
     app.audit
@@ -2840,7 +2951,7 @@ async fn admin_force_logout(
             None,
             None,
             None,
-            serde_json::json!({ "username": req.username }),
+            serde_json::json!({ "username": req.username, "session_id": req.session_id }),
             "admin",
         )
         .await;
@@ -2868,8 +2979,8 @@ async fn admin_set_password(
         now_ms(),
     )
     .await?;
-    // 改密后强制下线当前会话（旧 token 失效）
-    app.write(&Command::SessionLogout, now_ms()).await?;
+    // 改密后强制下线全部管理员会话（multisession：旧+新格式全清）
+    app.write(&Command::MultiSessionLogoutAll, now_ms()).await?;
     app.audit
         .append(
             "set_password",

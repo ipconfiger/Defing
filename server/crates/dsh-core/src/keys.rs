@@ -91,13 +91,27 @@ pub fn shared_draft_key(group: &str, key: &str) -> String {
 pub fn session_key() -> &'static str {
     K_SESSION
 }
+/// 管理员会话前缀（多会话：sess/admin/{session_id}；批量踢/审计用）。
+pub const K_SESSION_PREFIX: &str = "sess/admin/";
+/// 多会话管理员会话键：sess/admin/{session_id}（perf/multisession 改造）。
+pub fn session_key_with(sid: &str) -> String {
+    format!("{K_SESSION_PREFIX}{sid}")
+}
 /// 项目管理员账号键：adm/pa/{username}。
 pub fn project_admin_key(username: &str) -> String {
     format!("{K_PA_ACCOUNT}{username}")
 }
-/// 项目管理员会话键：sess/pa/{username}。
+/// 项目管理员会话键：sess/pa/{username}（旧单会话，兼容）。
 pub fn pa_session_key(username: &str) -> String {
     format!("{K_PA_SESSION}{username}")
+}
+/// 项目管理员会话前缀：sess/pa/{username}/（多会话批量操作）。
+pub fn pa_session_prefix(username: &str) -> String {
+    format!("{K_PA_SESSION}{username}/")
+}
+/// 多会话 PA 会话键：sess/pa/{username}/{session_id}。
+pub fn pa_session_key_with(username: &str, sid: &str) -> String {
+    format!("{K_PA_SESSION}{username}/{sid}")
 }
 pub fn audit_key(seq: u64) -> String {
     format!("{K_AUDIT}{seq:020}")

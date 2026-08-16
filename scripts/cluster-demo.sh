@@ -76,12 +76,12 @@ for H in "$H1" "$H2" "$H3"; do
 done
 echo "  admin login ok (session cluster-wide, token shared by 3 nodes)"
 
-# 跨节点单会话校验：已有会话 → 任意节点二次登录应 409 ERR_SESSION_IN_USE
+# 跨节点多会话校验（multisession）：任意节点二次登录应成功（多会话并存，非 409）
 CODE=$(curl -s -o /tmp/cluster-second-login.json -w "%{http_code}" -X POST "$H3/api/v1/login" -H 'Content-Type: application/json' -d '{"password":"admin123"}')
-if [ "$CODE" = "409" ] && grep -q ERR_SESSION_IN_USE /tmp/cluster-second-login.json; then
-  echo "  跨节点二次登录 409 ERR_SESSION_IN_USE ✅"
+if [ "$CODE" = "200" ] && grep -q '"token"' /tmp/cluster-second-login.json; then
+  echo "  跨节点二次登录 200（多会话并存，会话经 Raft 复制 ✅）"
 else
-  echo "  FAIL: 跨节点二次登录应 409（got $CODE: $(cat /tmp/cluster-second-login.json)）"
+  echo "  FAIL: 跨节点二次登录应 200（got $CODE: $(cat /tmp/cluster-second-login.json)）"
   exit 1
 fi
 
