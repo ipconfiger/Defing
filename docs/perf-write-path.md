@@ -179,3 +179,35 @@ POST /branches/{b}/publish（Publish）
   - **实测**：大配置（~50KB）发布 10 版本 DB 体积 0 增长（全量存储应 +250KB+），写放大消除；
   - 全量测试 136+ 用例绿、clippy/fmt 零告警、e2e 全过。
 - P0-2（last_applied 跨表合并）评估结论：**本期不做**——需 RedbStorage 暴露事务注入，收益边际（集群 3→2 fsync），正确性无碍，独立评审后另行排期。
+
+---
+
+## 5. 生产环境实测（2025-08-16，Alibaba Cloud Linux 3, x86_64, 2 核）
+
+部署：交叉编译 `bin/dsh-linux-x86_64`（cargo zigbuild，ELF x86-64 glibc，12MB）→ `root@47.108.112.24:/opt/dsh/dsh`。
+磁盘 fsync 能力：**467/s（2.14ms/fsync）**——远快于 macOS APFS（~10ms+）。
+
+### 5.1 单节点（dev-single，redb 落盘）
+
+| 指标 | 结果 |
+|------|------|
+| 读 QPS（数据面 snapshot，50 并发） | **3094** |
+| 串行写 QPS（draft+publish） | **85** |
+| 并发写 QPS（8 独立分支） | **76** |
+| watch 延迟（发布→SSE 事件） | **4.5ms** |
+| 1MB 大配置写 QPS（单 key 变更） | **82**（≈1KB 配置的 85——**diff 存储使写性能与配置大小解耦**） |
+
+### 5.2 3 节点集群（Raft，全部 promote 为 voter）
+
+| 指标 | 单节点 | 3 节点集群 | 比值 |
+|------|--------|-----------|------|
+| 串行写 QPS | 85 | **11** | 集群 ≈ 单节点的 **13%** |
+| 并发写 QPS（8 分支） | 76 | **12** | ~16% |
+| 读 QPS（数据面，集群节点分摊） | 3094 | **2859** | ~92%（读几乎无损） |
+
+**集群写路径开销（每命令）**：leader 日志 append fsync（#1）→ 复制到 2 follower（网络 ×2）→ 多数派确认（follower 各自 fsync）→ apply fsync（#2）→ write_last_applied fsync（#3）——**至少 3 次 fsync + 2 次网络 RTT**。实测 11 QPS ≈ 每写 90ms，与 Raft 多数派落盘语义吻合。
+
+**结论**：
+1. 集群写 ≈ 单节点 1/7~1/8（11 vs 85）是 Raft 强一致的**固有成本**（etcd 3 节点亦如此），非本优化可消除；
+2. 读几乎无损（92%）——数据面任意节点本地服务 + 方案③读写分离在集群下同样生效；
+3. 集群写瓶颈 = fsync 次数 × 网络复制。**方案④（Relaxed+日志重放）或 group commit（批量合并多条命令为一次日志 append+fsync）**是突破路径——后者可让集群写提升数倍。
