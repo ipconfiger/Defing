@@ -1,7 +1,7 @@
 //! gRPC 数据面集成测试（A1）：GetConfig / GetItem / Watch / ListMembers + 鉴权拦截器。
 //! 使用真实 TCP 监听 + 生成的客户端。
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use dsh_api::grpc::{
     config_service_client::ConfigServiceClient, config_service_server::ConfigServiceServer,
@@ -16,11 +16,11 @@ use dsh_crypto::Cipher;
 use dsh_testkit::seed_demo_project;
 use dsh_watch::WatchHub;
 
-fn seed_sm(sm: &Mutex<StateMachine>) {
+fn seed_sm(sm: &RwLock<StateMachine>) {
     // testkit 播种：项目 + 结构(host/port/pass secret) + dev 草稿(host/port) + 发布(v2)
     seed_demo_project(sm, "p").unwrap();
     // 追加 secret 项值（明文不落库，测试直接写密文）
-    let mut g = sm.lock().unwrap();
+    let mut g = sm.write().unwrap();
     g.apply(
         &Command::DraftUpdate {
             project: "p".into(),
@@ -61,9 +61,9 @@ fn seed_sm(sm: &Mutex<StateMachine>) {
 }
 
 async fn start_server(token: Option<String>) -> (String, ApiState) {
-    let sm = Arc::new(Mutex::new(StateMachine::new(
-        Box::new(InMemoryStore::new()),
-    )));
+    let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(
+        InMemoryStore::new(),
+    ))));
     seed_sm(&sm);
     let hub = WatchHub::new();
     let state = ApiState::new(

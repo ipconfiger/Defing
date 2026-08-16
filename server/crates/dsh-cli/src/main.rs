@@ -2,7 +2,7 @@
 //! HTTP handler 见 dsh-api；发布编排见 dsh-publish；可观测见 dsh-observability；
 //! watch 见 dsh-watch；状态机见 dsh-core。本文件仅负责启动装配。
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use clap::{Parser, Subcommand};
 use dsh_api::ApiState;
@@ -508,7 +508,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let sm = StateMachine::new(store);
         let admin_password = resolve_admin_password(&cli, "首次启动");
         let app = ApiState::with_retention(
-            Arc::new(Mutex::new(sm)),
+            Arc::new(RwLock::new(sm)),
             hub,
             None,
             None,
@@ -553,7 +553,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let storage = RedbStorage::open(&data_dir)?;
     let db = storage.raw_db();
-    let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage))));
+    let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
     // 集群模式挂主密钥轮换钩子：Raft apply 到 RotateMasterKey 时更新本节点 keyring 并持久化 ring 文件
     // （dev-single 不挂——它走 handler 的本地轮换逻辑，先持久化后切换）。
     let sm_store = Arc::new(StateMachineStore::new_with_rotation(

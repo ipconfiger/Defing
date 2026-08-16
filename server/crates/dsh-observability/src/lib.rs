@@ -1,7 +1,7 @@
 //! 可观测性（模块 10）：审计落库（AuditLog）、Prometheus 指标、就绪判断。
 //! 说明：审计条目经 Raft 状态机落库（audit/{seq}，集群一致）；指标为文本格式输出。
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use dsh_core::command::Command;
 use dsh_core::model::PublishEvent;
@@ -11,12 +11,12 @@ use dsh_raft::RaftHandle;
 /// 审计落库器（B4）：写入经状态机（集群经 Raft 复制，集群一致）。尽力而为。
 #[derive(Clone)]
 pub struct AuditLog {
-    sm: Arc<Mutex<StateMachine>>,
+    sm: Arc<RwLock<StateMachine>>,
     raft: Option<RaftHandle>,
 }
 
 impl AuditLog {
-    pub fn new(sm: Arc<Mutex<StateMachine>>, raft: Option<RaftHandle>) -> Self {
+    pub fn new(sm: Arc<RwLock<StateMachine>>, raft: Option<RaftHandle>) -> Self {
         Self { sm, raft }
     }
 
@@ -53,7 +53,7 @@ impl AuditLog {
         let res = match &self.raft {
             None => {
                 // F13：审计尽力而为——锁中毒仅告警不 panic
-                let mut sm = match self.sm.lock() {
+                let mut sm = match self.sm.write() {
                     Ok(g) => g,
                     Err(e) => {
                         tracing::warn!("audit append: state machine lock poisoned: {e:?}");
@@ -88,12 +88,12 @@ fn now_ms() -> i64 {
 /// Prometheus 文本指标（模块 10 §3 子集：项目/分支/版本/共享/审计/主密钥/raft）。
 /// 注：不含会话活动指标——`dsh_session_active` 是会话存在性 oracle（S7），已移除。
 pub fn metrics_text(
-    sm: &Mutex<StateMachine>,
+    sm: &RwLock<StateMachine>,
     raft: Option<&RaftHandle>,
     master_key_ok: bool,
 ) -> String {
     // F13：指标为只读，锁中毒时取内部值继续（PoisonError::into_inner）
-    let guard = sm.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = sm.read().unwrap_or_else(|e| e.into_inner());
     let projects = guard.list_projects().map(|p| p.len()).unwrap_or(0);
     let mut out = String::new();
     out.push_str("# HELP dsh_projects 项目数\n");
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn metrics_contains_gauges() {
-        let sm = Mutex::new(StateMachine::new(Box::new(InMemoryStore::new())));
+        let sm = RwLock::new(StateMachine::new(Box::new(InMemoryStore::new())));
         let text = metrics_text(&sm, None, true);
         assert!(text.contains("dsh_projects 0"));
         assert!(text.contains("dsh_master_key_ok 1"));

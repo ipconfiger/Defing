@@ -161,7 +161,7 @@ pub struct WriteOutcome {
 /// - `events_tx`：dev-single 直发 watch 广播（集群模式由 raft apply 经 sm_store 转发，传 None）。
 /// - 非 leader → `ErrorKind::LeaderRedirect`（携带 leader_hint，调用方跟随转发）。
 pub async fn write_command(
-    sm: &std::sync::Mutex<dsh_core::StateMachine>,
+    sm: &std::sync::RwLock<dsh_core::StateMachine>,
     raft: Option<&RaftHandle>,
     cmd: &dsh_core::command::Command,
     now_ms: i64,
@@ -169,16 +169,20 @@ pub async fn write_command(
 ) -> Result<WriteOutcome, dsh_core::Error> {
     match raft {
         None => {
-            let mut guard = sm
-                .lock()
-                .map_err(|e| dsh_core::Error::internal(e.to_string()))?;
-            let events = guard.apply(cmd, now_ms)?;
+            // perf 方案③：写锁作用域化——apply 后解锁再广播（锁外 send）
+            let (events, version) = {
+                let mut guard = sm
+                    .write()
+                    .map_err(|e| dsh_core::Error::internal(e.to_string()))?;
+                let events = guard.apply(cmd, now_ms)?;
+                let version = events.first().map(|e| e.version).unwrap_or(0);
+                (events, version)
+            };
             for e in &events {
                 if let Some(tx) = events_tx {
                     let _ = tx.send(e.clone());
                 }
             }
-            let version = events.first().map(|e| e.version).unwrap_or(0);
             Ok(WriteOutcome { version, events })
         }
         Some(raft) => {

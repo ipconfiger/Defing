@@ -6,7 +6,7 @@
 pub mod grpc;
 
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use axum::extract::{ConnectInfo, Path as AxumPath, State};
 use axum::http::StatusCode;
@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 /// HTTP 服务共享状态（axum State）。
 #[derive(Clone)]
 pub struct ApiState {
-    pub sm: Arc<Mutex<StateMachine>>,
+    pub sm: Arc<RwLock<StateMachine>>,
     /// 发布事件广播（watch SSE；dev-single 直发，集群由 raft apply 转发）
     pub hub: WatchHub,
     /// 集群模式下的 Raft 句柄
@@ -68,7 +68,7 @@ pub struct ApiState {
 impl ApiState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        sm: Arc<Mutex<StateMachine>>,
+        sm: Arc<RwLock<StateMachine>>,
         hub: WatchHub,
         raft: Option<RaftHandle>,
         node_id: Option<u64>,
@@ -96,7 +96,7 @@ impl ApiState {
 
     #[allow(clippy::too_many_arguments)]
     pub fn with_retention(
-        sm: Arc<Mutex<StateMachine>>,
+        sm: Arc<RwLock<StateMachine>>,
         hub: WatchHub,
         raft: Option<RaftHandle>,
         node_id: Option<u64>,
@@ -364,7 +364,7 @@ fn resolve_principal(app: &ApiState, auth_header: Option<&str>) -> Result<dsh_co
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(())?;
     let hash = dsh_core::token_hash(token);
-    let sm = app.sm.lock().map_err(|_| ())?;
+    let sm = app.sm.read().map_err(|_| ())?;
     // token 前缀路由（§3）：pa.{username}.{secret} → sess/pa/{username}；
     // adm.{secret} 或无前缀（旧格式 fallback）→ sess/admin。
     let (_, session) = if let Some(rest) = token.strip_prefix("pa.") {
@@ -577,7 +577,7 @@ async fn list_projects(
     State(app): State<ApiState>,
     principal: axum::Extension<dsh_core::Principal>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().map_err(lock_err)?;
+    let sm = app.sm.read().map_err(lock_err)?;
     let mut projects = sm
         .list_projects()
         .map_err(ApiError::from)?
@@ -595,7 +595,7 @@ async fn list_branches(
     State(app): State<ApiState>,
     AxumPath(pid): AxumPath<String>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().map_err(lock_err)?;
+    let sm = app.sm.read().map_err(lock_err)?;
     let id = ProjectId(pid);
     let branches = sm
         .list_branches(&id)
@@ -651,7 +651,7 @@ async fn get_structure_draft(
     State(app): State<ApiState>,
     AxumPath(pid): AxumPath<String>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().map_err(lock_err)?;
+    let sm = app.sm.read().map_err(lock_err)?;
     let draft = sm
         .get_structure_draft(&ProjectId(pid))
         .map_err(ApiError::from)?;
@@ -860,7 +860,7 @@ async fn project_detail(
     State(app): State<ApiState>,
     AxumPath(pid): AxumPath<String>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().map_err(lock_err)?;
+    let sm = app.sm.read().map_err(lock_err)?;
     let p = sm
         .get_project(&ProjectId(pid.clone()))
         .map_err(ApiError::from)?
@@ -922,7 +922,7 @@ async fn branch_detail(
     State(app): State<ApiState>,
     AxumPath((pid, branch)): AxumPath<(String, String)>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().map_err(lock_err)?;
+    let sm = app.sm.read().map_err(lock_err)?;
     let id = ProjectId(pid.clone());
     let bname = BranchName(branch.clone());
     let st = sm
@@ -996,7 +996,7 @@ async fn branch_diff(
     AxumPath(pid): AxumPath<String>,
     axum::extract::Query(q): axum::extract::Query<DiffQuery>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().map_err(lock_err)?;
+    let sm = app.sm.read().map_err(lock_err)?;
     let id = ProjectId(pid);
     let a = sm
         .get_config(&id, &BranchName(q.branch_a), 0)
@@ -1067,7 +1067,7 @@ async fn promote(
             .collect()
     });
     let (updates, applied, skipped, missing_from) = {
-        let sm = app.sm.lock().map_err(lock_err)?;
+        let sm = app.sm.read().map_err(lock_err)?;
         let src = sm
             .get_config(&pid_obj, &from_b, 0)
             .map_err(ApiError::from)?;
@@ -1267,7 +1267,7 @@ async fn update_shared_draft(
 }
 
 async fn list_shared(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().map_err(lock_err)?;
+    let sm = app.sm.read().map_err(lock_err)?;
     let items = sm
         .list_shared_published()
         .map_err(ApiError::from)?
@@ -1278,7 +1278,7 @@ async fn list_shared(State(app): State<ApiState>) -> ApiResult<serde_json::Value
 }
 
 async fn list_shared_drafts(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().map_err(lock_err)?;
+    let sm = app.sm.read().map_err(lock_err)?;
     let items = sm
         .list_shared_drafts()
         .map_err(ApiError::from)?
@@ -1322,7 +1322,7 @@ async fn publish_shared(
         }
     }
     let max_version = {
-        let sm = app.sm.lock().map_err(lock_err)?;
+        let sm = app.sm.read().map_err(lock_err)?;
         sm.list_shared_published()
             .map_err(ApiError::from)?
             .iter()
@@ -1451,7 +1451,7 @@ async fn list_refs(
     if let dsh_core::Principal::ProjectAdmin { project, .. } = principal.0 {
         q.project = project.0;
     }
-    let sm = app.sm.lock().map_err(lock_err)?;
+    let sm = app.sm.read().map_err(lock_err)?;
     let refs = sm
         .list_refs(&ProjectId(q.project))
         .map_err(ApiError::from)?;
@@ -1496,7 +1496,7 @@ async fn admin_config(
     axum::extract::Query(q): axum::extract::Query<ConfigQuery>,
 ) -> ApiResult<ConfigResp> {
     let (version, project, branch_name, structure_version, mut groups) = {
-        let sm = app.sm.lock().map_err(lock_err)?;
+        let sm = app.sm.read().map_err(lock_err)?;
         let snap = sm
             .get_config(&ProjectId(pid.clone()), &BranchName(branch.clone()), 0)
             .map_err(ApiError::from)?;
@@ -1633,7 +1633,7 @@ async fn list_project_admins(
     State(app): State<ApiState>,
     AxumPath(pid): AxumPath<String>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().map_err(lock_err)?;
+    let sm = app.sm.read().map_err(lock_err)?;
     let accounts = sm
         .list_project_admins(&pid)
         .map_err(ApiError::from)?
@@ -1734,7 +1734,7 @@ async fn snapshot(
     AxumPath((pid, branch)): AxumPath<(String, String)>,
 ) -> ApiResult<ConfigResp> {
     let (version, project, branch_name, structure_version, mut groups) = {
-        let sm = app.sm.lock().map_err(lock_err)?;
+        let sm = app.sm.read().map_err(lock_err)?;
         let snap = sm
             .get_config(&ProjectId(pid.clone()), &BranchName(branch.clone()), 0)
             .map_err(ApiError::from)?;
@@ -1760,7 +1760,7 @@ async fn version_history(
     State(app): State<ApiState>,
     AxumPath((pid, branch)): AxumPath<(String, String)>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().map_err(lock_err)?;
+    let sm = app.sm.read().map_err(lock_err)?;
     let versions = sm
         .version_history(&ProjectId(pid), &BranchName(branch))
         .map_err(ApiError::from)?;
@@ -1869,7 +1869,7 @@ async fn render_config(
     }
     let _ = session_ok;
     let (version, mut groups) = {
-        let sm = app.sm.lock().map_err(lock_err)?;
+        let sm = app.sm.read().map_err(lock_err)?;
         let snap = sm
             .get_config(
                 &ProjectId(pid.clone()),
@@ -1966,7 +1966,7 @@ async fn login(
     }
     // 密码校验：set-password 落状态机后优先；未设置时回退节点配置（--admin-password）。
     let sm_pw_ok = {
-        let sm = app.sm.lock().map_err(lock_err)?;
+        let sm = app.sm.read().map_err(lock_err)?;
         match sm.get_admin_password_hash().ok().flatten() {
             Some(hash) => verify_password(&req.password, &hash, ""),
             None => req.password == app.admin_password.as_ref(),
@@ -2126,7 +2126,7 @@ async fn pa_login(
 ) -> Result<Json<LoginResp>, (StatusCode, Json<ApiErrorBody>)> {
     // 校验账号与密码（统一 401，防枚举）
     let account = {
-        let sm = app.sm.lock().map_err(lock_err)?;
+        let sm = app.sm.read().map_err(lock_err)?;
         sm.get_project_admin(&username).ok().flatten()
     };
     let ok = account
@@ -2199,7 +2199,7 @@ async fn pa_login(
             Err(ApiError(e)) if e.kind == ErrorKind::SessionInUse => {
                 // N13：已有会话已过期 → 先登出再重试一轮（仅一次）
                 let expired = {
-                    let sm = app.sm.lock().map_err(lock_err)?;
+                    let sm = app.sm.read().map_err(lock_err)?;
                     sm.get_pa_session(&username)
                         .ok()
                         .flatten()
@@ -2412,7 +2412,7 @@ async fn audit_list(
     principal: axum::Extension<dsh_core::Principal>,
     axum::extract::Query(q): axum::extract::Query<AuditQuery>,
 ) -> ApiResult<serde_json::Value> {
-    let sm = app.sm.lock().map_err(lock_err)?;
+    let sm = app.sm.read().map_err(lock_err)?;
     // PA 强制下推 project 过滤到状态机（§4 + R2：先截断后过滤会让 PA 视图被全局条目冲空）
     let project_filter = match principal.0 {
         dsh_core::Principal::Admin => None,
@@ -2887,7 +2887,7 @@ async fn admin_set_password(
 /// 触发备份快照：返回状态机全量 KV dump（`dsh admin snapshot` 备份用；恢复走 dump/restore）。
 async fn admin_snapshot(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
     let pairs = {
-        let sm = app.sm.lock().map_err(lock_err)?;
+        let sm = app.sm.read().map_err(lock_err)?;
         sm.dump_all().map_err(ApiError::from)?
     };
     let entries: Vec<serde_json::Value> = pairs
@@ -2920,7 +2920,7 @@ async fn admin_snapshot(State(app): State<ApiState>) -> ApiResult<serde_json::Va
 /// 保留策略状态（`dsh admin version-retention-status`）：配置值 + 当前版本/审计计数。
 async fn admin_retention_status(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
     let (projects, versions, audits) = {
-        let sm = app.sm.lock().map_err(lock_err)?;
+        let sm = app.sm.read().map_err(lock_err)?;
         let projects = sm.list_projects().map(|p| p.len()).unwrap_or(0);
         let mut versions = 0u64;
         if let Ok(plist) = sm.list_projects() {
@@ -2971,7 +2971,7 @@ async fn watch_branch(
         let mut force = false;
         if q.after_version > 0 {
             // F13：watch 返回 Sse（不可 ?），锁中毒时取内部值继续（只读重放）
-            let sm = app.sm.lock().unwrap_or_else(|e| e.into_inner());
+            let sm = app.sm.read().unwrap_or_else(|e| e.into_inner());
             let pid = ProjectId(pid.clone());
             let bname = BranchName(branch.clone());
             if let Ok(hist) = sm.version_history(&pid, &bname) {
@@ -3336,7 +3336,7 @@ pub fn build_router(app: ApiState) -> Router {
 
 #[cfg(test)]
 mod join_token_tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, RwLock};
 
     use axum::http::{HeaderMap, HeaderValue};
 
@@ -3348,9 +3348,9 @@ mod join_token_tests {
     /// 用内存态构造 ApiState（仿照 ApiState::new 传参，经 with_retention 注入 join_token）。
     fn state_with_join_token(token: Option<Arc<str>>) -> ApiState {
         ApiState::with_retention(
-            Arc::new(Mutex::new(StateMachine::new(
-                Box::new(InMemoryStore::new()),
-            ))),
+            Arc::new(RwLock::new(StateMachine::new(Box::new(
+                InMemoryStore::new(),
+            )))),
             WatchHub::new(),
             None,
             None,
@@ -3517,7 +3517,7 @@ mod security_tests {
         use axum::http::HeaderMap;
         // 未配置可信代理：即使伪造 XFF，节流键也是对端 IP（不可伪造）
         let app = super::ApiState::with_retention(
-            std::sync::Arc::new(std::sync::Mutex::new(dsh_core::StateMachine::new(
+            std::sync::Arc::new(std::sync::RwLock::new(dsh_core::StateMachine::new(
                 Box::new(dsh_core::InMemoryStore::new()),
             ))),
             dsh_watch::WatchHub::new(),
@@ -3546,7 +3546,7 @@ mod security_tests {
     fn throttle_key_trusts_xff_from_trusted_proxy() {
         use axum::http::HeaderMap;
         let app = super::ApiState::with_retention(
-            std::sync::Arc::new(std::sync::Mutex::new(dsh_core::StateMachine::new(
+            std::sync::Arc::new(std::sync::RwLock::new(dsh_core::StateMachine::new(
                 Box::new(dsh_core::InMemoryStore::new()),
             ))),
             dsh_watch::WatchHub::new(),

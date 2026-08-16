@@ -3,7 +3,7 @@
 //! reveal 越权（B2 回归）、会话生命周期（改密/删号/force-logout/heartbeat）、
 //! 列表过滤（projects/audit/refs）、审计 operator。
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use dsh_api::{build_router, ApiState};
 use dsh_core::command::Command;
@@ -17,11 +17,11 @@ struct TestServer {
 }
 
 async fn start() -> TestServer {
-    let sm = Arc::new(Mutex::new(StateMachine::new(
-        Box::new(InMemoryStore::new()),
-    )));
+    let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(
+        InMemoryStore::new(),
+    ))));
     {
-        let mut g = sm.lock().unwrap();
+        let mut g = sm.write().unwrap();
         // 两个项目 + PA 账号（p1: alice，p2 无 PA）
         for name in ["p1", "p2"] {
             g.apply(
@@ -630,7 +630,7 @@ async fn expired_session_auto_relogin() {
     let s = start().await;
     // 直接向状态机注入一条已过期的 PA 会话（apply 不读墙钟，过期判定在 API 层）
     {
-        let mut sm = s._state.sm.lock().unwrap();
+        let mut sm = s._state.sm.write().unwrap();
         sm.apply(
             &Command::PaSessionLogin {
                 username: "alice".into(),

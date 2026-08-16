@@ -1318,3 +1318,207 @@ fn admin_set_password_persists_and_reads() {
     let s2 = sm();
     assert_eq!(s2.get_admin_password_hash().unwrap(), None);
 }
+
+// ---------------- perf 方案② D3：checkpoint/diff 版本存储 ----------------
+
+/// 发布 N 个版本（每次改 host 值），返回最终项目。
+/// 注意：setup 已产生 v1（结构发布）；本函数发布 n 次 → 版本号为 v2..v(n+1)。
+fn publish_n_versions(s: &mut StateMachine, n: u64) -> (ProjectId, BranchName) {
+    let (pid, _) = setup(s); // 结构 v1
+    let b = BranchName("dev".into());
+    for i in 0..n {
+        s.apply(
+            &Command::DraftUpdate {
+                project: pid.clone(),
+                branch: b.clone(),
+                updates: vec![DraftUpdateItem {
+                    group: "redis".into(),
+                    key: "host".into(),
+                    value: Value::String(format!("10.0.0.{}", i + 1)),
+                }],
+                deletes: vec![],
+                operator: String::new(),
+                ts: 0,
+            },
+            100 + i as i64,
+        )
+        .unwrap();
+        s.apply(
+            &Command::Publish {
+                project: pid.clone(),
+                branch: b.clone(),
+                comment: format!("v{}", i + 1),
+                request_id: format!("r{}", i + 1),
+                operator: String::new(),
+                ts: 0,
+            },
+            200 + i as i64,
+        )
+        .unwrap();
+    }
+    (pid, b)
+}
+
+/// T1: checkpoint 布局——v1/v100 full，其余 diff（经 VersionRecord.kind 验证）。
+#[test]
+fn checkpoint_layout_full_vs_diff() {
+    let mut s = sm();
+    let (pid, b) = publish_n_versions(&mut s, 104); // 产生 v2..v105（v100 为 checkpoint）
+    use dsh_core::model::VersionKind;
+    assert_eq!(
+        s.get_version_record(&pid, &b, 1).unwrap().unwrap().kind,
+        VersionKind::Full,
+        "v1 必须 full"
+    );
+    assert_eq!(
+        s.get_version_record(&pid, &b, 100).unwrap().unwrap().kind,
+        VersionKind::Full,
+        "v100 必须 full（checkpoint）"
+    );
+    assert_eq!(
+        s.get_version_record(&pid, &b, 2).unwrap().unwrap().kind,
+        VersionKind::Diff,
+        "v2 必须 diff"
+    );
+    assert_eq!(
+        s.get_version_record(&pid, &b, 101).unwrap().unwrap().kind,
+        VersionKind::Diff,
+        "v101 必须 diff"
+    );
+    assert_eq!(
+        s.snapshot_of(&pid, &b, 100).unwrap()["redis"]["host"],
+        Value::String("10.0.0.99".into()),
+        "v100 内容=第99次发布"
+    );
+    assert_eq!(
+        s.snapshot_of(&pid, &b, 101).unwrap()["redis"]["host"],
+        Value::String("10.0.0.100".into()),
+        "v101 内容=第100次发布"
+    );
+}
+
+/// T2: 任意版本快照重建正确（与活动版本 diff 一致）。
+#[test]
+fn snapshot_rebuild_any_version() {
+    let mut s = sm();
+    let (pid, b) = publish_n_versions(&mut s, 105); // v2..v106
+                                                    // 抽查：v 的内容 = 第 (v-1) 次发布的值（10.0.0.{v-1}）
+    for v in [2u64, 50, 100, 101, 105, 106] {
+        let snap = s.snapshot_of(&pid, &b, v).unwrap();
+        let host = &snap["redis"]["host"];
+        assert_eq!(
+            host,
+            &Value::String(format!("10.0.0.{}", v - 1)),
+            "v{v} 重建错误"
+        );
+    }
+    let cfg = s.get_config(&pid, &b, 0).unwrap();
+    assert_eq!(cfg.version, 106);
+    assert_eq!(
+        cfg.groups["redis"]["host"],
+        Value::String("10.0.0.105".into())
+    );
+}
+
+/// T5: 裁剪保留 checkpoint 基座，diff 链可重建。
+#[test]
+fn prune_keeps_checkpoint_base() {
+    let mut s = sm();
+    let (pid, b) = publish_n_versions(&mut s, 249); // v2..v250（v200 为 checkpoint）
+    let removed = s.prune_versions(&pid, &b, 10).unwrap();
+    assert!(removed > 0);
+    assert!(
+        s.get_version_record(&pid, &b, 200).unwrap().is_some(),
+        "v200 checkpoint 必须保留为基座"
+    );
+    assert!(
+        s.get_version_record(&pid, &b, 199).unwrap().is_none(),
+        "v199 已裁剪"
+    );
+    let snap = s.snapshot_of(&pid, &b, 250).unwrap();
+    assert_eq!(
+        snap["redis"]["host"],
+        Value::String("10.0.0.249".into()),
+        "v250 重建正确"
+    );
+}
+
+/// T6: DEK 重包覆盖 diff 中的 secret 密文。
+#[test]
+fn rewrap_deks_covers_diff_secrets() {
+    let mut s = sm();
+    let (pid, _) = setup(&mut s);
+    let b = BranchName("dev".into());
+    // 先设必填 host（结构校验），再发布 secret（v2，非 checkpoint → 存 diff）
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: b.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "redis".into(),
+                key: "host".into(),
+                value: Value::String("h".into()),
+            }],
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+        },
+        5,
+    )
+    .unwrap();
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: b.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "redis".into(),
+                key: "password".into(),
+                value: Value::Secret(dsh_core::model::Ciphertext {
+                    enc: "aes-256-gcm".into(),
+                    v: 1,
+                    dek_v: 1,
+                    nonce: "n".into(),
+                    ct: "ct-old".into(),
+                    edek: "edek-old".into(),
+                    edek_nonce: "en".into(),
+                }),
+            }],
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+        },
+        5,
+    )
+    .unwrap();
+    s.apply(
+        &Command::Publish {
+            project: pid.clone(),
+            branch: b.clone(),
+            comment: "secret v".into(),
+            request_id: "rs1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        7,
+    )
+    .unwrap();
+    // 重包：把所有 ct=ct-old 替换为 ct-new
+    let count = s
+        .rewrap_deks(&|ct| {
+            if ct.ct == "ct-old" {
+                let mut n = ct.clone();
+                n.ct = "ct-new".into();
+                Some(Ok(n))
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert!(count >= 1, "diff 中 secret 应被重包");
+    // 重建 v2（首个值版本），密文应为新值
+    let snap = s.snapshot_of(&pid, &b, 2).unwrap();
+    match &snap["redis"]["password"] {
+        Value::Secret(ct) => assert_eq!(ct.ct, "ct-new", "重包后密文应更新"),
+        other => panic!("应为 Secret: {other:?}"),
+    }
+}

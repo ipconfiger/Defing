@@ -213,6 +213,30 @@ impl Store for RedbStorage {
         txn.commit().map_err(|e| redb_error("commit batch", e))
     }
 
+    fn write_batch(&self, puts: &[(Vec<u8>, Vec<u8>)], deletes: &[Vec<u8>]) -> Result<(), Error> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| redb_error("begin write", e))?;
+        let mut table = txn
+            .open_table(TBL_STATE)
+            .map_err(|e| redb_error("open state table", e))?;
+        // 先删后插：同一事务内 remove+insert 同 key 无冲突（redb 单写者事务内自洽）
+        for key in deletes {
+            table
+                .remove(key.as_slice())
+                .map_err(|e| redb_error("batch remove", e))?;
+        }
+        for (key, value) in puts {
+            table
+                .insert(key.as_slice(), value.as_slice())
+                .map_err(|e| redb_error("batch insert", e))?;
+        }
+        drop(table);
+        txn.commit()
+            .map_err(|e| redb_error("commit write_batch", e))
+    }
+
     fn flush(&self) -> Result<(), Error> {
         // redb 写事务默认 Durability::Immediate（commit 返回即 fsync），无需额外落盘
         Ok(())
@@ -344,6 +368,37 @@ mod tests {
         assert_eq!(store.get_prefix(b"").unwrap().len(), 3);
         // 空批不报错
         store.put_batch(&[]).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_batch_puts_and_deletes_atomically() {
+        let dir = tmpdir("writebatch");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = RedbStorage::open(&dir.display().to_string()).unwrap();
+        store.put(b"del", b"1").unwrap();
+        store.put(b"keep", b"2").unwrap();
+        store.put(b"same", b"old").unwrap();
+        // 混合：删 2 个 + 插 2 个 + 覆盖 1 个（同批内先删后插自洽）
+        store
+            .write_batch(
+                &[
+                    (b"new1".to_vec(), b"v1".to_vec()),
+                    (b"same".to_vec(), b"new".to_vec()),
+                    (b"new2".to_vec(), b"v2".to_vec()),
+                ],
+                &[b"del".to_vec(), b"same".to_vec()],
+            )
+            .unwrap();
+        assert_eq!(store.get(b"del").unwrap(), None);
+        assert_eq!(store.get(b"keep").unwrap().unwrap(), b"2");
+        // 同一事务内先删后插 → same 最终值为 new（redb 单写者事务内自洽）
+        assert_eq!(store.get(b"same").unwrap().unwrap(), b"new");
+        assert_eq!(store.get(b"new1").unwrap().unwrap(), b"v1");
+        assert_eq!(store.get(b"new2").unwrap().unwrap(), b"v2");
+        assert_eq!(store.get_prefix(b"").unwrap().len(), 4);
+        // 空批不报错
+        store.write_batch(&[], &[]).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

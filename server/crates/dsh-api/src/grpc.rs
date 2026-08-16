@@ -136,7 +136,7 @@ impl config_service_server::ConfigService for ConfigGrpcService {
         let sm = self
             .state
             .sm
-            .lock()
+            .read()
             .map_err(|_| Status::internal("sm lock"))?;
         let snap = sm
             .get_config(
@@ -155,7 +155,7 @@ impl config_service_server::ConfigService for ConfigGrpcService {
         let sm = self
             .state
             .sm
-            .lock()
+            .read()
             .map_err(|_| Status::internal("sm lock"))?;
         let snap = sm
             .get_config(
@@ -196,7 +196,7 @@ impl config_service_server::ConfigService for ConfigGrpcService {
             let sm = self
                 .state
                 .sm
-                .lock()
+                .read()
                 .map_err(|_| Status::internal("sm lock"))?;
             let hist = sm
                 .version_history(&pid, &bname)

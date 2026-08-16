@@ -1,7 +1,7 @@
 //! 发布编排（模块 04）：提交前 secret 加密（I8）、发布/回滚/结构发布/草稿更新的写路径封装。
 //! 确定性 apply 仍在 dsh-core 状态机；本模块负责 API 层到状态机之间的发布域逻辑。
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use dsh_core::command::{Command, DraftUpdateItem};
 use dsh_core::error::Error;
@@ -33,7 +33,7 @@ pub struct StructurePublishOutcome {
 /// 发布编排服务。
 #[derive(Clone)]
 pub struct PublishService {
-    sm: Arc<Mutex<StateMachine>>,
+    sm: Arc<RwLock<StateMachine>>,
     cipher: Option<Arc<Cipher>>,
     raft: Option<RaftHandle>,
     events_tx: Option<tokio::sync::broadcast::Sender<PublishEvent>>,
@@ -41,7 +41,7 @@ pub struct PublishService {
 
 impl PublishService {
     pub fn new(
-        sm: Arc<Mutex<StateMachine>>,
+        sm: Arc<RwLock<StateMachine>>,
         cipher: Option<Arc<Cipher>>,
         raft: Option<RaftHandle>,
         events_tx: Option<tokio::sync::broadcast::Sender<PublishEvent>>,
@@ -77,7 +77,7 @@ impl PublishService {
         };
         let sm = self
             .sm
-            .lock()
+            .read()
             .map_err(|e| dsh_core::Error::internal(e.to_string()))?;
         let structure = sm.get_structure(project)?;
         let secret_keys: std::collections::HashSet<(String, String)> = structure
@@ -161,7 +161,7 @@ impl PublishService {
         } else {
             let sm = self
                 .sm
-                .lock()
+                .read()
                 .map_err(|e| dsh_core::Error::internal(e.to_string()))?;
             sm.get_branch_state(project, branch)?
                 .map(|s| s.active_version)
@@ -205,7 +205,7 @@ impl PublishService {
         }
         let sm = self
             .sm
-            .lock()
+            .read()
             .map_err(|e| dsh_core::Error::internal(e.to_string()))?;
         Ok(sm
             .get_branch_state(project, branch)?
@@ -250,7 +250,7 @@ mod tests {
     use dsh_core::model::{GroupDef, ItemDef, ValueType};
     use dsh_core::{InMemoryStore, StateMachine};
 
-    fn sm_with_structure() -> Arc<Mutex<StateMachine>> {
+    fn sm_with_structure() -> Arc<RwLock<StateMachine>> {
         let mut sm = StateMachine::new(Box::new(InMemoryStore::new()));
         sm.apply(
             &Command::ProjectCreate {
@@ -301,7 +301,7 @@ mod tests {
             3,
         )
         .unwrap();
-        Arc::new(Mutex::new(sm))
+        Arc::new(RwLock::new(sm))
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! 依赖：snapshots 表（dsh-storage）。
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use dsh_core::command::Command;
 use dsh_core::StateMachine;
@@ -26,8 +26,8 @@ async fn snapshot_persists_across_restart() {
     {
         let storage = RedbStorage::open(&dir.display().to_string()).unwrap();
         let db = storage.raw_db();
-        let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage))));
-        sm.lock()
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
+        sm.write()
             .unwrap()
             .apply(
                 &Command::ProjectCreate {
@@ -55,7 +55,7 @@ async fn snapshot_persists_across_restart() {
     {
         let storage = RedbStorage::open(&dir.display().to_string()).unwrap();
         let db = storage.raw_db();
-        let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage))));
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
         let mut s = StateMachineStore::new(sm.clone(), db);
         let snap = s
             .get_current_snapshot()

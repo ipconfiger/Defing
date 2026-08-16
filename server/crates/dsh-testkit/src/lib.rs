@@ -1,7 +1,7 @@
 //! dsh-testkit —— 测试夹具（模块 13）：演示结构/值构造 + 项目播种。
 //! 供集成测试复用（grpc_data_plane 等），避免各测试重复样板。
 
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 use dsh_core::command::Command;
 use dsh_core::model::{BranchName, GroupDef, ItemDef, ProjectId, Value, ValueType};
@@ -48,12 +48,12 @@ pub fn int_val(i: i64) -> Value {
 /// 播种演示项目：建项目 → 结构草稿（demo_structure）→ 发布结构 →
 /// dev 草稿（host/port）→ 发布值版本。返回 (项目, dev 分支)。
 pub fn seed_demo_project(
-    sm: &Mutex<StateMachine>,
+    sm: &RwLock<StateMachine>,
     project: &str,
 ) -> Result<(ProjectId, BranchName), dsh_core::Error> {
     let pid = ProjectId(project.into());
     let dev = BranchName("dev".into());
-    let mut g = sm.lock().map_err(|_| dsh_core::Error::internal("lock"))?;
+    let mut g = sm.write().map_err(|_| dsh_core::Error::internal("lock"))?;
     g.apply(
         &Command::ProjectCreate {
             name: project.into(),
@@ -129,9 +129,9 @@ mod tests {
 
     #[test]
     fn seed_produces_published_values() {
-        let sm = Mutex::new(StateMachine::new(Box::new(InMemoryStore::new())));
+        let sm = RwLock::new(StateMachine::new(Box::new(InMemoryStore::new())));
         let (pid, dev) = seed_demo_project(&sm, "demo").unwrap();
-        let snap = sm.lock().unwrap().get_config(&pid, &dev, 0).unwrap();
+        let snap = sm.read().unwrap().get_config(&pid, &dev, 0).unwrap();
         assert_eq!(snap.version, 2);
         assert_eq!(
             snap.groups["redis"]["host"],

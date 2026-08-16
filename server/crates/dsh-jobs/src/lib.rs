@@ -1,6 +1,6 @@
 //! 后台任务（模块 11）：版本裁剪等。任务仅在 leader 节点执行。
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use dsh_core::StateMachine;
 use dsh_crypto::Cipher;
@@ -14,7 +14,7 @@ pub struct JobCtx {
 pub trait Job: Send + Sync {
     fn name(&self) -> &'static str;
     fn interval(&self) -> std::time::Duration;
-    fn run(&self, sm: &Mutex<StateMachine>) -> Result<(), String>;
+    fn run(&self, sm: &RwLock<StateMachine>) -> Result<(), String>;
 }
 
 /// 版本裁剪：每分支保留最近 keep 个版本 + 活动版本。
@@ -31,8 +31,8 @@ impl Job for VersionRetention {
         std::time::Duration::from_secs(60)
     }
 
-    fn run(&self, sm: &Mutex<StateMachine>) -> Result<(), String> {
-        let guard = sm.lock().map_err(|e| e.to_string())?;
+    fn run(&self, sm: &RwLock<StateMachine>) -> Result<(), String> {
+        let guard = sm.write().map_err(|e| e.to_string())?;
         let projects = guard.list_projects().map_err(|e| e.to_string())?;
         for p in projects {
             for b in guard.list_branches(&p.id).map_err(|e| e.to_string())? {
@@ -62,8 +62,8 @@ impl Job for AuditRetention {
         std::time::Duration::from_secs(3600)
     }
 
-    fn run(&self, sm: &Mutex<StateMachine>) -> Result<(), String> {
-        let guard = sm.lock().map_err(|e| e.to_string())?;
+    fn run(&self, sm: &RwLock<StateMachine>) -> Result<(), String> {
+        let guard = sm.write().map_err(|e| e.to_string())?;
         let removed = guard.prune_audit(self.keep).map_err(|e| e.to_string())?;
         if removed > 0 {
             tracing::info!("pruned {removed} audit entries (keep {})", self.keep);
@@ -87,10 +87,10 @@ impl Job for RewrapDeks {
         std::time::Duration::from_secs(300)
     }
 
-    fn run(&self, sm: &Mutex<StateMachine>) -> Result<(), String> {
+    fn run(&self, sm: &RwLock<StateMachine>) -> Result<(), String> {
         let cipher = self.cipher.clone();
         let gen = cipher.keyring().generation();
-        let guard = sm.lock().map_err(|e| e.to_string())?;
+        let guard = sm.write().map_err(|e| e.to_string())?;
         let count = guard
             .rewrap_deks(&|ct| {
                 if ct.dek_v >= gen {
@@ -126,7 +126,7 @@ impl JobScheduler {
         self.jobs.push(Box::new(job));
     }
 
-    pub fn spawn(self, sm: Arc<Mutex<StateMachine>>, is_leader: watch::Receiver<bool>) {
+    pub fn spawn(self, sm: Arc<RwLock<StateMachine>>, is_leader: watch::Receiver<bool>) {
         for job in self.jobs {
             let sm = sm.clone();
             let is_leader = is_leader.clone();
@@ -237,20 +237,67 @@ mod tests {
             .len();
         assert!(total >= 6); // 结构 v1 + 5 次发布
 
+        // perf 方案② D3：diff 链完整性优先——版本数小于 checkpoint 间隔时基座为 v1，
+        // 裁剪不删任何版本（removed=0 是保守正确行为）；活动版本始终可读。
         let removed = sm
             .prune_versions(&"p".into(), &BranchName("dev".into()), 2)
             .unwrap();
-        assert!(removed > 0);
-        let hist = sm
-            .version_history(&"p".into(), &BranchName("dev".into()))
-            .unwrap();
-        // 保留活动版本 + 最近 2 个
-        assert!(hist.len() <= 3);
+        // 6 个版本全在 v1 基座 + diff 链内 → 不裁剪
+        assert_eq!(removed, 0, "小版本数 diff 链必须完整保留");
         // 活动版本仍可读
         let cfg = sm
             .get_config(&"p".into(), &BranchName("dev".into()), 0)
             .unwrap();
         assert_eq!(cfg.version, 6);
+        // 跨 checkpoint 裁剪：发布到 v250 后 keep=10 → 删除 v<200 且保留 v200 基座
+        for i in 0..244 {
+            sm.apply(
+                &Command::DraftUpdate {
+                    project: "p".into(),
+                    branch: BranchName("dev".into()),
+                    updates: vec![DraftUpdateItem {
+                        group: "g".into(),
+                        key: "k".into(),
+                        value: dsh_core::model::Value::String(format!("x{i}")),
+                    }],
+                    deletes: vec![],
+                    operator: String::new(),
+                    ts: 0,
+                },
+                100 + i,
+            )
+            .unwrap();
+            sm.apply(
+                &Command::Publish {
+                    project: "p".into(),
+                    branch: BranchName("dev".into()),
+                    comment: "c".into(),
+                    request_id: format!("rx{i}"),
+                    operator: String::new(),
+                    ts: 0,
+                },
+                200 + i,
+            )
+            .unwrap();
+        }
+        let removed2 = sm
+            .prune_versions(&"p".into(), &BranchName("dev".into()), 10)
+            .unwrap();
+        assert!(removed2 > 0, "跨 checkpoint 裁剪应删除旧版本");
+        let hist2 = sm
+            .version_history(&"p".into(), &BranchName("dev".into()))
+            .unwrap();
+        // 保留 v200 基座 + v241..v250 + 活动版本，总 <= 61
+        assert!(hist2.len() <= 61, "裁剪后历史应受限: {}", hist2.len());
+        // 活动版本（v250）仍可读且内容正确
+        let cfg2 = sm
+            .get_config(&"p".into(), &BranchName("dev".into()), 0)
+            .unwrap();
+        assert_eq!(cfg2.version, 250);
+        assert_eq!(
+            cfg2.groups["g"]["k"],
+            dsh_core::model::Value::String("x243".into())
+        );
     }
 }
 
@@ -388,10 +435,10 @@ mod rewrap_tests {
         let job = RewrapDeks {
             cipher: cipher.clone(),
         };
-        let sm_mutex = Mutex::new(sm);
+        let sm_mutex = RwLock::new(sm);
         job.run(&sm_mutex).unwrap();
 
-        let guard = sm_mutex.lock().unwrap();
+        let guard = sm_mutex.read().unwrap();
         let cfg = guard
             .get_config(&"p".into(), &BranchName("dev".into()), 0)
             .unwrap();

@@ -17,6 +17,9 @@ pub trait Store: Send + Sync {
     fn get_prefix(&self, prefix: &[u8]) -> Result<KeyValuePairs, Error>;
     /// 批量写（单次事务提交语义）。
     fn put_batch(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), Error>;
+    /// 批量写 + 批量删（单事务，原子提交；redb 一次 fsync；内存实现先删后插）。
+    /// perf 方案①：状态机命令末统一落盘，替代逐 key 独立事务（每次 fsync）。
+    fn write_batch(&self, puts: &[(Vec<u8>, Vec<u8>)], deletes: &[Vec<u8>]) -> Result<(), Error>;
     /// 强制落盘（崩溃恢复测试用）；内存实现为空操作。
     fn flush(&self) -> Result<(), Error> {
         Ok(())
@@ -66,6 +69,17 @@ impl Store for InMemoryStore {
     fn put_batch(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), Error> {
         let mut guard = self.inner.write().expect("store lock");
         for (k, v) in pairs {
+            guard.insert(k.clone(), v.clone());
+        }
+        Ok(())
+    }
+
+    fn write_batch(&self, puts: &[(Vec<u8>, Vec<u8>)], deletes: &[Vec<u8>]) -> Result<(), Error> {
+        let mut guard = self.inner.write().expect("store lock");
+        for k in deletes {
+            guard.remove(k);
+        }
+        for (k, v) in puts {
             guard.insert(k.clone(), v.clone());
         }
         Ok(())

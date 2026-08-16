@@ -1,5 +1,5 @@
 //! 契约：learner 上 client_write 返回 ForwardToLeader 且携带 leader 的 http_addr（login 转发依赖）。
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use dsh_core::command::Command;
@@ -17,7 +17,7 @@ async fn learner_forward_hint() {
 
     let storage = RedbStorage::open(&dir.display().to_string()).unwrap();
     let db = storage.raw_db();
-    let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage))));
+    let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
     let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone()));
     let log_store = LogStore::new(db.clone());
     let n1 = NodeInfo {
@@ -36,7 +36,7 @@ async fn learner_forward_hint() {
 
     let storage2 = RedbStorage::open(&dir2.display().to_string()).unwrap();
     let db2 = storage2.raw_db();
-    let sm2 = Arc::new(Mutex::new(StateMachine::new(Box::new(storage2))));
+    let sm2 = Arc::new(RwLock::new(StateMachine::new(Box::new(storage2))));
     let sm_store2 = Arc::new(StateMachineStore::new(sm2.clone(), db2.clone()));
     let log_store2 = LogStore::new(db2.clone());
     let n2 = NodeInfo {

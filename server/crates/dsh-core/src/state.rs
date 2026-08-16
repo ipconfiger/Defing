@@ -13,7 +13,7 @@ use crate::error::{Error, ErrorKind};
 use crate::keys::*;
 use crate::limits::*;
 use crate::model::*;
-use crate::store::Store;
+use crate::store::{KeyValuePairs, Store};
 use crate::validator;
 
 /// GetConfig 返回的配置快照。
@@ -25,6 +25,10 @@ pub struct ConfigSnapshot {
     pub structure_version: u64,
     pub groups: BTreeMap<String, BTreeMap<String, Value>>,
 }
+
+/// 版本存储 checkpoint 间隔（perf 方案② D3）：每 N 版本存 full 快照，其余存 diff。
+/// 与 design-modules/04-publish.md §8 一致；改小可降低重建成本但增加存储，改大反之。
+pub const CHECKPOINT_INTERVAL: u64 = 100;
 
 /// apply 结果：成功产出的事件列表（确定性副作用，供 watch 扇出）。
 pub type ApplyOutcome = Result<Vec<PublishEvent>, Error>;
@@ -65,24 +69,120 @@ fn valid_branch(name: &str) -> bool {
         && name.as_bytes()[name.len() - 1] != b'-'
 }
 
+/// 命令级写缓冲操作（perf 方案①）：统一序列保证"最后一次操作决定"语义。
+#[derive(Debug, Clone)]
+enum PendingOp {
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+}
+
 /// 确定性状态机。
 pub struct StateMachine {
     store: Box<dyn Store>,
+    /// 命令级写缓冲（perf 方案①：apply 期间收集写操作，命令末统一 write_batch 单事务提交）。
+    /// apply 开始清空、命令成功 flush、失败 abort。非 apply 路径（快照安装/后台任务）不使用。
+    pending_ops: Vec<PendingOp>,
 }
 
 impl StateMachine {
     pub fn new(store: Box<dyn Store>) -> Self {
-        Self { store }
+        Self {
+            store,
+            pending_ops: Vec::new(),
+        }
+    }
+
+    // ---------------- 命令级写缓冲（perf 方案①） ----------------
+
+    /// 写缓冲 put：apply 期间收集；无 pending（非 apply 路径）时直写 store。
+    fn put_pending(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
+        self.pending_ops
+            .push(PendingOp::Put(key.to_vec(), value.to_vec()));
+        Ok(())
+    }
+
+    /// 写缓冲 delete：apply 期间收集。
+    fn delete_pending(&mut self, key: &[u8]) -> Result<(), Error> {
+        self.pending_ops.push(PendingOp::Delete(key.to_vec()));
+        Ok(())
+    }
+
+    /// 读合并 get：pending 逆序找 key（最后一次操作决定），miss 走 store。
+    fn get_merged(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        for op in self.pending_ops.iter().rev() {
+            match op {
+                PendingOp::Put(k, v) if k.as_slice() == key => return Ok(Some(v.clone())),
+                PendingOp::Delete(k) if k.as_slice() == key => return Ok(None),
+                _ => {}
+            }
+        }
+        self.store.get(key)
+    }
+
+    /// 读合并 get_prefix：store 结果 + pending 操作（按序应用），BTreeMap 保字典序。
+    fn get_prefix_merged(&self, prefix: &[u8]) -> Result<KeyValuePairs, Error> {
+        let mut out: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+            self.store.get_prefix(prefix)?.into_iter().collect();
+        for op in &self.pending_ops {
+            match op {
+                PendingOp::Put(k, v) => {
+                    if k.starts_with(prefix) {
+                        out.insert(k.clone(), v.clone());
+                    }
+                }
+                PendingOp::Delete(k) => {
+                    if k.starts_with(prefix) {
+                        out.remove(k);
+                    }
+                }
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    /// 命令末统一落盘：单事务 write_batch（puts + deletes）。
+    fn flush_pending(&mut self) -> Result<(), Error> {
+        if self.pending_ops.is_empty() {
+            return Ok(());
+        }
+        // 操作序列 → puts/deletes（写缓冲内允许同 key 多操作，write_batch 先删后插自洽）
+        let ops = std::mem::take(&mut self.pending_ops);
+        let mut puts = Vec::new();
+        let mut deletes = Vec::new();
+        for op in ops {
+            match op {
+                PendingOp::Put(k, v) => puts.push((k, v)),
+                PendingOp::Delete(k) => deletes.push(k),
+            }
+        }
+        self.store.write_batch(&puts, &deletes)
+    }
+
+    /// 命令内读（写后读可见：pending 优先）——apply 路径统一入口。
+    fn load_merged<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, Error> {
+        match self.get_merged(key.as_bytes())? {
+            Some(raw) => serde_json::from_slice(&raw)
+                .map(Some)
+                .map_err(|e| Error::internal(format!("corrupt value at {key}: {e}"))),
+            None => Ok(None),
+        }
+    }
+
+    /// 命令内写（写缓冲）——apply 路径统一入口。
+    fn save_pending<T: Serialize>(&mut self, key: &str, value: &T) -> Result<(), Error> {
+        let raw =
+            serde_json::to_vec(value).map_err(|e| Error::internal(format!("serialize: {e}")))?;
+        self.put_pending(key.as_bytes(), &raw)
     }
 
     // ---------------- 读取 ----------------
 
     pub fn get_project(&self, id: &ProjectId) -> Result<Option<Project>, Error> {
-        load(&*self.store, &project_key(id))
+        self.load_merged(&project_key(id))
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>, Error> {
-        let rows = self.store.get_prefix(b"p/")?;
+        let rows = self.get_prefix_merged(b"p/")?;
         let mut out = Vec::new();
         for (k, v) in rows {
             let ks = String::from_utf8_lossy(&k);
@@ -99,11 +199,11 @@ impl StateMachine {
     }
 
     pub fn get_structure(&self, id: &ProjectId) -> Result<Option<Structure>, Error> {
-        load(&*self.store, &struct_key(id))
+        self.load_merged(&struct_key(id))
     }
 
     pub fn get_structure_draft(&self, id: &ProjectId) -> Result<Option<StructureDraft>, Error> {
-        load(&*self.store, &struct_draft_key(id))
+        self.load_merged(&struct_draft_key(id))
     }
 
     pub fn get_branch_state(
@@ -111,12 +211,12 @@ impl StateMachine {
         id: &ProjectId,
         branch: &BranchName,
     ) -> Result<Option<BranchState>, Error> {
-        load(&*self.store, &branch_state_key(id, branch))
+        self.load_merged(&branch_state_key(id, branch))
     }
 
     /// 读取当前活动会话（I7；无会话返回 None）。
     pub fn get_session(&self) -> Result<Option<AdminSession>, Error> {
-        load(&*self.store, session_key())
+        self.load_merged(session_key())
     }
 
     /// 审计查询：按 action 过滤、since（ts ≥ since，墙钟 ms）过滤、按 seq 倒序、limit 截断。
@@ -127,7 +227,7 @@ impl StateMachine {
         since: Option<i64>,
         limit: usize,
     ) -> Result<Vec<AuditEntry>, Error> {
-        let rows = self.store.get_prefix(K_AUDIT.as_bytes())?;
+        let rows = self.get_prefix_merged(K_AUDIT.as_bytes())?;
         let mut out = Vec::new();
         for (k, v) in rows {
             let ks = String::from_utf8_lossy(&k);
@@ -166,7 +266,7 @@ impl StateMachine {
 
     /// 审计保留：仅保留最近 keep 条（后台任务用；keep=0 清空全部）。
     pub fn prune_audit(&self, keep: usize) -> Result<usize, Error> {
-        let rows = self.store.get_prefix(K_AUDIT.as_bytes())?;
+        let rows = self.get_prefix_merged(K_AUDIT.as_bytes())?;
         let mut seqs: Vec<u64> = Vec::new();
         for (k, _) in rows {
             let ks = String::from_utf8_lossy(&k);
@@ -191,12 +291,13 @@ impl StateMachine {
 
     /// DEK 重包（B6）：扫描全部存储中的 secret 密文，用 `f` 逐个重写（轮换后台任务用）。
     /// `f` 返回 None = 跳过（如代际已最新）；返回 Some(新密文) = 写回。
-    /// 覆盖：版本快照（…/snap）、共享项（sh/、sh-draft/）、分支草稿（…/b/{branch}/state）。
+    /// 覆盖：版本快照（…/snap）、版本 diff（…/diff，perf 方案② D3）、
+    /// 共享项（sh/、sh-draft/）、分支草稿（…/b/{branch}/state）。
     pub fn rewrap_deks(
         &self,
         f: &dyn Fn(&Ciphertext) -> Option<Result<Ciphertext, Error>>,
     ) -> Result<usize, Error> {
-        let rows = self.store.get_prefix(b"")?;
+        let rows = self.get_prefix_merged(b"")?;
         let mut rewrapped = 0usize;
         for (k, v) in rows {
             let ks = String::from_utf8_lossy(&k);
@@ -208,6 +309,27 @@ impl StateMachine {
                 };
                 if Self::rewrap_snapshot(&mut snap, f)? {
                     save(&*self.store, key, &snap)?;
+                    rewrapped += 1;
+                }
+            } else if key.ends_with("/diff") {
+                // perf 方案② D3：diff 中 Upsert 条目的 new_value 可能含 Secret 密文
+                let mut diff: Vec<DiffEntry> = match serde_json::from_slice(&v) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let mut changed = false;
+                for entry in diff.iter_mut() {
+                    if let ChangeKind::Upsert = entry.kind {
+                        if let Some(nv) = &mut entry.new_value {
+                            if Self::rewrap_value(nv, f)? {
+                                changed = true;
+                            }
+                        }
+                    }
+                    // Delete 条目 new_value=None，天然跳过
+                }
+                if changed {
+                    save(&*self.store, key, &diff)?;
                     rewrapped += 1;
                 }
             } else if key.starts_with(K_SHARED) || key.starts_with(K_SHARED_DRAFT) {
@@ -273,7 +395,7 @@ impl StateMachine {
     }
     pub fn list_branches(&self, id: &ProjectId) -> Result<Vec<BranchName>, Error> {
         let prefix = format!("{K_PROJECT}{}{K_BRANCH}", id.as_str());
-        let rows = self.store.get_prefix(prefix.as_bytes())?;
+        let rows = self.get_prefix_merged(prefix.as_bytes())?;
         let mut out = Vec::new();
         for (k, _) in rows {
             let ks = String::from_utf8_lossy(&k);
@@ -290,19 +412,121 @@ impl StateMachine {
         Ok(out)
     }
 
-    /// 读取某版本的值快照（M1：每个版本存全量快照）。
+    /// 读取某版本的值快照（perf 方案② D3：checkpoint 版本存 full，其余存 diff，读时重建）。
+    /// 定位最近 checkpoint（含自身）作为基座，从基座 + 1 应用到目标版本。
     pub fn snapshot_of(
         &self,
         id: &ProjectId,
         branch: &BranchName,
         version: u64,
     ) -> Result<SnapshotMap, Error> {
-        let key = snapshot_key(id, branch, version);
-        match self.store.get(key.as_bytes())? {
-            Some(raw) => serde_json::from_slice(&raw)
-                .map_err(|e| Error::internal(format!("corrupt snapshot {key}: {e}"))),
-            None => Err(Error::not_found(format!("version {version} of {branch}"))),
+        // 边界：version 必须 ≥1（调用方保证：get_config 对 version=0 解析 active_version）
+        if version == 0 {
+            return Err(Error::not_found(format!("version 0 of {branch}")));
         }
+        // 最近 checkpoint 基座（向下取整；v=1 恒 full）
+        let start = if version.is_multiple_of(CHECKPOINT_INTERVAL) {
+            version // 自身即 checkpoint：直接读 full，0 个 diff 应用
+        } else {
+            let base = ((version - 1) / CHECKPOINT_INTERVAL) * CHECKPOINT_INTERVAL;
+            if base == 0 {
+                1
+            } else {
+                base
+            }
+        };
+        let base_key = snapshot_key(id, branch, start);
+        let mut snap: SnapshotMap = match self.get_merged(base_key.as_bytes())? {
+            Some(raw) => serde_json::from_slice(&raw)
+                .map_err(|e| Error::internal(format!("corrupt snapshot {base_key}: {e}")))?,
+            None => {
+                // 兼容旧数据/裁剪后基座缺失：退化直读目标版本（旧版全量存储或兜底）
+                let fallback = snapshot_key(id, branch, version);
+                return match self.get_merged(fallback.as_bytes())? {
+                    Some(raw) => serde_json::from_slice(&raw)
+                        .map_err(|e| Error::internal(format!("corrupt snapshot {fallback}: {e}"))),
+                    None => Err(Error::not_found(format!("version {version} of {branch}"))),
+                };
+            }
+        };
+        for v in (start + 1)..=version {
+            if v % CHECKPOINT_INTERVAL == 0 {
+                // checkpoint 版本存 full：直接替换基座
+                let cp_key = snapshot_key(id, branch, v);
+                snap = match self.get_merged(cp_key.as_bytes())? {
+                    Some(raw) => serde_json::from_slice(&raw)
+                        .map_err(|e| Error::internal(format!("corrupt snapshot {cp_key}: {e}")))?,
+                    None => {
+                        return Err(Error::not_found(format!("snapshot {v} of {branch}")));
+                    }
+                };
+            } else {
+                let dk = diff_key(id, branch, v);
+                let diff: Vec<DiffEntry> = match self.get_merged(dk.as_bytes())? {
+                    Some(raw) => serde_json::from_slice(&raw)
+                        .map_err(|e| Error::internal(format!("corrupt diff {dk}: {e}")))?,
+                    None => {
+                        // 旧版本（升级前全量存储）无 diff_key：退化直读目标版本全量
+                        let fallback = snapshot_key(id, branch, v);
+                        return match self.get_merged(fallback.as_bytes())? {
+                            Some(raw) => serde_json::from_slice(&raw).map_err(|e| {
+                                Error::internal(format!("corrupt snapshot {fallback}: {e}"))
+                            }),
+                            None => Err(Error::not_found(format!("version {v} of {branch}"))),
+                        };
+                    }
+                };
+                Self::apply_diff(&mut snap, &diff);
+            }
+        }
+        Ok(snap)
+    }
+
+    /// 应用 diff 到快照（确定性：BTreeMap 有序；Upsert 写、Delete 删）。
+    /// Delete 删除 item 后若组变空则移除组（与全量快照的空组语义一致，避免残留空组）。
+    fn apply_diff(snap: &mut SnapshotMap, diff: &[DiffEntry]) {
+        for entry in diff {
+            match entry.kind {
+                ChangeKind::Upsert => {
+                    if let Some(v) = &entry.new_value {
+                        snap.entry(entry.group.clone())
+                            .or_default()
+                            .insert(entry.key.clone(), v.clone());
+                    }
+                }
+                ChangeKind::Delete => {
+                    if let Some(items) = snap.get_mut(&entry.group) {
+                        items.remove(&entry.key);
+                        if items.is_empty() {
+                            snap.remove(&entry.group);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 写版本快照（perf 方案② D3）：checkpoint（每 100 或首次）存 full，其余存 diff。
+    /// 需同时传入 old 快照（compute_diff 的输入）；`record.kind` 会被覆写为 Full/Diff。
+    fn write_version_snapshot(
+        &mut self,
+        id: &ProjectId,
+        branch: &BranchName,
+        vno: u64,
+        old: &SnapshotMap,
+        new: &SnapshotMap,
+        record: &mut VersionRecord,
+    ) -> Result<(), Error> {
+        let is_checkpoint = vno == 1 || vno.is_multiple_of(CHECKPOINT_INTERVAL);
+        if is_checkpoint {
+            record.kind = VersionKind::Full;
+            self.save_pending(&snapshot_key(id, branch, vno), new)?;
+        } else {
+            record.kind = VersionKind::Diff;
+            let diff = compute_diff(old, new);
+            self.save_pending(&diff_key(id, branch, vno), &diff)?;
+        }
+        self.save_pending(&version_key(id, branch, vno), record)
     }
 
     pub fn get_version_record(
@@ -311,7 +535,7 @@ impl StateMachine {
         branch: &BranchName,
         no: u64,
     ) -> Result<Option<VersionRecord>, Error> {
-        load(&*self.store, &version_key(id, branch, no))
+        self.load_merged(&version_key(id, branch, no))
     }
 
     pub fn version_history(
@@ -324,11 +548,12 @@ impl StateMachine {
             id.as_str(),
             branch.as_str()
         );
-        let rows = self.store.get_prefix(prefix.as_bytes())?;
+        let rows = self.get_prefix_merged(prefix.as_bytes())?;
         let mut out = Vec::new();
         for (k, v) in rows {
             let ks = String::from_utf8_lossy(&k);
-            if ks.ends_with("/snap") {
+            // 跳过快照与 diff 后缀（perf 方案② D3：snap/diff 与 version 同前缀）
+            if ks.ends_with("/snap") || ks.ends_with("/diff") {
                 continue;
             }
             if let Ok(r) = serde_json::from_slice::<VersionRecord>(&v) {
@@ -341,12 +566,12 @@ impl StateMachine {
 
     /// 导出全部状态（快照构建用）。
     pub fn dump_all(&self) -> Result<crate::store::KeyValuePairs, Error> {
-        self.store.get_prefix(b"")
+        self.get_prefix_merged(b"")
     }
 
     /// 清空并恢复全部状态（快照安装用）。
     pub fn restore_all(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), Error> {
-        for (k, _) in self.store.get_prefix(b"")? {
+        for (k, _) in self.get_prefix_merged(b"")? {
             self.store.delete(&k)?;
         }
         for (k, v) in pairs {
@@ -356,6 +581,9 @@ impl StateMachine {
     }
 
     /// 版本裁剪：保留活动版本 + 最近 keep 个版本，删除更早的历史（后台任务用）。
+    /// 版本裁剪：保留活动版本 + 最近 keep 个版本，删除更早的历史（后台任务用）。
+    /// perf 方案② D3：同时删除 diff_key；且删除下限对齐到"最近保留 checkpoint 之前"——
+    /// 保证最新保留版本是 checkpoint（full 基座），其后的 diff 链可完整重建。
     pub fn prune_versions(
         &self,
         project: &ProjectId,
@@ -370,16 +598,31 @@ impl StateMachine {
         if total <= keep {
             return Ok(0);
         }
-        let cutoff = total - keep;
+        // 目标：保留最近 keep 个版本。若裁剪导致最新保留版本不是 checkpoint，
+        // 则额外保留其 checkpoint 基座（否则 diff 链断裂、历史全部不可读）。
+        // 最新保留版本号 = total - keep（1-based 第 total-keep 个）；其基座 = 该版本向下取整到 checkpoint。
+        let newest_kept_no = hist[total - keep - 1].no;
+        let mut keep_from = newest_kept_no; // 语义上保留 >= keep_from 的版本
+        if !newest_kept_no.is_multiple_of(CHECKPOINT_INTERVAL) && newest_kept_no != 1 {
+            // 向下对齐到最近 checkpoint（含）——额外保留基座
+            keep_from = ((newest_kept_no - 1) / CHECKPOINT_INTERVAL) * CHECKPOINT_INTERVAL;
+            if keep_from == 0 {
+                keep_from = 1;
+            }
+        }
         let mut removed = 0;
-        for rec in hist.into_iter().take(cutoff) {
-            if rec.no == st.active_version {
-                continue; // 保活动版本
+        for rec in hist.iter().take(total) {
+            let no = rec.no;
+            if no >= keep_from || no == st.active_version {
+                continue; // 保留区间或活动版本
             }
             self.store
-                .delete(version_key(project, branch, rec.no).as_bytes())?;
+                .delete(version_key(project, branch, no).as_bytes())?;
+            // 该版本可能存 full（checkpoint）或 diff——两个 key 都尝试删除（幂等）
             self.store
-                .delete(snapshot_key(project, branch, rec.no).as_bytes())?;
+                .delete(snapshot_key(project, branch, no).as_bytes())?;
+            self.store
+                .delete(diff_key(project, branch, no).as_bytes())?;
             removed += 1;
         }
         Ok(removed)
@@ -428,7 +671,28 @@ impl StateMachine {
         }
     }
 
+    /// 应用命令（perf 方案①）：命令级写缓冲——apply 内多次写合并为一次 write_batch 单事务。
+    /// 失败时 abort（pending 清空，无部分写）；成功时 flush（一次 fsync）。
     pub fn apply(&mut self, cmd: &Command, now_ms: i64) -> ApplyOutcome {
+        self.pending_ops.clear();
+        let result = self.apply_inner(cmd, now_ms);
+        match result {
+            Ok(events) => {
+                if let Err(e) = self.flush_pending() {
+                    self.pending_ops.clear();
+                    return Err(e);
+                }
+                Ok(events)
+            }
+            Err(e) => {
+                // abort：丢弃未提交写（命令失败无部分生效，语义优于旧逐事务提交）
+                self.pending_ops.clear();
+                Err(e)
+            }
+        }
+    }
+
+    fn apply_inner(&mut self, cmd: &Command, now_ms: i64) -> ApplyOutcome {
         match cmd {
             Command::ProjectCreate { name, operator, ts } => {
                 self.apply_project_create(name, Self::eff_ts(ts, now_ms), operator)
@@ -611,12 +875,11 @@ impl StateMachine {
             version: 1,
             groups: vec![],
         };
-        save(&*self.store, &project_key(&id), &project)?;
-        save(&*self.store, &idx_pname(name), &"1")?;
-        save(&*self.store, &struct_key(&id), &structure)?;
+        self.save_pending(&project_key(&id), &project)?;
+        self.save_pending(&idx_pname(name), &"1")?;
+        self.save_pending(&struct_key(&id), &structure)?;
         for default_branch in [BranchName::DEV, BranchName::TEST, BranchName::PROD] {
-            save(
-                &*self.store,
+            self.save_pending(
                 &branch_state_key(&id, &BranchName(default_branch.to_string())),
                 &BranchState::new(1),
             )?;
@@ -629,10 +892,10 @@ impl StateMachine {
             .get_project(id)?
             .ok_or_else(|| Error::not_found(format!("project {id}")))?;
         let prefix = project_key(id);
-        for (k, _) in self.store.get_prefix(prefix.as_bytes())? {
-            self.store.delete(&k)?;
+        for (k, _) in self.get_prefix_merged(prefix.as_bytes())? {
+            self.delete_pending(&k)?;
         }
-        self.store.delete(idx_pname(&project.name).as_bytes())?;
+        self.delete_pending(idx_pname(&project.name).as_bytes())?;
         // 级联删除该项目全部项目管理员账号及其会话（设计 §5）
         for acct in self.list_project_admins(&id.0)? {
             self.store
@@ -643,22 +906,22 @@ impl StateMachine {
         // N1：清理孤儿全局引用索引（共享项发布级联扫描会命中已删项目，索引脏数据需一并清除）。
         // 共享 group/key 与项目名/组名均受 valid_key_name 字符集约束（无 `/`），按 `/` 切分可靠。
         // idx/ref/{sg}/{sk}/{project}/{group}/{item_key} → 第 3 段（index 2）为 project
-        for (k, _) in self.store.get_prefix(K_IDX_REF.as_bytes())? {
+        for (k, _) in self.get_prefix_merged(K_IDX_REF.as_bytes())? {
             let ks = String::from_utf8_lossy(&k);
             if let Some(rest) = ks.strip_prefix(K_IDX_REF) {
                 let parts: Vec<&str> = rest.split('/').collect();
                 if parts.len() == 5 && parts[2] == id.as_str() {
-                    self.store.delete(&k)?;
+                    self.delete_pending(&k)?;
                 }
             }
         }
         // idx/refg/{sg}/{project}/{group} → 第 2 段（index 1）为 project
-        for (k, _) in self.store.get_prefix(K_IDX_REFG.as_bytes())? {
+        for (k, _) in self.get_prefix_merged(K_IDX_REFG.as_bytes())? {
             let ks = String::from_utf8_lossy(&k);
             if let Some(rest) = ks.strip_prefix(K_IDX_REFG) {
                 let parts: Vec<&str> = rest.split('/').collect();
                 if parts.len() == 3 && parts[1] == id.as_str() {
-                    self.store.delete(&k)?;
+                    self.delete_pending(&k)?;
                 }
             }
         }
@@ -719,7 +982,7 @@ impl StateMachine {
                 })
                 .collect();
         }
-        save(&*self.store, &branch_state_key(id, name), &state)?;
+        self.save_pending(&branch_state_key(id, name), &state)?;
         Ok(vec![])
     }
 
@@ -738,8 +1001,8 @@ impl StateMachine {
             ));
         }
         let prefix = branch_prefix(id, name);
-        for (k, _) in self.store.get_prefix(prefix.as_bytes())? {
-            self.store.delete(&k)?;
+        for (k, _) in self.get_prefix_merged(prefix.as_bytes())? {
+            self.delete_pending(&k)?;
         }
         Ok(vec![])
     }
@@ -774,7 +1037,7 @@ impl StateMachine {
             base_version,
             groups: groups.to_vec(),
         };
-        save(&*self.store, &struct_draft_key(id), &draft)?;
+        self.save_pending(&struct_draft_key(id), &draft)?;
         Ok(vec![])
     }
 
@@ -822,7 +1085,7 @@ impl StateMachine {
             } else {
                 self.snapshot_of(id, branch, st.active_version)?
             };
-            let record = VersionRecord {
+            let mut record = VersionRecord {
                 no: vno,
                 structure_version: new_structure.version,
                 created_at: now_ms,
@@ -834,8 +1097,8 @@ impl StateMachine {
                 diff_ref: None,
                 event_ty: Some(EventType::StructurePublish),
             };
-            save(&*self.store, &version_key(id, branch, vno), &record)?;
-            save(&*self.store, &snapshot_key(id, branch, vno), &values)?;
+            // 结构发布值不变：old==values==new → diff 恒空（checkpoint 规则仍按 vno）
+            self.write_version_snapshot(id, branch, vno, &values, &values, &mut record)?;
             st.active_version = vno;
             st.structure_version = new_structure.version;
             // D14：清理结构发布后不存在的 item 草稿值
@@ -854,7 +1117,7 @@ impl StateMachine {
                     !items.is_empty()
                 }
             });
-            save(&*self.store, &branch_state_key(id, branch), &st)?;
+            self.save_pending(&branch_state_key(id, branch), &st)?;
             events.push(PublishEvent {
                 project: id.clone(),
                 branch: branch.clone(),
@@ -866,8 +1129,8 @@ impl StateMachine {
                 changes: vec![],
             });
         }
-        save(&*self.store, &struct_key(id), &new_structure)?;
-        self.store.delete(struct_draft_key(id).as_bytes())?;
+        self.save_pending(&struct_key(id), &new_structure)?;
+        self.delete_pending(struct_draft_key(id).as_bytes())?;
         Ok(events)
     }
 
@@ -939,7 +1202,7 @@ impl StateMachine {
                 },
             );
         }
-        save(&*self.store, &branch_state_key(id, branch), &st)?;
+        self.save_pending(&branch_state_key(id, branch), &st)?;
         Ok(vec![])
     }
 
@@ -1031,7 +1294,7 @@ impl StateMachine {
         let diff = compute_diff(&old, &resolved);
 
         let vno = st.active_version + 1;
-        let record = VersionRecord {
+        let mut record = VersionRecord {
             no: vno,
             structure_version: structure.version,
             created_at: now_ms,
@@ -1043,12 +1306,11 @@ impl StateMachine {
             diff_ref: None,
             event_ty: Some(EventType::ValuePublish),
         };
-        save(&*self.store, &version_key(id, branch, vno), &record)?;
-        save(&*self.store, &snapshot_key(id, branch, vno), &resolved)?;
+        self.write_version_snapshot(id, branch, vno, &old, &resolved, &mut record)?;
         st.active_version = vno;
         st.last_request_id = Some(request_id.to_string());
         st.value_draft.clear();
-        save(&*self.store, &branch_state_key(id, branch), &st)?;
+        self.save_pending(&branch_state_key(id, branch), &st)?;
 
         Ok(vec![PublishEvent {
             project: id.clone(),
@@ -1096,7 +1358,7 @@ impl StateMachine {
         };
         let diff = compute_diff(&old, &snap);
         let vno = st.active_version + 1;
-        let record = VersionRecord {
+        let mut record = VersionRecord {
             no: vno,
             structure_version: st.structure_version,
             created_at: now_ms,
@@ -1108,11 +1370,10 @@ impl StateMachine {
             diff_ref: None,
             event_ty: Some(EventType::Rollback),
         };
-        save(&*self.store, &version_key(project, branch, vno), &record)?;
-        save(&*self.store, &snapshot_key(project, branch, vno), &snap)?;
+        self.write_version_snapshot(project, branch, vno, &old, &snap, &mut record)?;
         st.active_version = vno;
         st.last_request_id = Some(request_id.to_string());
-        save(&*self.store, &branch_state_key(project, branch), &st)?;
+        self.save_pending(&branch_state_key(project, branch), &st)?;
         Ok(vec![PublishEvent {
             project: project.clone(),
             branch: branch.clone(),
@@ -1152,17 +1413,13 @@ impl StateMachine {
         if size > MAX_VALUE_BYTES {
             return Err(Error::limit_exceeded("shared item too large"));
         }
-        save(
-            &*self.store,
-            &shared_draft_key(&item.group, &item.key),
-            item,
-        )?;
+        self.save_pending(&shared_draft_key(&item.group, &item.key), item)?;
         Ok(vec![])
     }
 
     /// 管理面访问器：共享草稿列表（GET /api/v1/shared-draft）。
     pub fn list_shared_drafts(&self) -> Result<Vec<SharedItem>, Error> {
-        let rows = self.store.get_prefix(K_SHARED_DRAFT.as_bytes())?;
+        let rows = self.get_prefix_merged(K_SHARED_DRAFT.as_bytes())?;
         let mut out = Vec::new();
         for (_, v) in rows {
             if let Ok(item) = serde_json::from_slice::<SharedItem>(&v) {
@@ -1177,7 +1434,7 @@ impl StateMachine {
 
     /// 管理面访问器：已发布共享项列表（GET /api/v1/shared）。
     pub fn list_shared_published(&self) -> Result<Vec<SharedItem>, Error> {
-        let rows = self.store.get_prefix(K_SHARED.as_bytes())?;
+        let rows = self.get_prefix_merged(K_SHARED.as_bytes())?;
         let mut out = Vec::new();
         for (_, v) in rows {
             if let Ok(item) = serde_json::from_slice::<SharedItem>(&v) {
@@ -1196,7 +1453,7 @@ impl StateMachine {
     }
 
     pub fn get_shared(&self, group: &str, key: &str) -> Result<Option<SharedItem>, Error> {
-        load(&*self.store, &shared_key(group, key))
+        self.load_merged(&shared_key(group, key))
     }
 
     /// 引用索引：idx/ref/{shared_group}/{shared_key}/{project}/{group}/{item_key} → "1"
@@ -1237,17 +1494,13 @@ impl StateMachine {
                 value: item.value.clone(),
                 version,
             };
-            save(
-                &*self.store,
-                &shared_key(&item.group, &item.key),
-                &published,
-            )?;
+            self.save_pending(&shared_key(&item.group, &item.key), &published)?;
             self.store
                 .delete(shared_draft_key(&item.group, &item.key).as_bytes())?;
 
             // 级联（auto）：引用该共享项的 (项目, 分支) 版本推进
             let prefix = format!("{K_IDX_REF}{}/{}", item.group, item.key);
-            let rows = self.store.get_prefix(prefix.as_bytes())?;
+            let rows = self.get_prefix_merged(prefix.as_bytes())?;
             for (k, _) in rows {
                 let ks = String::from_utf8_lossy(&k);
                 let rest = &ks[prefix.len() + 1..]; // {project}/{group}/{item_key}
@@ -1271,7 +1524,7 @@ impl StateMachine {
             }
             // 组级引用级联（B3）：idx/refg/{shared_group}/{project}/{group} —— 结构组内含该 key 则推进
             let gprefix = format!("{K_IDX_REFG}{}", item.group);
-            let grows = self.store.get_prefix(gprefix.as_bytes())?;
+            let grows = self.get_prefix_merged(gprefix.as_bytes())?;
             for (gk, _) in grows {
                 let gks = String::from_utf8_lossy(&gk);
                 let grest = &gks[gprefix.len() + 1..]; // {project}/{group}
@@ -1336,7 +1589,7 @@ impl StateMachine {
                 .insert(key.to_string(), value.clone());
             let diff = compute_diff(&old, &new_snap);
             let vno = st.active_version + 1;
-            let record = VersionRecord {
+            let mut record = VersionRecord {
                 no: vno,
                 structure_version: st.structure_version,
                 created_at: now_ms,
@@ -1348,14 +1601,9 @@ impl StateMachine {
                 diff_ref: None,
                 event_ty: Some(EventType::SharedCascade),
             };
-            save(&*self.store, &version_key(project, &branch, vno), &record)?;
-            save(
-                &*self.store,
-                &snapshot_key(project, &branch, vno),
-                &new_snap,
-            )?;
+            self.write_version_snapshot(project, &branch, vno, &old, &new_snap, &mut record)?;
             st.active_version = vno;
-            save(&*self.store, &branch_state_key(project, &branch), &st)?;
+            self.save_pending(&branch_state_key(project, &branch), &st)?;
             events.push(PublishEvent {
                 project: project.clone(),
                 branch,
@@ -1413,13 +1661,8 @@ impl StateMachine {
                         binding.shared_group, binding.shared_key
                     )));
                 }
-                save(
-                    &*self.store,
-                    &ref_key(project, &binding.group, Some(item_key)),
-                    binding,
-                )?;
-                save(
-                    &*self.store,
+                self.save_pending(&ref_key(project, &binding.group, Some(item_key)), binding)?;
+                self.save_pending(
                     &Self::ref_index_key(
                         &binding.shared_group,
                         &binding.shared_key,
@@ -1453,13 +1696,8 @@ impl StateMachine {
                         binding.shared_group, binding.group
                     )));
                 }
-                save(
-                    &*self.store,
-                    &ref_key(project, &binding.group, None),
-                    binding,
-                )?;
-                save(
-                    &*self.store,
+                self.save_pending(&ref_key(project, &binding.group, None), binding)?;
+                self.save_pending(
                     &group_ref_index_key(&binding.shared_group, project, &binding.group),
                     &"1",
                 )?;
@@ -1478,11 +1716,10 @@ impl StateMachine {
         match item_key {
             Some(key) => {
                 let binding: Option<RefBinding> =
-                    load(&*self.store, &ref_key(project, group, Some(key)))?;
+                    self.load_merged(&ref_key(project, group, Some(key)))?;
                 if let Some(b) = binding {
-                    self.store
-                        .delete(ref_key(project, group, Some(key)).as_bytes())?;
-                    self.store.delete(
+                    self.delete_pending(ref_key(project, group, Some(key)).as_bytes())?;
+                    self.delete_pending(
                         Self::ref_index_key(&b.shared_group, &b.shared_key, project, group, key)
                             .as_bytes(),
                     )?;
@@ -1491,12 +1728,12 @@ impl StateMachine {
             None => {
                 // 组级解绑
                 let binding: Option<RefBinding> =
-                    load(&*self.store, &ref_key(project, group, None))?;
+                    self.load_merged(&ref_key(project, group, None))?;
                 if let Some(b) = binding {
-                    self.store
-                        .delete(ref_key(project, group, None).as_bytes())?;
-                    self.store
-                        .delete(group_ref_index_key(&b.shared_group, project, group).as_bytes())?;
+                    self.delete_pending(ref_key(project, group, None).as_bytes())?;
+                    self.delete_pending(
+                        group_ref_index_key(&b.shared_group, project, group).as_bytes(),
+                    )?;
                 }
             }
         }
@@ -1506,7 +1743,7 @@ impl StateMachine {
     /// 读取项目全部 item 级引用。
     fn read_refs_of_project(&self, project: &ProjectId) -> Result<Vec<RefBinding>, Error> {
         let prefix = format!("{K_PROJECT}{}{K_REF}", project.as_str());
-        let rows = self.store.get_prefix(prefix.as_bytes())?;
+        let rows = self.get_prefix_merged(prefix.as_bytes())?;
         let mut out = Vec::new();
         for (_, v) in rows {
             if let Ok(b) = serde_json::from_slice::<RefBinding>(&v) {
@@ -1543,12 +1780,12 @@ impl StateMachine {
             device_id: "cli".into(),
             principal: Principal::Admin,
         };
-        save(&*self.store, session_key(), &session)?;
+        self.save_pending(session_key(), &session)?;
         Ok(vec![])
     }
 
     fn apply_session_logout(&mut self) -> ApplyOutcome {
-        self.store.delete(session_key().as_bytes())?;
+        self.delete_pending(session_key().as_bytes())?;
         Ok(vec![])
     }
 
@@ -1557,7 +1794,7 @@ impl StateMachine {
             .get_session()?
             .ok_or_else(|| Error::new(ErrorKind::SessionExpired, "未登录"))?;
         session.expires_at = expires_at;
-        save(&*self.store, session_key(), &session)?;
+        self.save_pending(session_key(), &session)?;
         Ok(vec![])
     }
 
@@ -1606,7 +1843,7 @@ impl StateMachine {
             password_hash: password_hash.to_string(),
             created_at: now_ms,
         };
-        save(&*self.store, &key, &acct)?;
+        self.save_pending(&key, &acct)?;
         Ok(vec![])
     }
 
@@ -1615,8 +1852,8 @@ impl StateMachine {
         if load::<ProjectAdminAccount>(&*self.store, &key)?.is_none() {
             return Err(Error::new(ErrorKind::NotFound, "账号不存在"));
         }
-        self.store.delete(pa_session_key(username).as_bytes())?;
-        self.store.delete(key.as_bytes())?;
+        self.delete_pending(pa_session_key(username).as_bytes())?;
+        self.delete_pending(key.as_bytes())?;
         Ok(vec![])
     }
 
@@ -1632,9 +1869,9 @@ impl StateMachine {
         };
         acct.salt = salt.to_string();
         acct.password_hash = password_hash.to_string();
-        save(&*self.store, &key, &acct)?;
+        self.save_pending(&key, &acct)?;
         // 改密即时收回会话（权限立即生效）
-        self.store.delete(pa_session_key(username).as_bytes())?;
+        self.delete_pending(pa_session_key(username).as_bytes())?;
         Ok(vec![])
     }
 
@@ -1664,12 +1901,12 @@ impl StateMachine {
                 project: acct.project.clone(),
             },
         };
-        save(&*self.store, &key, &session)?;
+        self.save_pending(&key, &session)?;
         Ok(vec![])
     }
 
     fn apply_pa_session_logout(&mut self, username: &str) -> ApplyOutcome {
-        self.store.delete(pa_session_key(username).as_bytes())?;
+        self.delete_pending(pa_session_key(username).as_bytes())?;
         Ok(vec![])
     }
 
@@ -1683,19 +1920,19 @@ impl StateMachine {
             return Err(Error::new(ErrorKind::SessionExpired, "会话不存在"));
         };
         session.expires_at = expires_at;
-        save(&*self.store, &key, &session)?;
+        self.save_pending(&key, &session)?;
         Ok(vec![])
     }
 
     /// 读取项目管理员账号。
     pub fn get_project_admin(&self, username: &str) -> Result<Option<ProjectAdminAccount>, Error> {
-        load(&*self.store, &project_admin_key(username))
+        self.load_merged(&project_admin_key(username))
     }
 
     /// 列出项目全部项目管理员账号（扫 adm/pa/ 前缀过滤，O(账号数)）。
     pub fn list_project_admins(&self, project: &str) -> Result<Vec<ProjectAdminAccount>, Error> {
         let mut out = vec![];
-        for (_, raw) in self.store.get_prefix(K_PA_ACCOUNT.as_bytes())? {
+        for (_, raw) in self.get_prefix_merged(K_PA_ACCOUNT.as_bytes())? {
             if let Ok(acct) = serde_json::from_slice::<ProjectAdminAccount>(&raw) {
                 if acct.project.0 == project {
                     out.push(acct);
@@ -1707,30 +1944,30 @@ impl StateMachine {
     }
 
     pub fn get_pa_session(&self, username: &str) -> Result<Option<AdminSession>, Error> {
-        load(&*self.store, &pa_session_key(username))
+        self.load_merged(&pa_session_key(username))
     }
 
     fn apply_admin_set_password(&mut self, password_hash: &str) -> ApplyOutcome {
-        save(&*self.store, K_ADMIN_PW, &password_hash.to_string())?;
+        self.save_pending(K_ADMIN_PW, &password_hash.to_string())?;
         Ok(vec![])
     }
 
     /// 状态机内管理员密码哈希（set-password 后登录用它校验；未设置时回退节点配置）。
     pub fn get_admin_password_hash(&self) -> Result<Option<String>, Error> {
-        load(&*self.store, K_ADMIN_PW)
+        self.load_merged(K_ADMIN_PW)
     }
 
     /// 审计追加：seq 单调分配（audit/seq 计数），条目落 audit/{seq:020}。
     /// 入参 entry.seq 忽略（由状态机分配）。
     fn apply_audit_append(&mut self, entry: &AuditEntry) -> ApplyOutcome {
-        let prev: Option<u64> = load(&*self.store, K_AUDIT_SEQ)?;
+        let prev: Option<u64> = self.load_merged(K_AUDIT_SEQ)?;
         let seq = prev.unwrap_or(0) + 1;
         let entry = AuditEntry {
             seq,
             ..entry.clone()
         };
-        save(&*self.store, &audit_key(seq), &entry)?;
-        save(&*self.store, K_AUDIT_SEQ, &seq)?;
+        self.save_pending(&audit_key(seq), &entry)?;
+        self.save_pending(K_AUDIT_SEQ, &seq)?;
         Ok(vec![])
     }
 
@@ -1859,7 +2096,15 @@ mod tests {
     fn project_delete_cleans_orphan_ref_indexes() {
         let mut s = sm();
         let proj = "order-service";
-        s.apply_project_create(proj, 1, "").unwrap();
+        s.apply(
+            &Command::ProjectCreate {
+                name: proj.into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            1,
+        )
+        .unwrap();
 
         // 直接构造 RefBind 已写入的全局引用索引键（item 级 5 段 + 组级 3 段），
         // 模拟删除项目后遗留的孤儿条目。
@@ -1873,7 +2118,14 @@ mod tests {
         s.store.put(other_item.as_bytes(), b"1").unwrap();
         s.store.put(other_group.as_bytes(), b"1").unwrap();
 
-        s.apply_project_delete(&ProjectId(proj.into()), "").unwrap();
+        s.apply(
+            &Command::ProjectDelete {
+                id: ProjectId(proj.into()),
+                operator: String::new(),
+            },
+            2,
+        )
+        .unwrap();
 
         // 断言：idx/ref/ 与 idx/refg/ 前缀下不存在含该项目 id 的键（与清理逻辑同构的精确匹配）。
         for (k, _) in s.store.get_prefix(K_IDX_REF.as_bytes()).unwrap() {
@@ -1899,5 +2151,146 @@ mod tests {
         // 对照组索引不受影响。
         assert!(s.store.get(other_item.as_bytes()).unwrap().is_some());
         assert!(s.store.get(other_group.as_bytes()).unwrap().is_some());
+    }
+
+    /// perf 方案① T5：命令内读合并——pending 覆盖/删除对 load/get_prefix 可见（写后读）。
+    #[test]
+    fn pending_read_merge_visibility() {
+        let mut s = sm();
+        // put → merged get 命中 pending（未提交即可见）
+        s.put_pending(b"p/x", b"v1").unwrap();
+        assert_eq!(s.get_merged(b"p/x").unwrap().unwrap(), b"v1");
+        // 覆盖：后写优先（逆序）
+        s.put_pending(b"p/x", b"v2").unwrap();
+        assert_eq!(s.get_merged(b"p/x").unwrap().unwrap(), b"v2");
+        // 删除优先于插入（同 key 先插后删 → None）
+        s.delete_pending(b"p/x").unwrap();
+        assert_eq!(s.get_merged(b"p/x").unwrap(), None);
+        // 先删后插 → 插生效
+        s.put_pending(b"p/x", b"v3").unwrap();
+        assert_eq!(s.get_merged(b"p/x").unwrap().unwrap(), b"v3");
+        // get_prefix 合并：store 基 + pending 插 + pending 删
+        s.store.put(b"p/a", b"sa").unwrap();
+        s.store.put(b"p/z", b"sz").unwrap();
+        s.put_pending(b"p/m", b"pm").unwrap();
+        s.delete_pending(b"p/a").unwrap();
+        let rows = s.get_prefix_merged(b"p/").unwrap();
+        let map: std::collections::BTreeMap<_, _> = rows.into_iter().collect();
+        assert_eq!(map.get(b"p/a".as_slice()), None, "pending 删除遮蔽 store");
+        assert_eq!(
+            map.get(b"p/m".as_slice()).unwrap(),
+            b"pm",
+            "pending 插入合并"
+        );
+        assert_eq!(map.get(b"p/z".as_slice()).unwrap(), b"sz", "store 基保留");
+        assert_eq!(map.get(b"p/x".as_slice()).unwrap(), b"v3");
+        // 前缀边界：prefix "p/m" 只命中自己
+        let rows2 = s.get_prefix_merged(b"p/m").unwrap();
+        assert_eq!(rows2.len(), 1);
+    }
+
+    /// perf 方案① T4：命令失败 → pending abort，store 无部分写。
+    #[test]
+    fn apply_failure_aborts_pending() {
+        let mut s = sm();
+        // 建项目 + 结构（正常路径）
+        s.apply(
+            &Command::ProjectCreate {
+                name: "p".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            1,
+        )
+        .unwrap();
+        s.apply(
+            &Command::StructureDraftSet {
+                project: "p".into(),
+                base_version: 1,
+                groups: vec![GroupDef {
+                    name: "redis".into(),
+                    items: vec![ItemDef {
+                        key: "host".into(),
+                        ty: ValueType::String,
+                        required: true,
+                        secret: false,
+                        validate: None,
+                    }],
+                }],
+                operator: String::new(),
+            },
+            2,
+        )
+        .unwrap();
+        s.apply(
+            &Command::PublishStructure {
+                project: "p".into(),
+                comment: "s".into(),
+                request_id: "s1".into(),
+                operator: String::new(),
+                ts: 0,
+            },
+            3,
+        )
+        .unwrap();
+        // 无草稿直接发布 → 失败（NoDraft）；不产生版本/快照
+        let e = s
+            .apply(
+                &Command::Publish {
+                    project: "p".into(),
+                    branch: BranchName("dev".into()),
+                    comment: "x".into(),
+                    request_id: "r1".into(),
+                    operator: String::new(),
+                    ts: 0,
+                },
+                4,
+            )
+            .unwrap_err();
+        assert_eq!(e.kind, ErrorKind::NoDraft);
+        assert!(s.pending_ops.is_empty(), "失败后 pending 必须清空");
+        // store 无版本记录/快照（无部分写）
+        let pid: ProjectId = "p".into();
+        let dev = BranchName("dev".into());
+        assert!(s
+            .store
+            .get(version_key(&pid, &dev, 4).as_bytes())
+            .unwrap()
+            .is_none());
+        assert!(s
+            .store
+            .get(snapshot_key(&pid, &dev, 4).as_bytes())
+            .unwrap()
+            .is_none());
+        // 分支仍可正常发布（后续成功路径不受污染）
+        s.apply(
+            &Command::DraftUpdate {
+                project: "p".into(),
+                branch: BranchName("dev".into()),
+                updates: vec![crate::command::DraftUpdateItem {
+                    group: "redis".into(),
+                    key: "host".into(),
+                    value: Value::String("h".into()),
+                }],
+                deletes: vec![],
+                operator: String::new(),
+                ts: 0,
+            },
+            5,
+        )
+        .unwrap();
+        assert!(s
+            .apply(
+                &Command::Publish {
+                    project: "p".into(),
+                    branch: BranchName("dev".into()),
+                    comment: "v1".into(),
+                    request_id: "r2".into(),
+                    operator: String::new(),
+                    ts: 0,
+                },
+                6,
+            )
+            .is_ok());
     }
 }

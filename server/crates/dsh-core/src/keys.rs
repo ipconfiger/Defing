@@ -57,6 +57,16 @@ pub fn snapshot_key(id: &ProjectId, branch: &BranchName, no: u64) -> String {
         branch.as_str()
     )
 }
+/// 版本 diff（perf 方案② D3：非 checkpoint 版本存 diff 而非全量快照）。
+/// 布局：p/{pid}/b/{branch}/v/{no}/diff —— 与 snapshot_key 同前缀不同后缀，
+/// `version_history` 前缀扫描时按 `/snap` 后缀跳过逻辑需同步排除 `/diff`。
+pub fn diff_key(id: &ProjectId, branch: &BranchName, no: u64) -> String {
+    format!(
+        "{K_PROJECT}{}{K_BRANCH}{}{K_VERSION}{no}/diff",
+        id.as_str(),
+        branch.as_str()
+    )
+}
 pub fn branch_prefix(id: &ProjectId, branch: &BranchName) -> String {
     format!("{K_PROJECT}{}{K_BRANCH}{}", id.as_str(), branch.as_str())
 }
@@ -119,6 +129,7 @@ mod tests {
             snapshot_key(&id, &b, 12),
             "p/order-service/b/prod/v/12/snap"
         );
+        assert_eq!(diff_key(&id, &b, 12), "p/order-service/b/prod/v/12/diff");
         assert_eq!(shared_key("redis", "host"), "sh/redis/host");
         assert_eq!(idx_pname("order-service"), "idx/pname/order-service");
         assert_eq!(audit_key(7), "audit/00000000000000000007");

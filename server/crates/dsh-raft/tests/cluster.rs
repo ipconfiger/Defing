@@ -2,7 +2,7 @@
 //! 使用进程内直连网络（NetworkFactory）。
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use dsh_core::command::{Command, DraftUpdateItem};
@@ -20,7 +20,7 @@ fn tmpdir(tag: &str) -> std::path::PathBuf {
 
 struct NodeCtx {
     raft: RaftHandle,
-    sm: Arc<Mutex<StateMachine>>,
+    sm: Arc<RwLock<StateMachine>>,
     sm_store: Arc<StateMachineStore>,
     dir: std::path::PathBuf,
 }
@@ -30,7 +30,7 @@ async fn make_node(id: NodeId, tag: &str, network: &NetworkFactory) -> NodeCtx {
     let _ = std::fs::remove_dir_all(&dir);
     let storage = RedbStorage::open(&dir.display().to_string()).unwrap();
     let db = storage.raw_db();
-    let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage))));
+    let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage))));
     let sm_store = Arc::new(StateMachineStore::new(sm.clone(), db.clone()));
     let log_store = LogStore::new(db.clone());
     let node = NodeInfo {
@@ -57,13 +57,13 @@ async fn make_node(id: NodeId, tag: &str, network: &NetworkFactory) -> NodeCtx {
     }
 }
 
-fn sm_has_project(sm: &Mutex<StateMachine>, name: &str) -> bool {
-    let g = sm.lock().unwrap();
+fn sm_has_project(sm: &RwLock<StateMachine>, name: &str) -> bool {
+    let g = sm.read().unwrap();
     g.list_projects().unwrap().iter().any(|p| p.name == name)
 }
 
-fn sm_get_version(sm: &Mutex<StateMachine>, project: &str, branch: &str) -> Option<u64> {
-    let g = sm.lock().unwrap();
+fn sm_get_version(sm: &RwLock<StateMachine>, project: &str, branch: &str) -> Option<u64> {
+    let g = sm.read().unwrap();
     g.get_config(&project.into(), &BranchName(branch.into()), 0)
         .ok()
         .map(|c| c.version)
@@ -358,7 +358,7 @@ async fn session_is_cluster_wide_single() {
         wait_until(
             || n2
                 .sm
-                .lock()
+                .read()
                 .unwrap()
                 .get_session()
                 .ok()

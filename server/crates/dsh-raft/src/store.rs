@@ -3,7 +3,7 @@
 #![allow(clippy::result_large_err, clippy::type_complexity)] // openraft StorageError/RPCError 的 Err 变体较大（上游类型）
 
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use dsh_core::error::Error as DshError;
 use dsh_core::model::PublishEvent;
@@ -397,7 +397,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 #[derive(Clone)]
 pub struct StateMachineStore {
     /// 状态机（共享：apply 与读共用锁）
-    pub sm: Arc<Mutex<StateMachine>>,
+    pub sm: Arc<RwLock<StateMachine>>,
     db: DbHandle,
     /// 内存中的当前快照（M1：不跨重启持久化）
     current_snapshot: Arc<tokio::sync::Mutex<Option<(SnapshotMeta<NodeId, NodeInfo>, Vec<u8>)>>>,
@@ -410,13 +410,13 @@ pub struct StateMachineStore {
 }
 
 impl StateMachineStore {
-    pub fn new(sm: Arc<Mutex<StateMachine>>, db: DbHandle) -> Self {
+    pub fn new(sm: Arc<RwLock<StateMachine>>, db: DbHandle) -> Self {
         Self::new_with_rotation(sm, db, None)
     }
 
     /// 构造状态机存储并挂载主密钥轮换钩子（集群模式由 dsh-cli 传入；dev-single 走 handler 本地逻辑，不挂）。
     pub fn new_with_rotation(
-        sm: Arc<Mutex<StateMachine>>,
+        sm: Arc<RwLock<StateMachine>>,
         db: DbHandle,
         hook: Option<Arc<dyn Fn(&dsh_core::command::Command) + Send + Sync>>,
     ) -> Self {
@@ -492,7 +492,7 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, ErrOf> {
         let pairs = {
             let sm =
-                self.inner.sm.lock().map_err(|e| {
+                self.inner.sm.read().map_err(|e| {
                     io_err(ErrorSubject::StateMachine, ErrorVerb::Write, e.to_string())
                 })?;
             sm.dump_all().map_err(storage_err)?
@@ -544,51 +544,62 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         I: IntoIterator<Item = EntryOf> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let mut sm = self
-            .sm
-            .lock()
-            .map_err(|e| io_err(ErrorSubject::StateMachine, ErrorVerb::Write, e.to_string()))?;
+        // perf 方案③：写锁作用域化——events 收集后解锁再广播（锁外 send），
+        // 缩短写锁持有时间（fsync 已由方案①收敛；send 移到锁外不阻塞读）。
         let mut responses = Vec::new();
-        for entry in entries {
-            let log_id = entry.log_id;
-            if let EntryPayload::Membership(m) = &entry.payload {
-                let stored = StoredMembership::new(Some(log_id), m.clone());
-                self.write_membership(&stored)?;
-            }
-            let mut resp = Ok(crate::types::WriteAck::default());
-            if let EntryPayload::Normal(cmd) = &entry.payload {
-                // 确定性时间：用日志序号（避免墙钟导致跨节点状态发散，D16）
-                let now_ms = log_id.index as i64;
-                match sm.apply(cmd, now_ms) {
-                    Ok(events) => {
-                        // 事件广播（watch）：所有节点本地 apply 时推送，语义一致
-                        for e in &events {
-                            let _ = self.events.send(e.clone());
-                        }
-                        // 主密钥轮换副作用（更新本地 keyring + 持久化 ring 文件）：
-                        // 状态机 apply 成功后才触发（钩子幂等，重放/多节点安全）。
-                        // F7b：新命令 kek 为空、kek_enc 为当前 KEK 自加密的新 KEK（日志无明文）；
-                        // 钩子负责解密（旧日志 kek 明文 → 直接使用）。
-                        if matches!(cmd, dsh_core::command::Command::RotateMasterKey { .. }) {
-                            if let Some(h) = &self.rotation_hook {
-                                h(cmd);
+        let mut pending_events: Vec<PublishEvent> = Vec::new();
+        {
+            let mut sm = self
+                .sm
+                .write()
+                .map_err(|e| io_err(ErrorSubject::StateMachine, ErrorVerb::Write, e.to_string()))?;
+            for entry in entries {
+                let log_id = entry.log_id;
+                if let EntryPayload::Membership(m) = &entry.payload {
+                    let stored = StoredMembership::new(Some(log_id), m.clone());
+                    self.write_membership(&stored)?;
+                }
+                let mut resp = Ok(crate::types::WriteAck::default());
+                if let EntryPayload::Normal(cmd) = &entry.payload {
+                    // 确定性时间：用日志序号（避免墙钟导致跨节点状态发散，D16）
+                    let now_ms = log_id.index as i64;
+                    match sm.apply(cmd, now_ms) {
+                        Ok(events) => {
+                            // 主密钥轮换副作用（更新本地 keyring + 持久化 ring 文件）：
+                            // 状态机 apply 成功后才触发（钩子幂等，重放/多节点安全）。
+                            // F7b：新命令 kek 为空、kek_enc 为当前 KEK 自加密的新 KEK（日志无明文）；
+                            // 钩子负责解密（旧日志 kek 明文 → 直接使用）。
+                            // 注：钩子含 ring 文件写 IO，仍留写锁内（低频仅轮换，可接受）。
+                            if matches!(cmd, dsh_core::command::Command::RotateMasterKey { .. }) {
+                                if let Some(h) = &self.rotation_hook {
+                                    h(cmd);
+                                }
                             }
+                            // F6：事件随响应返回；广播延迟到锁外统一 send（perf 方案③）
+                            pending_events.extend(events.iter().cloned());
+                            resp = Ok(crate::types::WriteAck {
+                                version: events.first().map(|e| e.version).unwrap_or(0),
+                                events,
+                            });
                         }
-                        // F6：事件随响应返回（dev-single 与集群行为一致，changes/affected 不再缺失）
-                        resp = Ok(crate::types::WriteAck {
-                            version: events.first().map(|e| e.version).unwrap_or(0),
-                            events,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!("apply command failed (logged but state unchanged): {e}");
-                        // 错误随 Raft 客户端响应返回（不再吞掉）
-                        resp = Err(e);
+                        Err(e) => {
+                            tracing::warn!(
+                                "apply command failed (logged but state unchanged): {e}"
+                            );
+                            // 错误随 Raft 客户端响应返回（不再吞掉）
+                            resp = Err(e);
+                        }
                     }
                 }
+                self.write_last_applied(&log_id)?;
+                responses.push(resp);
             }
-            self.write_last_applied(&log_id)?;
-            responses.push(resp);
+        } // 写锁释放
+          // 锁外广播（watch）：所有节点本地 apply 后推送，语义一致。
+          // 行为说明：解锁后广播 → "状态先于事件可见"窗口（读可先见新状态、watch 事件后到），
+          // SSE watch 通知语义 + after_version 重放可回补，接受。
+        for e in &pending_events {
+            let _ = self.events.send(e.clone());
         }
         Ok(responses)
     }
@@ -620,7 +631,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         {
             let sm = self
                 .sm
-                .lock()
+                .write()
                 .map_err(|e| io_err(ErrorSubject::StateMachine, ErrorVerb::Write, e.to_string()))?;
             sm.restore_all(&pairs).map_err(storage_err)?;
         }
@@ -661,6 +672,7 @@ mod tests {
     use super::*;
     use dsh_storage::RedbStorage;
     use openraft::storage::RaftLogStorageExt;
+    use std::sync::Mutex;
 
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -774,7 +786,7 @@ mod tests {
             snapshot_id: "5-2".to_string(),
         };
         {
-            let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage.clone()))));
+            let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
             let mut store = StateMachineStore::new(sm, storage.raw_db());
             store
                 .install_snapshot(&meta, Box::new(Cursor::new(data.clone())))
@@ -783,7 +795,7 @@ mod tests {
         }
 
         // 「重启」：全新 StateMachineStore（内存快照为空）→ 从盘恢复
-        let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage.clone()))));
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
         let mut revived = StateMachineStore::new(sm, storage.raw_db());
         let snap = revived
             .get_current_snapshot()
@@ -802,7 +814,7 @@ mod tests {
         let dir = tmpdir("meta");
         let _ = std::fs::remove_dir_all(&dir);
         let storage = open_storage(&dir);
-        let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage.clone()))));
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
         let mut store = StateMachineStore::new(sm, storage.raw_db());
 
         assert!(
@@ -821,7 +833,7 @@ mod tests {
         let dir = tmpdir("rot");
         let _ = std::fs::remove_dir_all(&dir);
         let storage = open_storage(&dir);
-        let sm = Arc::new(Mutex::new(StateMachine::new(Box::new(storage.clone()))));
+        let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(storage.clone()))));
 
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
