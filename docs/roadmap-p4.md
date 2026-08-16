@@ -63,10 +63,10 @@ watch：
 
 | 阶段 | 内容 | 关键代码面 | 验收 | 估时 |
 |------|------|-----------|------|------|
-| **G0 设计先行** | 灰度模型选型文档（实例标签 vs IP 段 vs 百分比）、与分支模型融合、SDK 身份传递与缓存键、watch 语义、回滚语义 | docs/（新增 `design/gray-release.md`，走 proposal→design 证据链） | 设计评审通过；决策记录 D17–D21 落地 | 2–3 天 |
+| **G0 设计先行** | ✅ **已完成**（`docs/design/gray-release.md`，330 行含流程图 + 审核 Q1-Q6 修订记录）：模型选型、分支内双版本、身份传递、watch 语义、回滚语义；决策 D17–D23 落地 | — | 设计评审通过（子代理 Q1-Q6 全闭环，含 3 阻塞级修订） | ✅ |
 | **G1 发布策略地基（D1 收尾）** | `--publish-policy=block\|warn`（warn 时发布校验失败仅记录 detail 继续）、`--shared-cascade=auto\|manual`（manual：共享发布只更共享版本，引用分支下次发布物化）、`--read-mode=linear\|stale` | cli main.rs 加参 → PublishService/apply 注入 policy；`apply_shared_publish` 拆 manual 路径（state.rs:1216） | 三旋钮 e2e 实测；对应 D1 偏差关闭 | 3–4 天 |
-| **G2 灰度核心状态机** | 新命令 `GrayPublish{project,branch,rule,request_id,operator,ts}`、`GrayAbort{…}`、`GrayPromote{…}`（纯新增，旧变体不动）；`BranchState` 加 `gray_version/gray_rule`（serde default）；apply 写 gray 版本（复用 snapshot 存储，key 加前缀）、指针、`VersionRecord.event_ty=GrayPublish`（D-TYPE 延续） | command.rs / model.rs / state.rs / keys.rs；core 测试先行 | `cargo test -p dsh-core` 新增 ≥15 用例（发布/幂等/回滚/结构发布与 gray 共存/级联到 gray） | 5–7 天 |
-| **G3 数据面解析 + watch** | `get_config` 增加 client_ctx 解析（gRPC metadata `x-dsh-instance`/`x-dsh-labels`；HTTP header），命中规则返回 gray 版本；watch 事件加 `gray:bool` 标记 | state.rs `get_config` 签名扩展（向后兼容重载）、lib.rs snapshot/render/watch、grpc.rs、proto 加字段（向后兼容） | 数据面按标签/IP/百分比三路解析实测；watch 灰度事件隔离实测 | 4–5 天 |
+| **G2 灰度核心状态机** | 新命令 `GrayPublish{project,branch,rule,comment,request_id,operator,ts}`、`GrayAbort{…}`、`GrayPromote{…}`（纯新增，旧变体不动）；`BranchState` 加 `gray_seq`/`gray_rule`（serde default）；灰度快照存独立前缀 `gray-snap/`（**独立灰度序号，不与 active_version 冲突**，Q1 修订）；**复用既有 EventType + `gray:bool` 字段**（不新增枚举值，Q3 修订）；补 I10 幂等；`prune_versions` 保留 gray_seq 指向快照（Q5 修订） | command.rs / model.rs / state.rs / keys.rs；core 测试先行 | `cargo test -p dsh-core` 新增 ≥15 用例（灰度发布/解析/转正/下量/幂等/结构发布×gray/无身份不进灰度） | 5–7 天 |
+| **G3 数据面解析 + watch** | `resolve_version`/`rule_matches`/`fnv1a_hash` 读路径纯函数（**固定求值次序 labels→IP→percent；无身份永不进灰度**，Q2 修订）；仅 HTTP snapshot / gRPC get_config / gRPC get_item 三处传 client_ctx（Q6 修订）；watch 按身份投递或 gray 事件永不按版本过滤 + abort 携带回落版本号（**§5.5 Q4 修订**） | state.rs、lib.rs snapshot/render/watch、grpc.rs、proto 加字段（向后兼容） | 数据面三路解析实测；watch 灰度事件隔离实测 | 4–5 天 |
 | **G4 灰度管理面 + UI** | HTTP：`POST /projects/{p}/branches/{b}/gray-publish`、`…/gray-abort`、`…/gray-promote`、`GET …/gray-status`；openapi 补路径；Admin UI 灰度 tab（规则编辑/状态/一键回滚）；审计 action 覆盖 | lib.rs handler、openapi.v1.yaml、admin/index.html+app.js | api-surface 新增断言组全过；浏览器全流程实测 | 4–5 天 |
 | **G5 百分比放量 + 观察** | 身份哈希分桶（确定性，文档化算法）；灰度期间 metrics（`dsh_gray_active` 等）；"一键回滚"= GrayAbort；自动回滚钩子（对接 /metrics 指标，可选） | observability、jobs（自动回滚任务，仅 leader） | 百分比放量跨节点一致（Raft 重放同一规则同一桶）；自动回滚触发实测 | 4–5 天 |
 
