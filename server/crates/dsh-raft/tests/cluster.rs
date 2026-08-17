@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use dsh_core::command::{Command, DraftUpdateItem};
-use dsh_core::model::{BranchName, ItemDef, Value, ValueType};
+use dsh_core::model::{BranchName, ItemDef, PublishPolicy, Value, ValueType};
 use dsh_core::StateMachine;
 use dsh_raft::*;
 use dsh_storage::RedbStorage;
@@ -196,6 +196,7 @@ async fn three_node_bootstrap_join_failover() {
 
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         Duration::from_secs(10),
     )
@@ -240,6 +241,7 @@ async fn three_node_bootstrap_join_failover() {
 
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         Duration::from_secs(10),
     )
@@ -476,6 +478,7 @@ async fn cluster_watch_events_reach_subscribers() {
 
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         Duration::from_secs(10),
     )
@@ -609,6 +612,7 @@ async fn gray_percentage_consistent_across_nodes() {
             request_id: "s1".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         Command::DraftUpdate {
             project: pid.clone(),
@@ -631,6 +635,7 @@ async fn gray_percentage_consistent_across_nodes() {
             request_id: "p1".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         Command::DraftUpdate {
             project: pid.clone(),
@@ -657,6 +662,7 @@ async fn gray_percentage_consistent_across_nodes() {
             request_id: "g1".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
     ] {
         let resp = client_write(&leader_raft, cmd, Duration::from_secs(10)).await;

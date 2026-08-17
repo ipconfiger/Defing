@@ -366,6 +366,36 @@ pub struct PublishEvent {
     pub gray: bool,
 }
 
+/// 发布校验策略（G1/D35：编码进发布命令——apply 确定性由日志序保证）。
+/// 默认 Block = 校验失败拒绝发布（现状）；Warn = 校验失败仅记录继续发布。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PublishPolicy {
+    #[default]
+    Block,
+    Warn,
+}
+
+/// 共享发布级联模式（G1/D36：编码进 SharedPublish 命令）。
+/// 默认 Auto = 发布共享时自动级联引用分支（现状，原子 D15）；Manual = 只更共享版本，
+/// 引用分支下次发布时物化新值（防风暴开关 D7）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SharedCascadeMode {
+    #[default]
+    Auto,
+    Manual,
+}
+
+/// 读取模式（G1/D37：节点配置，读不产生日志无确定性问题）。
+/// 默认 Linear = 读前 ReadIndex 门控（读已提交）；Stale = 本地直接读（可能稍旧）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadMode {
+    #[default]
+    Linear,
+    Stale,
+}
+
 /// 跨项目共享项（集群级）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SharedItem {

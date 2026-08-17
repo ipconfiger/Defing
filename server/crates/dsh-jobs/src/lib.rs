@@ -283,7 +283,7 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use dsh_core::command::{Command, DraftUpdateItem};
-    use dsh_core::model::BranchName;
+    use dsh_core::model::{BranchName, PublishPolicy};
     use dsh_core::InMemoryStore;
 
     #[test]
@@ -326,6 +326,7 @@ mod tests {
 
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             3,
         )
@@ -359,6 +360,7 @@ mod tests {
 
                     operator: String::new(),
                     ts: 0,
+                    policy: PublishPolicy::Block,
                 },
                 20 + i,
             )
@@ -409,6 +411,7 @@ mod tests {
                     request_id: format!("rx{i}"),
                     operator: String::new(),
                     ts: 0,
+                    policy: PublishPolicy::Block,
                 },
                 200 + i,
             )
@@ -472,7 +475,10 @@ mod gray_rollback_tests {
 mod rewrap_tests {
     use super::*;
     use dsh_core::command::{Command, DraftUpdateItem};
-    use dsh_core::model::{BranchName, GroupDef, ItemDef, SharedItem, Value, ValueType};
+    use dsh_core::model::{
+        BranchName, GroupDef, ItemDef, PublishPolicy, SharedCascadeMode, SharedItem, Value,
+        ValueType,
+    };
     use dsh_core::InMemoryStore;
 
     #[test]
@@ -525,6 +531,7 @@ mod rewrap_tests {
 
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             3,
         )
@@ -564,6 +571,7 @@ mod rewrap_tests {
 
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             5,
         )
@@ -593,6 +601,10 @@ mod rewrap_tests {
 
                 operator: String::new(),
                 ts: 0,
+
+                cascade: SharedCascadeMode::Auto,
+
+                policy: PublishPolicy::Block,
             },
             7,
         )
@@ -625,7 +637,7 @@ mod auto_rollback_tests {
     use super::*;
     use dsh_core::command::{Command, DraftUpdateItem};
     use dsh_core::model::{
-        BranchName, GrayRule, GroupDef, ItemDef, LabelSelector, Value, ValueType,
+        BranchName, GrayRule, GroupDef, ItemDef, LabelSelector, PublishPolicy, Value, ValueType,
     };
     use dsh_core::InMemoryStore;
     use std::time::Duration;
@@ -677,6 +689,8 @@ mod auto_rollback_tests {
                 request_id: "s1".into(),
                 operator: String::new(),
                 ts: 0,
+
+                policy: PublishPolicy::Block,
             },
             3,
         )
@@ -708,6 +722,8 @@ mod auto_rollback_tests {
                         request_id: "p1".into(),
                         operator: String::new(),
                         ts: 0,
+
+                        policy: PublishPolicy::Block,
                     },
                     20,
                 )
@@ -730,6 +746,8 @@ mod auto_rollback_tests {
                 request_id: "g1".into(),
                 operator: String::new(),
                 ts: 0,
+
+                policy: PublishPolicy::Block,
             },
             30,
         )

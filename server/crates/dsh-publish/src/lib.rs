@@ -5,7 +5,10 @@ use std::sync::{Arc, RwLock};
 
 use dsh_core::command::{Command, DraftUpdateItem};
 use dsh_core::error::Error;
-use dsh_core::model::{BranchName, DiffEntry, GrayRule, ProjectId, PublishEvent, Value, ValueType};
+use dsh_core::model::{
+    BranchName, DiffEntry, GrayRule, ProjectId, PublishEvent, PublishPolicy, SharedCascadeMode,
+    Value, ValueType,
+};
 use dsh_core::StateMachine;
 use dsh_crypto::Cipher;
 use dsh_raft::RaftHandle;
@@ -22,6 +25,8 @@ fn now_ms() -> i64 {
 pub struct PublishOutcome {
     pub version: u64,
     pub changes: Vec<DiffEntry>,
+    /// G1/D35：Warn 模式下发布校验的告警明细（Block 模式恒空）。
+    pub warnings: Vec<String>,
 }
 
 /// 结构发布结果。
@@ -37,6 +42,10 @@ pub struct PublishService {
     cipher: Option<Arc<Cipher>>,
     raft: Option<RaftHandle>,
     events_tx: Option<tokio::sync::broadcast::Sender<PublishEvent>>,
+    /// G1/D35：发布校验策略（CLI 注入；默认 Block = 现状）
+    pub publish_policy: PublishPolicy,
+    /// G1/D36：共享发布级联模式（CLI 注入；默认 Auto = 现状）
+    pub shared_cascade: SharedCascadeMode,
 }
 
 impl PublishService {
@@ -51,6 +60,8 @@ impl PublishService {
             cipher,
             raft,
             events_tx,
+            publish_policy: PublishPolicy::Block,
+            shared_cascade: SharedCascadeMode::Auto,
         }
     }
 
@@ -155,6 +166,7 @@ impl PublishService {
 
                     operator: operator.to_string(),
                     ts: now_ms(),
+                    policy: self.publish_policy,
                 },
                 now_ms(),
             )
@@ -175,7 +187,31 @@ impl PublishService {
             .first()
             .map(|e| e.changes.clone())
             .unwrap_or_default();
-        Ok(PublishOutcome { version, changes })
+        // G1/D35：Warn 模式下把校验告警暴露给调用方（Block 模式恒空）
+        let warnings = if self.publish_policy == PublishPolicy::Warn {
+            let sm = self
+                .sm
+                .read()
+                .map_err(|e| dsh_core::Error::internal(e.to_string()))?;
+            let draft = sm
+                .get_branch_state(project, branch)?
+                .map(|st| st.value_draft.clone())
+                .unwrap_or_default();
+            let structure = sm
+                .get_structure(project)?
+                .unwrap_or(dsh_core::model::Structure {
+                    version: 0,
+                    groups: vec![],
+                });
+            dsh_core::validator::validate_publish(&draft, &structure)
+        } else {
+            vec![]
+        };
+        Ok(PublishOutcome {
+            version,
+            changes,
+            warnings,
+        })
     }
 
     /// 回滚（新版本 = 旧版本内容，历史不可变 I6/I9）。
@@ -233,6 +269,7 @@ impl PublishService {
 
                     operator: operator.to_string(),
                     ts: now_ms(),
+                    policy: self.publish_policy,
                 },
                 now_ms(),
             )
@@ -268,6 +305,7 @@ impl PublishService {
                     request_id: request_id.to_string(),
                     operator: operator.to_string(),
                     ts: now_ms(),
+                    policy: self.publish_policy,
                 },
                 now_ms(),
             )
@@ -380,6 +418,7 @@ mod tests {
                 request_id: "s1".into(),
                 operator: "test".to_string(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             3,
         )

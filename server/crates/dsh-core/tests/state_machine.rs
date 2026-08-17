@@ -73,6 +73,7 @@ fn setup(s: &mut StateMachine) -> (ProjectId, Vec<BranchName>) {
                 request_id: "s1".into(),
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             3,
         )
@@ -128,6 +129,7 @@ fn full_flow_dev_publish() {
                 request_id: "r1".into(),
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             5,
         )
@@ -183,6 +185,7 @@ fn publish_is_idempotent_by_request_id() {
 
         operator: String::new(),
         ts: 0,
+        policy: PublishPolicy::Block,
     };
     let first = s.apply(&cmd, 5).unwrap();
     assert_eq!(first.len(), 1);
@@ -225,6 +228,7 @@ fn required_unset_blocks_publish() {
                 request_id: "r2".into(),
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             5,
         )
@@ -247,6 +251,7 @@ fn no_draft_publish_errors() {
                 request_id: "r3".into(),
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             5,
         )
@@ -286,6 +291,7 @@ fn branch_inherits_structure_and_values() {
 
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         5,
     )
@@ -456,6 +462,7 @@ fn rollback_creates_new_version_with_old_content() {
 
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         5,
     )
@@ -573,6 +580,8 @@ fn publish_shared(s: &mut StateMachine, group: &str, key: &str, value: Value, re
 
             operator: String::new(),
             ts: 0,
+            cascade: SharedCascadeMode::Auto,
+            policy: PublishPolicy::Block,
         },
         11,
     )
@@ -650,6 +659,7 @@ fn shared_cascade_updates_referencing_branches() {
 
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         13,
     )
@@ -705,6 +715,7 @@ fn shared_cascade_updates_referencing_branches() {
 
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         16,
     )
@@ -993,6 +1004,7 @@ fn group_ref_materializes_matching_items_at_publish() {
 
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         32,
     )
@@ -1110,6 +1122,7 @@ fn group_ref_unbind_stops_materialization() {
 
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         53,
     )
@@ -1164,6 +1177,8 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
 
             operator: String::new(),
             ts: 0,
+            cascade: SharedCascadeMode::Auto,
+            policy: PublishPolicy::Block,
         },
         61,
     )
@@ -1203,6 +1218,7 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
 
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         63,
     )
@@ -1365,6 +1381,7 @@ fn publish_n_versions(s: &mut StateMachine, n: u64) -> (ProjectId, BranchName) {
                 request_id: format!("r{}", i + 1),
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             200 + i as i64,
         )
@@ -1514,6 +1531,7 @@ fn rewrap_deks_covers_diff_secrets() {
             request_id: "rs1".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         7,
     )
@@ -2027,6 +2045,7 @@ fn gray_setup(s: &mut StateMachine) -> (ProjectId, BranchName) {
             request_id: "p1".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         11,
     )
@@ -2067,6 +2086,7 @@ fn gray_publish_creates_gray_snapshot() {
                 request_id: "g1".into(),
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             13,
         )
@@ -2135,6 +2155,7 @@ fn gray_resolve_three_paths() {
             request_id: "g2".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         13,
     )
@@ -2225,6 +2246,7 @@ fn gray_promote_makes_gray_active() {
             request_id: "g1".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         13,
     )
@@ -2286,6 +2308,7 @@ fn gray_abort_reverts_to_stable() {
             request_id: "g1".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         13,
     )
@@ -2344,6 +2367,7 @@ fn gray_commands_idempotent() {
             request_id: "g1".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         13,
     )
@@ -2358,6 +2382,7 @@ fn gray_commands_idempotent() {
                 request_id: "g1".into(),
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             14,
         )
@@ -2423,6 +2448,7 @@ fn gray_commands_idempotent() {
             request_id: "g2".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         18,
     )
@@ -2474,6 +2500,7 @@ fn gray_command_error_paths() {
                 request_id: "g1".into(),
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             10,
         )
@@ -2507,6 +2534,7 @@ fn gray_command_error_paths() {
                 request_id: "g2".into(),
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             12,
         )
@@ -2526,6 +2554,7 @@ fn gray_command_error_paths() {
                 request_id: "g3".into(),
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             13,
         )
@@ -2545,6 +2574,7 @@ fn gray_command_error_paths() {
                 request_id: "g4".into(),
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             14,
         )
@@ -2596,6 +2626,7 @@ fn structure_publish_with_active_gray_bumps_both() {
             request_id: "g1".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         13,
     )
@@ -2620,6 +2651,7 @@ fn structure_publish_with_active_gray_bumps_both() {
             request_id: "s3".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         15,
     )
@@ -2667,6 +2699,7 @@ fn gray_resolve_no_identity_never_gray() {
             request_id: "g1".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         13,
     )
@@ -2724,6 +2757,7 @@ fn gray_resolve_no_identity_never_gray() {
             request_id: "g-ip".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         15,
     )
@@ -2792,6 +2826,7 @@ fn prune_keeps_gray_snapshot() {
                 request_id: format!("p{i}"),
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             200 + i as i64,
         )
@@ -2824,6 +2859,7 @@ fn prune_keeps_gray_snapshot() {
             request_id: "g1".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         500,
     )
@@ -2863,6 +2899,7 @@ fn g3_get_config_resolved_three_paths() {
             request_id: "g1".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         13,
     )
@@ -2951,6 +2988,7 @@ fn g3_numeric_coincidence_gray_seq_eq_active() {
             request_id: "g1".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         11,
     )
@@ -2998,6 +3036,7 @@ fn g3_explicit_version_bypasses_resolve() {
             request_id: "g1".into(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         13,
     )
@@ -3016,5 +3055,231 @@ fn g3_explicit_version_bypasses_resolve() {
     assert_eq!(
         snap.groups["redis"]["host"],
         Value::String("stable-host".into())
+    );
+}
+
+// ==================== G1 发布策略（design/g1-policy.md，D35/D36） ====================
+
+/// G1-D1：publish-policy=warn——缺 required 项时校验失败仅记录继续发布（active 推进）。
+#[test]
+fn g1_warn_policy_publishes_incomplete() {
+    let mut s = sm();
+    let (pid, _branches) = setup(&mut s); // 结构含 redis.host(required)
+    let dev = BranchName("dev".into());
+    // 草稿缺 required 的 host（只有可选 port）
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "redis".into(),
+                key: "port".into(),
+                value: Value::Int(6379),
+            }],
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        10,
+    )
+    .unwrap();
+    // Block（默认）→ 拒绝
+    let e = s
+        .apply(
+            &Command::Publish {
+                project: pid.clone(),
+                branch: dev.clone(),
+                comment: "block".into(),
+                request_id: "b1".into(),
+                operator: String::new(),
+                ts: 0,
+                policy: PublishPolicy::Block,
+            },
+            11,
+        )
+        .unwrap_err();
+    assert_eq!(e.kind, ErrorKind::PublishBlocked, "Block 拒绝缺 required");
+    // Warn → 继续发布
+    let events = s
+        .apply(
+            &Command::Publish {
+                project: pid.clone(),
+                branch: dev.clone(),
+                comment: "warn".into(),
+                request_id: "w1".into(),
+                operator: String::new(),
+                ts: 0,
+                policy: PublishPolicy::Warn,
+            },
+            12,
+        )
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    let cfg = s.get_config(&pid, &dev, 0).unwrap();
+    assert_eq!(cfg.version, 2, "warn 放行：active 推进");
+    assert!(cfg.groups["redis"].contains_key("port"));
+}
+
+/// G1-D2：shared-cascade=manual——共享发布只更共享版本，不级联引用分支；
+/// 引用分支下次发布时经物化读取新共享值。
+#[test]
+fn g1_manual_cascade_shared_publish() {
+    let mut s = sm();
+    let (pid, _branches) = setup(&mut s);
+    let dev = BranchName("dev".into());
+    // 共享项草稿 + 发布（v1）
+    s.apply(
+        &Command::SharedDraftUpdate {
+            item: SharedItem {
+                group: "lib".into(),
+                key: "timeout".into(),
+                ty: ValueType::Int,
+                secret: false,
+                required: false,
+                value: Value::Int(30),
+                version: 0,
+            },
+            operator: String::new(),
+        },
+        10,
+    )
+    .unwrap();
+    s.apply(
+        &Command::SharedPublish {
+            comment: "v1".into(),
+            request_id: "sp1".into(),
+            operator: String::new(),
+            ts: 0,
+            cascade: SharedCascadeMode::Auto,
+            policy: PublishPolicy::Block,
+        },
+        11,
+    )
+    .unwrap();
+    // 绑定引用：dev.redis.port ← lib.timeout；发布 dev（物化 30）→ active=2
+    s.apply(
+        &Command::RefBind {
+            project: pid.clone(),
+            binding: RefBinding {
+                group: "redis".into(),
+                item_key: Some("port".into()),
+                shared_group: "lib".into(),
+                shared_key: "timeout".into(),
+            },
+            operator: String::new(),
+        },
+        12,
+    )
+    .unwrap();
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "redis".into(),
+                key: "host".into(),
+                value: Value::String("h".into()),
+            }],
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        13,
+    )
+    .unwrap();
+    s.apply(
+        &Command::Publish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            comment: "v2".into(),
+            request_id: "p1".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        14,
+    )
+    .unwrap();
+    let cfg = s.get_config(&pid, &dev, 0).unwrap();
+    assert_eq!(cfg.groups["redis"]["port"], Value::Int(30), "物化共享值");
+    let st_before = s.get_branch_state(&pid, &dev).unwrap().unwrap();
+    let active_before = st_before.active_version;
+
+    // manual 共享发布（值 60）→ 共享版本推进，但引用分支版本不推进
+    s.apply(
+        &Command::SharedDraftUpdate {
+            item: SharedItem {
+                group: "lib".into(),
+                key: "timeout".into(),
+                ty: ValueType::Int,
+                secret: false,
+                required: false,
+                value: Value::Int(60),
+                version: 1,
+            },
+            operator: String::new(),
+        },
+        15,
+    )
+    .unwrap();
+    let events = s
+        .apply(
+            &Command::SharedPublish {
+                comment: "v2".into(),
+                request_id: "sp2".into(),
+                operator: String::new(),
+                ts: 0,
+                cascade: SharedCascadeMode::Manual,
+                policy: PublishPolicy::Block,
+            },
+            16,
+        )
+        .unwrap();
+    assert!(events.is_empty(), "manual 不级联 → 无分支事件");
+    let st = s.get_branch_state(&pid, &dev).unwrap().unwrap();
+    assert_eq!(
+        st.active_version, active_before,
+        "manual：引用分支版本不推进"
+    );
+    // 共享版本已更新
+    assert_eq!(s.get_shared("lib", "timeout").unwrap().unwrap().version, 2);
+    // 引用分支下次发布 → 物化新共享值 60
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "redis".into(),
+                key: "host".into(),
+                value: Value::String("h2".into()),
+            }],
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        17,
+    )
+    .unwrap();
+    s.apply(
+        &Command::Publish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            comment: "v3".into(),
+            request_id: "p2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        18,
+    )
+    .unwrap();
+    let cfg = s.get_config(&pid, &dev, 0).unwrap();
+    assert_eq!(
+        cfg.groups["redis"]["port"],
+        Value::Int(60),
+        "下次发布物化新共享值"
     );
 }

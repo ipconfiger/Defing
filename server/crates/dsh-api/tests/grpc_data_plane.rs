@@ -9,7 +9,7 @@ use dsh_api::grpc::{
 };
 use dsh_api::ApiState;
 use dsh_core::command::Command;
-use dsh_core::model::{BranchName, ProjectId, Value};
+use dsh_core::model::{BranchName, ProjectId, PublishPolicy, Value};
 use dsh_core::InMemoryStore;
 use dsh_core::StateMachine;
 use dsh_crypto::Cipher;
@@ -55,6 +55,7 @@ fn seed_sm(sm: &RwLock<StateMachine>) {
 
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         7,
     )
@@ -316,6 +317,7 @@ async fn gray_data_plane_resolves_by_identity() {
                 request_id: "g1".into(),
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             101,
         )
@@ -462,6 +464,7 @@ async fn gray_watch_delivers_gray_events() {
                 request_id: "g1".into(),
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             101,
         )

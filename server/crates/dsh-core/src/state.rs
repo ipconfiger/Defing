@@ -979,12 +979,14 @@ impl StateMachine {
                 request_id,
                 operator,
                 ts,
+                policy,
             } => self.apply_publish_structure(
                 project,
                 comment,
                 request_id,
                 Self::eff_ts(ts, now_ms),
                 operator,
+                *policy,
             ),
             Command::DraftUpdate {
                 project,
@@ -1010,6 +1012,7 @@ impl StateMachine {
                 request_id,
                 operator,
                 ts,
+                policy,
             } => self.apply_publish(
                 project,
                 branch,
@@ -1017,6 +1020,7 @@ impl StateMachine {
                 request_id,
                 Self::eff_ts(ts, now_ms),
                 operator,
+                *policy,
             ),
             Command::Rollback {
                 project,
@@ -1043,7 +1047,16 @@ impl StateMachine {
                 request_id,
                 operator,
                 ts,
-            } => self.apply_shared_publish(comment, request_id, Self::eff_ts(ts, now_ms), operator),
+                cascade,
+                policy,
+            } => self.apply_shared_publish(
+                comment,
+                request_id,
+                Self::eff_ts(ts, now_ms),
+                operator,
+                *cascade,
+                *policy,
+            ),
             Command::RefBind {
                 project,
                 binding,
@@ -1153,6 +1166,7 @@ impl StateMachine {
                 request_id,
                 operator,
                 ts,
+                policy,
             } => self.apply_gray_publish(
                 project,
                 branch,
@@ -1161,6 +1175,7 @@ impl StateMachine {
                 request_id,
                 Self::eff_ts(ts, now_ms),
                 operator,
+                *policy,
             ),
             Command::GrayPromote {
                 project,
@@ -1387,6 +1402,7 @@ impl StateMachine {
         request_id: &str,
         now_ms: i64,
         operator: &str,
+        policy: PublishPolicy,
     ) -> ApplyOutcome {
         let structure = self
             .get_structure(id)?
@@ -1402,7 +1418,8 @@ impl StateMachine {
             groups: draft.groups.clone(),
         };
         let errs = validator::validate_structure(&draft_structure);
-        if !errs.is_empty() {
+        // G1/D35：Warn 时校验失败仅记录继续（策略编码进命令，确定性由日志序保证）
+        if !errs.is_empty() && policy == PublishPolicy::Block {
             return Err(Error::publish_blocked(
                 serde_json::json!({ "errors": errs }),
             ));
@@ -1572,17 +1589,19 @@ impl StateMachine {
     }
 
     /// 物化草稿为已解析快照（apply_publish 与 apply_gray_publish 共用，行为一致）：
-    /// 完整性校验（M1 policy=block）+ 草稿值 + 共享库引用补全（草稿无值时取共享值）。
+    /// 完整性校验（G1/D35：Block=拒绝 / Warn=仅记录继续）+ 草稿值 + 共享库引用补全。
+    /// 返回 (快照, 校验告警列表——Warn 模式下非空)。
     fn materialize_resolved(
         &self,
         id: &ProjectId,
         st: &BranchState,
         structure: &Structure,
-    ) -> Result<SnapshotMap, Error> {
-        // 完整性校验（M1 policy=block）
+        policy: PublishPolicy,
+    ) -> Result<(SnapshotMap, Vec<String>), Error> {
+        // 完整性校验（G1/D35：策略编码进命令——确定性由日志序保证）
         let draft_map: BTreeMap<String, BTreeMap<String, DraftValue>> = st.value_draft.clone();
         let errs = validator::validate_publish(&draft_map, structure);
-        if !errs.is_empty() {
+        if !errs.is_empty() && policy == PublishPolicy::Block {
             return Err(Error::publish_blocked(
                 serde_json::json!({ "errors": errs }),
             ));
@@ -1634,9 +1653,10 @@ impl StateMachine {
                 }
             }
         }
-        Ok(resolved)
+        Ok((resolved, errs))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_publish(
         &mut self,
         id: &ProjectId,
@@ -1645,6 +1665,7 @@ impl StateMachine {
         request_id: &str,
         now_ms: i64,
         operator: &str,
+        policy: PublishPolicy,
     ) -> ApplyOutcome {
         let mut st = self
             .get_branch_state(id, branch)?
@@ -1662,7 +1683,7 @@ impl StateMachine {
         }
 
         // 完整性校验 + 物化（草稿值 + 共享库引用）
-        let resolved = self.materialize_resolved(id, &st, &structure)?;
+        let (resolved, _warnings) = self.materialize_resolved(id, &st, &structure, policy)?;
 
         let old = if st.active_version == 0 {
             SnapshotMap::new()
@@ -1782,6 +1803,7 @@ impl StateMachine {
         request_id: &str,
         _now_ms: i64,
         _operator: &str,
+        policy: PublishPolicy,
     ) -> ApplyOutcome {
         Self::validate_gray_rule(rule)?;
         let mut st = self
@@ -1800,7 +1822,7 @@ impl StateMachine {
         }
 
         // 完整性校验 + 物化（草稿值 + 共享库引用；与普通发布同一路径）
-        let gray_snap = self.materialize_resolved(id, &st, &structure)?;
+        let (gray_snap, _warnings) = self.materialize_resolved(id, &st, &structure, policy)?;
         let old = if st.active_version == 0 {
             SnapshotMap::new()
         } else {
@@ -2029,6 +2051,8 @@ impl StateMachine {
         request_id: &str,
         now_ms: i64,
         _operator: &str,
+        cascade: SharedCascadeMode,
+        _policy: PublishPolicy,
     ) -> ApplyOutcome {
         let drafts = self.list_shared_drafts()?;
         if drafts.is_empty() {
@@ -2051,7 +2075,11 @@ impl StateMachine {
             self.store
                 .delete(shared_draft_key(&item.group, &item.key).as_bytes())?;
 
-            // 级联（auto）：引用该共享项的 (项目, 分支) 版本推进
+            // 级联（G1/D36）：Auto = 引用该共享项的 (项目, 分支) 版本推进（现状，原子 D15）；
+            // Manual = 只更共享版本，引用分支下次发布时经 materialize_resolved 物化新值。
+            if cascade == SharedCascadeMode::Manual {
+                continue;
+            }
             let prefix = format!("{K_IDX_REF}{}/{}", item.group, item.key);
             let rows = self.get_prefix_merged(prefix.as_bytes())?;
             for (k, _) in rows {
@@ -2932,6 +2960,7 @@ mod tests {
                 request_id: "s1".into(),
                 operator: String::new(),
                 ts: 0,
+                policy: PublishPolicy::Block,
             },
             3,
         )
@@ -2946,6 +2975,7 @@ mod tests {
                     request_id: "r1".into(),
                     operator: String::new(),
                     ts: 0,
+                    policy: PublishPolicy::Block,
                 },
                 4,
             )
@@ -2992,6 +3022,7 @@ mod tests {
                     request_id: "r2".into(),
                     operator: String::new(),
                     ts: 0,
+                    policy: PublishPolicy::Block,
                 },
                 6,
             )

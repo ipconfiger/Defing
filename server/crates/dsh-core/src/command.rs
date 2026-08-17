@@ -65,6 +65,9 @@ pub enum Command {
         /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）
         #[serde(default)]
         ts: i64,
+        /// 校验策略（G1/D35，同 Publish）
+        #[serde(default)]
+        policy: crate::model::PublishPolicy,
     },
     /// 更新分支值草稿（不生效，I4）。
     /// `expected_draft_rev`（乐观锁）：`Some(rev)` 时校验 == 当前 draft_rev，不匹配 →
@@ -96,6 +99,9 @@ pub enum Command {
         /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）
         #[serde(default)]
         ts: i64,
+        /// 校验策略（G1/D35：Warn = 校验失败仅记录继续发布；缺省 Block。serde default 兼容旧日志）
+        #[serde(default)]
+        policy: crate::model::PublishPolicy,
     },
     /// 回滚：基于历史版本内容创建新版本（历史不可变，I6/I9）。
     Rollback {
@@ -116,7 +122,7 @@ pub enum Command {
         #[serde(default)]
         operator: String,
     },
-    /// 发布共享项（auto 级联引用它的所有项目分支；原子）。
+    /// 发布共享项（级联引用它的所有项目分支；原子）。
     SharedPublish {
         comment: String,
         request_id: String,
@@ -125,6 +131,12 @@ pub enum Command {
         /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）
         #[serde(default)]
         ts: i64,
+        /// 级联模式（G1/D36：Manual = 只更共享版本，引用分支下次发布物化；缺省 Auto）
+        #[serde(default)]
+        cascade: crate::model::SharedCascadeMode,
+        /// 校验策略（G1/D35）
+        #[serde(default)]
+        policy: crate::model::PublishPolicy,
     },
     /// 绑定项目 item → 共享项。
     RefBind {
@@ -258,6 +270,9 @@ pub enum Command {
         /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）
         #[serde(default)]
         ts: i64,
+        /// 校验策略（G1/D35）
+        #[serde(default)]
+        policy: crate::model::PublishPolicy,
     },
     /// 灰度转正：读灰度快照内容 → 写新 active_version（next = max(active, gray)+1，Q1）→ 清灰度。
     /// 事件 gray=true 携带新 active 版本号（灰度客户端据此重拉；Q4）。

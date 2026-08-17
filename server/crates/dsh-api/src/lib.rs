@@ -65,6 +65,8 @@ pub struct ApiState {
     /// HTTP 数据面访问令牌（D2）：配置时 /v1/* 需 Bearer 或 ?token=（兼容 SSE EventSource）；
     /// 未配置开放（与 gRPC data_plane_interceptor 同语义）。
     data_plane_token: Option<std::sync::Arc<str>>,
+    /// 读取模式（G1/D37：Linear=ReadIndex 门控 / Stale=本地直读；CLI --read-mode 注入，默认 Linear）
+    pub read_mode: dsh_core::model::ReadMode,
 }
 
 impl ApiState {
@@ -136,10 +138,24 @@ impl ApiState {
             login_throttle: std::sync::Arc::new(LoginThrottle::new()),
             trusted_proxies,
             data_plane_token,
+            read_mode: dsh_core::model::ReadMode::Linear,
         }
     }
 
     /// 通用写（dev-single 直 apply；集群经 Raft client_write）。
+    /// G1/D37：线性读门控——Linear 模式 + 集群下先做 ReadIndex（ensure_linearizable），
+    /// 保证读已提交；Stale 或 dev-single 直接返回（本地读）。
+    pub async fn linearized_read(&self) -> Result<(), ApiError> {
+        if self.read_mode == dsh_core::model::ReadMode::Linear {
+            if let Some(raft) = &self.raft {
+                raft.ensure_linearizable().await.map_err(|e| {
+                    ApiError(dsh_core::Error::internal(format!("linearized read: {e}")))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     async fn write(&self, cmd: &Command, now_ms: i64) -> Result<dsh_raft::WriteOutcome, ApiError> {
         dsh_raft::write_command(
             &self.sm,
@@ -875,13 +891,18 @@ async fn publish(
             Some(branch.clone()),
             Some(outcome.version),
             Some(rid.clone()),
-            serde_json::json!({}),
+            // G1/D35：warn 模式下校验告警留痕
+            serde_json::json!({
+                "warnings": outcome.warnings,
+            }),
             &principal_op(&principal),
         )
         .await;
     Ok(Json(serde_json::json!({
         "version": outcome.version,
         "changes": serde_json::to_value(&outcome.changes).expect("serialize"),
+        // G1/D35：warn 发布时校验告警（block 恒空数组）
+        "warnings": outcome.warnings,
         "request_id": rid,
     })))
 }
@@ -1222,6 +1243,8 @@ async fn branch_diff(
     AxumPath(pid): AxumPath<String>,
     axum::extract::Query(q): axum::extract::Query<DiffQuery>,
 ) -> ApiResult<serde_json::Value> {
+    // G1/D37：线性读门控
+    app.linearized_read().await?;
     let sm = app.sm.read().map_err(lock_err)?;
     let id = ProjectId(pid);
     let a = sm
@@ -1535,6 +1558,9 @@ async fn publish_shared(
 
                 operator: principal_op(&principal),
                 ts: now_ms(),
+                // G1/D36/D35：从节点配置注入（CLI --shared-cascade / --publish-policy）
+                cascade: app.publish.shared_cascade,
+                policy: app.publish.publish_policy,
             },
             now_ms(),
         )
@@ -1728,6 +1754,8 @@ async fn admin_config(
     AxumPath((pid, branch)): AxumPath<(String, String)>,
     axum::extract::Query(q): axum::extract::Query<ConfigQuery>,
 ) -> ApiResult<ConfigResp> {
+    // G1/D37：线性读门控
+    app.linearized_read().await?;
     let (version, project, branch_name, structure_version, mut groups) = {
         let sm = app.sm.read().map_err(lock_err)?;
         let snap = sm
@@ -1970,6 +1998,8 @@ async fn snapshot(
     headers: axum::http::HeaderMap,
     PeerAddr(peer): PeerAddr,
 ) -> ApiResult<ConfigResp> {
+    // G1/D37：线性读门控（Linear 模式 ReadIndex 后本地读）
+    app.linearized_read().await?;
     // G3/D26：数据面身份解析——X-Dsh-Instance / X-Dsh-Labels（k=v,k2=v2 逗号分隔）+ 对端 IP 兜底。
     // 无身份（缺头/空值）→ 空 ClientCtx → resolve 走稳定版（Q2 向后兼容）。
     let ctx = client_ctx_from_headers(&headers, peer);
@@ -2117,6 +2147,17 @@ async fn render_config(
     axum::extract::Query(q): axum::extract::Query<RenderQuery>,
     req: axum::extract::Request,
 ) -> Result<axum::response::Response, (StatusCode, Json<ApiErrorBody>)> {
+    // G1/D37：线性读门控
+    app.linearized_read().await.map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiErrorBody {
+                code: "ERR_LINEAR_READ".into(),
+                message: e.0.message,
+                detail: None,
+            }),
+        )
+    })?;
     // G3/D28（Q6）：管理面渲染——明确**不接身份**（不 resolve 灰度）。管理员看到的是
     // 稳定客户端所见（version=0 → active）；要看灰度明文须显式传版本号（G4 gray-status）。
     // reveal=true：校验管理面会话（本端点不在 /api/v1 鉴权中间件覆盖内，手动校验）。

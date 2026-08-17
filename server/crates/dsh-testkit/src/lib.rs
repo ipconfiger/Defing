@@ -4,7 +4,7 @@
 use std::sync::RwLock;
 
 use dsh_core::command::Command;
-use dsh_core::model::{BranchName, GroupDef, ItemDef, ProjectId, Value, ValueType};
+use dsh_core::model::{BranchName, GroupDef, ItemDef, ProjectId, PublishPolicy, Value, ValueType};
 use dsh_core::StateMachine;
 
 /// 演示项目结构：redis 组（host 必填 string / port int / pass secret）。
@@ -81,6 +81,7 @@ pub fn seed_demo_project(
 
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         3,
     )?;
@@ -117,6 +118,7 @@ pub fn seed_demo_project(
 
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         5,
     )?;

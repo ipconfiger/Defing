@@ -3,7 +3,7 @@
 
 use dsh_core::command::Command;
 use dsh_core::model::{AdminSession, Principal};
-use dsh_core::model::{BranchName, ProjectId};
+use dsh_core::model::{BranchName, ProjectId, PublishPolicy};
 use dsh_core::{token_hash, ErrorKind, InMemoryStore, StateMachine};
 
 fn sm() -> StateMachine {
@@ -451,6 +451,7 @@ fn publish_operator_recorded_in_version() {
             request_id: "req-test".to_string(),
             operator: "pa:alice".to_string(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         1_600,
     )
@@ -480,6 +481,7 @@ fn publish_operator_recorded_in_version() {
             request_id: "req-test".to_string(),
             operator: "pa:alice".to_string(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         1_800,
     )
@@ -524,6 +526,7 @@ fn publish_operator_defaults_to_admin() {
             request_id: "req-test".to_string(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         1_600,
     )
@@ -553,6 +556,7 @@ fn publish_operator_defaults_to_admin() {
             request_id: "req-test".to_string(),
             operator: String::new(),
             ts: 0,
+            policy: PublishPolicy::Block,
         },
         1_800,
     )

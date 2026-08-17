@@ -134,6 +134,11 @@ impl config_service_server::ConfigService for ConfigGrpcService {
         &self,
         req: Request<GetConfigRequest>,
     ) -> Result<Response<ConfigSnapshot>, Status> {
+        // G1/D37：线性读门控（Linear 模式 ReadIndex 后本地读）
+        self.state
+            .linearized_read()
+            .await
+            .map_err(|e| Status::unavailable(format!("linearized read: {}", e.0.message)))?;
         // G3/D26：对端 IP（tonic RemoteAddr 注入；须在 into_inner 前取）
         let peer_ip = req.remote_addr().map(|a| a.ip());
         let r = req.into_inner();
@@ -165,6 +170,11 @@ impl config_service_server::ConfigService for ConfigGrpcService {
     }
 
     async fn get_item(&self, req: Request<GetItemRequest>) -> Result<Response<ItemValue>, Status> {
+        // G1/D37：线性读门控
+        self.state
+            .linearized_read()
+            .await
+            .map_err(|e| Status::unavailable(format!("linearized read: {}", e.0.message)))?;
         // G3/D26（Q6）：get_item 必须同样 resolve——单 item 读取按身份分流
         let peer_ip = req.remote_addr().map(|a| a.ip());
         let r = req.into_inner();

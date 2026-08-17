@@ -105,6 +105,15 @@ struct Cli {
     /// 灰度自动回滚检查间隔秒（测试可调小；默认 60）
     #[arg(long, default_value_t = 60)]
     gray_rollback_interval: u64,
+    /// 发布校验策略（G1/D35）：block=校验失败拒绝（默认）| warn=仅记录继续发布
+    #[arg(long, value_enum, default_value_t = PolicyArg::Block)]
+    publish_policy: PolicyArg,
+    /// 共享发布级联模式（G1/D36）：auto=自动级联引用分支（默认）| manual=只更共享版本
+    #[arg(long, value_enum, default_value_t = CascadeArg::Auto)]
+    shared_cascade: CascadeArg,
+    /// 读取模式（G1/D37）：linear=ReadIndex 门控读已提交（默认）| stale=本地直读
+    #[arg(long, value_enum, default_value_t = ReadArg::Linear)]
+    read_mode: ReadArg,
     /// 管理员密码（缺省首启随机生成并打印；admin 客户端模式用于登录）
     #[arg(long, global = true)]
     admin_password: Option<String>,
@@ -407,6 +416,48 @@ fn resolve_admin_password(cli: &Cli, node_label: &str) -> Arc<str> {
     }
 }
 
+// ---------------- G1/D35-37：CLI 参数枚举（clap value_enum → core 类型） ----------------
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum PolicyArg {
+    Block,
+    Warn,
+}
+impl From<PolicyArg> for dsh_core::model::PublishPolicy {
+    fn from(v: PolicyArg) -> Self {
+        match v {
+            PolicyArg::Block => dsh_core::model::PublishPolicy::Block,
+            PolicyArg::Warn => dsh_core::model::PublishPolicy::Warn,
+        }
+    }
+}
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum CascadeArg {
+    Auto,
+    Manual,
+}
+impl From<CascadeArg> for dsh_core::model::SharedCascadeMode {
+    fn from(v: CascadeArg) -> Self {
+        match v {
+            CascadeArg::Auto => dsh_core::model::SharedCascadeMode::Auto,
+            CascadeArg::Manual => dsh_core::model::SharedCascadeMode::Manual,
+        }
+    }
+}
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum ReadArg {
+    Linear,
+    Stale,
+}
+impl From<ReadArg> for dsh_core::model::ReadMode {
+    fn from(v: ReadArg) -> Self {
+        match v {
+            ReadArg::Linear => dsh_core::model::ReadMode::Linear,
+            ReadArg::Stale => dsh_core::model::ReadMode::Stale,
+        }
+    }
+}
+
 // ---------------- 主入口 ----------------
 
 #[tokio::main]
@@ -515,7 +566,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let admin_password = resolve_admin_password(&cli, "首次启动");
         // hub 将被移入 ApiState，先取 sender 供自动回滚广播（G5/D33）
         let hub_sender = hub.sender().clone();
-        let app = ApiState::with_retention(
+        let mut app = ApiState::with_retention(
             Arc::new(RwLock::new(sm)),
             hub,
             None,
@@ -532,6 +583,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             trusted_proxies.clone(),
             cli.data_plane_token.clone().map(Arc::from),
         );
+        // G1/D35-37：发布策略/级联/读取模式注入
+        app.publish.publish_policy = cli.publish_policy.into();
+        app.publish.shared_cascade = cli.shared_cascade.into();
+        app.read_mode = cli.read_mode.into();
         // G5/D33：灰度自动回滚（dev-single 恒 leader；threshold 百分比 → 比例）
         if cli.gray_rollback_threshold > 0.0 {
             let (_leader_tx, leader_rx) = tokio::sync::watch::channel(true);
@@ -680,7 +735,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
 
     let admin_password = resolve_admin_password(&cli, &format!("节点 {node_id}"));
-    let app = ApiState::with_retention(
+    let mut app = ApiState::with_retention(
         sm.clone(),
         hub,
         Some(raft.clone()),
@@ -697,6 +752,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         trusted_proxies,
         cli.data_plane_token.clone().map(Arc::from),
     );
+    // G1/D35-37：发布策略/级联/读取模式注入
+    app.publish.publish_policy = cli.publish_policy.into();
+    app.publish.shared_cascade = cli.shared_cascade.into();
+    app.read_mode = cli.read_mode.into();
     spawn_grpc(&cli, app.clone());
     let router = dsh_api::build_router(app);
     let listener = tokio::net::TcpListener::bind(&cli.http_addr).await?;
