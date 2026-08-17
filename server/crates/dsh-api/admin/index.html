@@ -1,224 +1,487 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Defing 配置中心</title>
-<style>
-:root { --bg:#0f172a; --panel:#1e293b; --line:#334155; --fg:#e2e8f0; --dim:#94a3b8; --acc:#38bdf8; --ok:#34d399; --err:#f87171; }
-* { box-sizing:border-box; }
-body { font-family:system-ui,sans-serif; margin:0; background:var(--bg); color:var(--fg); font-size:14px; }
-header { padding:12px 20px; background:var(--panel); border-bottom:1px solid var(--line); display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
-header h1 { font-size:16px; margin:0; }
-header .spacer { flex:1; }
-main { padding:16px 20px; max-width:1200px; }
-.hidden { display:none !important; }
-button { background:#334155; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 12px; cursor:pointer; font-size:13px; }
-button:hover { background:#475569; }
-button.primary { background:#0ea5e9; border-color:#0ea5e9; color:#fff; }
-button.danger { background:#7f1d1d; border-color:#991b1b; }
-input, select, textarea { background:#0f172a; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 8px; font-size:13px; }
-textarea { font-family:ui-monospace,monospace; width:100%; min-height:120px; }
-pre { background:#0f172a; border:1px solid var(--line); border-radius:8px; padding:10px; overflow:auto; font-size:12px; font-family:ui-monospace,monospace; max-height:320px; }
-.card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:14px; }
-.card h3 { margin:0 0 10px; font-size:14px; color:var(--acc); }
-.row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
-table { border-collapse:collapse; width:100%; font-size:13px; }
-th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
-th { color:var(--dim); font-weight:600; }
-code { background:#0f172a; padding:1px 5px; border-radius:4px; }
-.msg { padding:6px 10px; border-radius:6px; margin:8px 0; display:none; }
-.msg.ok { display:block; background:#052e16; color:var(--ok); border:1px solid #166534; }
-.msg.err { display:block; background:#450a0a; color:var(--err); border:1px solid #991b1b; }
-.tabs { display:flex; gap:6px; margin:10px 0; flex-wrap:wrap; }
-.tabs button { font-size:13px; padding:6px 14px; }
-.tabs button.active { background:#0ea5e9; color:#fff; border-color:#0ea5e9; }
-#events { height:140px; overflow:auto; background:#0f172a; border:1px solid var(--line); border-radius:8px; padding:8px; font-size:12px; font-family:ui-monospace,monospace; }
-#audit td, #shared td { white-space:nowrap; }
-.mono { font-family:ui-monospace,monospace; }
-.badge { background:#334155; border-radius:10px; padding:1px 8px; font-size:12px; }
-.badge.v { background:#0c4a6e; }
-.muted { color:var(--dim); }
-#modal { position:fixed; inset:0; background:rgba(0,0,0,.55); display:flex; align-items:center; justify-content:center; z-index:50; }
-.modal-box { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:18px 20px; min-width:320px; max-width:520px; }
-.modal-box h3 { margin:0 0 12px; font-size:14px; color:var(--acc); }
-</style>
+<link rel="stylesheet" href="/admin/styles.css">
+<!-- D-CSP：脚本全部外置（script-src 'self'，无 inline script / onclick） -->
+<script src="/admin/app.js" defer></script>
 </head>
 <body>
-<header>
-  <h1>Defing 配置中心 <small class="muted">单管理员会话 I7</small></h1>
-  <span class="spacer"></span>
-  <span id="who" class="muted hidden"></span>
-  <button id="btn-login" class="hidden">登录</button>
-  <button id="btn-logout" class="hidden danger">登出</button>
-</header>
-<main>
-  <!-- 登录 -->
-  <div id="view-login" class="card hidden">
-    <h3>管理员登录</h3>
-    <div class="row">
-      <input id="login-pw" type="password" placeholder="管理员密码">
-      <button class="primary" data-act="doLogin">登录</button>
-    </div>
+
+<!-- 图标库（内联 sprite，无外部依赖） -->
+<svg xmlns="http://www.w3.org/2000/svg" class="sprite" aria-hidden="true">
+  <symbol id="i-logo" viewBox="0 0 24 24"><path d="M12 2.5 21 7.25 12 12 3 7.25 12 2.5Z"/><path d="m3 12.2 9 4.75 9-4.75"/><path d="m3 17.05 9 4.75 9-4.75"/></symbol>
+  <symbol id="i-config" viewBox="0 0 24 24"><path d="M4 6h16"/><path d="M4 12h10"/><path d="M4 18h7"/><circle cx="17" cy="12" r="2.2"/><circle cx="13" cy="18" r="2.2"/></symbol>
+  <symbol id="i-branch" viewBox="0 0 24 24"><path d="M6 3v12"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+  <symbol id="i-shared" viewBox="0 0 24 24"><path d="M12 2 2 7l10 5 10-5-10-5Z"/><path d="m2 12 10 5 10-5"/><path d="m2 17 10 5 10-5"/></symbol>
+  <symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6Z"/><path d="M14 2v6h6"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/></symbol>
+  <symbol id="i-cluster" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><path d="M6.01 6.5h.01"/><path d="M6.01 17.5h.01"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14"/><path d="M5 12h14"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M10 11v6"/><path d="M14 11v6"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-radio" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49"/><path d="M7.76 16.25a6 6 0 0 1 0-8.49"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M4.93 19.07a10 10 0 0 1 0-14.14"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></symbol>
+  <symbol id="i-rollback" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 2.64-6.36L3 8"/><path d="M3 3v5h5"/></symbol>
+  <symbol id="i-diff" viewBox="0 0 24 24"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/><path d="M11 18H8a2 2 0 0 1-2-2V9"/></symbol>
+  <symbol id="i-arrow-r" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></symbol>
+  <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.64-6.36L21 8"/><path d="M21 3v5h-5"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></symbol>
+  <symbol id="i-code" viewBox="0 0 24 24"><path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></symbol>
+  <symbol id="i-funnel" viewBox="0 0 24 24"><path d="M22 3H2l8 9.46V19l4 2v-8.54L22 3Z"/></symbol>
+  <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11Z"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+  <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></symbol>
+</svg>
+
+<noscript><p style="padding:24px;text-align:center">Defing 管理控制台需要启用 JavaScript。</p></noscript>
+
+<!-- ========== 登录 ========== -->
+<div id="login-view" class="login-wrap hidden">
+  <div class="login-card">
+    <div class="login-brand"><svg class="ic ic-lg"><use href="#i-logo"/></svg></div>
+    <h1>Defing 配置中心</h1>
+    <p class="login-sub">分布式配置管理控制台</p>
+    <form id="login-form" autocomplete="off" novalidate>
+      <div class="field">
+        <label for="login-user">用户名</label>
+        <input class="in" id="login-user" placeholder="全局管理员留空" autocomplete="username">
+      </div>
+      <div class="field">
+        <label for="login-pw">密码</label>
+        <input class="in" id="login-pw" type="password" placeholder="请输入密码" autocomplete="current-password">
+      </div>
+      <div id="login-err" class="field-err hidden"></div>
+      <button type="submit" class="btn primary block" id="login-submit">登 录</button>
+    </form>
+    <p class="login-foot">项目管理员请填写用户名；令牌仅保存在本地浏览器</p>
   </div>
-
-  <!-- 主视图 -->
-  <div id="view-main" class="hidden">
-    <div class="tabs">
-      <button data-tab="projects" class="active" data-act="showTab" data-arg="projects">项目</button>
-      <button data-tab="shared" data-act="showTab" data-arg="shared">共享库</button>
-      <button data-tab="audit" data-act="showTab" data-arg="audit">审计</button>
-      <button data-tab="cluster" data-act="showTab" data-arg="cluster">集群</button>
-    </div>
-
-    <!-- 项目 -->
-    <div id="tab-projects">
-      <div class="card">
-        <h3>项目</h3>
-        <div class="row">
-          <input id="new-proj" placeholder="新项目名（小写字母/数字/连字符）">
-          <button class="primary" data-act="createProject">创建项目</button>
-          <select id="sel-proj" data-act="loadProject"><option value="">选择项目…</option></select>
-          <button class="danger" data-act="deleteProject">删除项目</button>
-        </div>
-      </div>
-
-      <div id="proj-detail" class="hidden">
-        <div class="card">
-          <h3 id="proj-title">项目详情</h3>
-          <div class="row">
-            <select id="sel-branch" data-act="loadBranch"></select>
-            <input id="new-branch" placeholder="新分支名">
-            <button data-act="createBranch">建分支</button>
-            <button class="danger" data-act="deleteBranch">删分支</button>
-            <button data-act="toggleWatch" id="btn-watch">订阅变更</button>
-            <button data-act="viewConfig">查看配置</button>
-            <label><input type="checkbox" id="cfg-reveal"> reveal（明文，审计）</label>
-          </div>
-          <div id="events" class="hidden"></div>
-          <pre id="cfg-out" class="hidden"></pre>
-        </div>
-
-        <div class="card">
-          <h3>结构草稿（JSON：{"base_version":N,"groups":[{"name","items":[{"key","type","required","secret"}]}]}）</h3>
-          <textarea id="struct-draft" placeholder='{"base_version":1,"groups":[]}'></textarea>
-          <div class="row" style="margin-top:8px">
-            <button data-act="loadStructDraft">载入当前</button>
-            <button class="primary" data-act="saveStructDraft">保存结构草稿</button>
-            <button data-act="publishStruct">发布结构</button>
-            <span class="muted">发布结构 = 全部分支版本推进（I3/I5）</span>
-          </div>
-        </div>
-
-        <div class="card">
-          <h3 id="branch-title">分支草稿编辑</h3>
-          <div id="draft-editor">（选择分支后编辑）</div>
-        </div>
-
-        <div class="card">
-          <h3>灰度发布（分支级：稳定版 + 灰度版双版本，规则定向，G2/G3）</h3>
-          <div id="gray-status" class="muted">（选择分支后加载）</div>
-          <div style="margin-top:8px">
-            <textarea id="gray-rule" placeholder='{"match_labels":[{"key":"zone","value":"cn-north-1"}],"ip_cidrs":[],"percentage":null}'></textarea>
-          </div>
-          <div class="row" style="margin-top:8px">
-            <button data-act="loadGrayRule">载入当前规则</button>
-            <button class="primary" data-act="doGrayPublish">灰度发布</button>
-            <button data-act="doGrayPromote">一键转正</button>
-            <button class="danger" data-act="doGrayAbort">一键下量(回滚)</button>
-            <span class="muted">发布前先编辑分支草稿；命中规则的客户端读灰度快照，其余读稳定版</span>
-          </div>
-        </div>
-
-        <div class="card">
-          <h3>版本历史 / 回滚 / 对比 / 提升</h3>
-          <div class="row">
-            <select id="diff-a"></select> vs <select id="diff-b"></select>
-            <button data-act="showDiff">对比</button>
-            <span style="width:12px"></span>
-            提升 <select id="promote-from"></select> → <select id="promote-to"></select>
-            <label><input type="checkbox" id="promote-force"> force</label>
-            <button class="primary" data-act="doPromote">提升</button>
-          </div>
-          <div id="diff-out"></div>
-          <table id="versions" style="margin-top:10px">
-            <thead><tr><th>版本</th><th>类型</th><th>备注</th><th>结构</th><th>时间</th><th></th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-
-    <!-- 共享库 -->
-    <div id="tab-shared" class="hidden">
-      <div class="card">
-        <h3>共享项（写共享草稿 → 发布 → 级联引用项目）</h3>
-        <div class="row">
-          <input id="sh-group" placeholder="组" style="width:120px">
-          <input id="sh-key" placeholder="key" style="width:140px">
-          <select id="sh-type">
-            <option value="string">string</option><option value="int">int</option><option value="float">float</option>
-            <option value="bool">bool</option><option value="json">json</option><option value="array">array</option>
-            <option value="secret">secret</option>
-          </select>
-          <label><input type="checkbox" id="sh-secret"> secret</label>
-          <label><input type="checkbox" id="sh-required"> required</label>
-          <input id="sh-value" placeholder='{"type":"string","str_value":"x"}' style="width:300px">
-          <button class="primary" data-act="saveShared">保存草稿</button>
-          <button data-act="publishShared">发布共享</button>
-        </div>
-        <div class="row" style="margin-top:8px">
-          <b class="muted">引用绑定：</b>
-          <input id="ref-project" placeholder="项目" style="width:140px">
-          <input id="ref-group" placeholder="结构组" style="width:120px">
-          <input id="ref-item" placeholder="item key（空=整组）" style="width:140px">
-          <input id="ref-sg" placeholder="共享组" style="width:100px">
-          <input id="ref-sk" placeholder="共享 key" style="width:120px">
-          <button data-act="bindRef">绑定</button>
-        </div>
-      </div>
-      <div class="card">
-        <h3>已发布 / 草稿</h3>
-        <table id="shared"><thead><tr><th>组</th><th>key</th><th>类型</th><th>版本</th><th>值</th><th>secret</th></tr></thead><tbody></tbody></table>
-      </div>
-    </div>
-
-    <!-- 审计 -->
-    <div id="tab-audit" class="hidden">
-      <div class="card">
-        <h3>审计（最近 200 条）</h3>
-        <div class="row">
-          <input id="audit-filter" placeholder="action 过滤（如 publish）">
-          <button data-act="loadAudit">刷新</button>
-        </div>
-        <table id="audit"><thead><tr><th>seq</th><th>时间</th><th>action</th><th>项目/分支</th><th>版本</th><th>request_id</th><th>明细</th></tr></thead><tbody></tbody></table>
-      </div>
-    </div>
-
-    <!-- 集群（P3-⑦：集群管理入口；admin-only） -->
-    <div id="tab-cluster" class="hidden">
-      <div class="card">
-        <h3>集群成员 / 提升 / 移除</h3>
-        <div id="cluster-out">（加载中…）</div>
-      </div>
-    </div>
-  </div>
-  <div id="msg"></div>
 </div>
 
-<!-- 确认/输入 modal（替代 prompt/confirm，可自动化且 UX 更好） -->
-<div id="modal" class="hidden">
-  <div class="modal-box">
+<!-- ========== 应用外壳 ========== -->
+<div id="app" class="shell hidden">
+  <aside class="sidebar">
+    <div class="brand">
+      <svg class="ic"><use href="#i-logo"/></svg>
+      <div class="brand-text">Defing<small>配置中心</small></div>
+    </div>
+    <nav class="nav">
+      <button type="button" class="nav-item active" data-act="switchView" data-nav="config"><svg class="ic"><use href="#i-config"/></svg><span>配置管理</span></button>
+      <button type="button" class="nav-item" data-act="switchView" data-nav="shared"><svg class="ic"><use href="#i-shared"/></svg><span>共享库</span></button>
+      <button type="button" class="nav-item" data-act="switchView" data-nav="audit"><svg class="ic"><use href="#i-audit"/></svg><span>审计日志</span></button>
+      <button type="button" class="nav-item" data-act="switchView" data-nav="cluster"><svg class="ic"><use href="#i-cluster"/></svg><span>集群节点</span></button>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="session">
+        <span class="avatar" id="who-avatar">A</span>
+        <div class="session-info">
+          <div class="session-name" id="who-name">管理员</div>
+          <div class="session-sub" id="who-sub">全局</div>
+        </div>
+      </div>
+      <div class="foot-row">
+        <button type="button" class="btn ghost" id="btn-theme" data-act="toggleTheme" title="切换主题" aria-label="切换主题">
+          <svg class="ic" id="btn-theme-sun"><use href="#i-sun"/></svg>
+          <svg class="ic hidden" id="btn-theme-moon"><use href="#i-moon"/></svg>
+        </button>
+        <button type="button" class="btn ghost danger" id="btn-logout" data-act="doLogout">
+          <svg class="ic"><use href="#i-logout"/></svg><span>登出</span>
+        </button>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="main-inner">
+
+      <!-- ===== 配置管理 ===== -->
+      <section id="view-config" class="view">
+        <header class="view-head">
+          <h1>配置管理</h1>
+          <p class="view-sub">项目与分支的草稿编辑、发布、灰度与版本管理</p>
+        </header>
+
+        <div class="proj-bar">
+          <div id="proj-chips" class="proj-chips"></div>
+          <div class="proj-bar-actions">
+            <button type="button" class="btn ghost" data-act="newProjectModal"><svg class="ic"><use href="#i-plus"/></svg>新建项目</button>
+            <button type="button" class="icon-btn danger hidden" id="btn-del-proj" data-act="deleteProject" title="删除当前项目" aria-label="删除当前项目"><svg class="ic"><use href="#i-trash"/></svg></button>
+          </div>
+        </div>
+
+        <div id="cfg-empty" class="card empty hidden">
+          <svg class="ic"><use href="#i-inbox"/></svg>
+          <h4>暂无项目</h4>
+          <p>创建第一个项目后，即可定义结构、编辑草稿并发布配置版本。</p>
+          <button type="button" class="btn primary" data-act="newProjectModal"><svg class="ic"><use href="#i-plus"/></svg>新建项目</button>
+        </div>
+
+        <div id="cfg-work" class="stack hidden">
+          <div class="card ctxbar">
+            <div class="ctx-main">
+              <select id="sel-branch" class="sel" data-act="selectBranch" aria-label="选择分支"></select>
+              <div id="ctx-badges" class="badges"></div>
+            </div>
+            <div class="ctx-actions">
+              <button type="button" class="btn" data-act="openCfgModal"><svg class="ic"><use href="#i-eye"/></svg>查看配置</button>
+              <button type="button" class="btn" id="btn-watch" data-act="toggleWatch"><svg class="ic"><use href="#i-radio"/></svg><span id="btn-watch-label">订阅变更</span></button>
+              <button type="button" class="btn ghost" data-act="newBranchModal"><svg class="ic"><use href="#i-plus"/></svg>新建分支</button>
+              <button type="button" class="icon-btn danger" data-act="deleteBranch" title="删除当前分支" aria-label="删除当前分支"><svg class="ic"><use href="#i-trash"/></svg></button>
+            </div>
+          </div>
+
+          <div id="watch-panel" class="console-wrap hidden">
+            <div class="console-head">
+              <span class="live-dot"></span><span>实时变更订阅</span>
+              <span id="watch-ctx" class="mono small"></span>
+              <span class="spacer"></span>
+              <button type="button" class="btn sm ghost" data-act="toggleWatch">停止订阅</button>
+            </div>
+            <div id="events" class="console"></div>
+          </div>
+
+          <div class="pane-tabs">
+            <div class="seg" id="pane-seg">
+              <button type="button" data-act="switchPane" data-pane="draft" class="active">草稿</button>
+              <button type="button" data-act="switchPane" data-pane="gray">灰度发布</button>
+              <button type="button" data-act="switchPane" data-pane="versions">版本历史</button>
+              <button type="button" data-act="switchPane" data-pane="structure">结构</button>
+              <button type="button" data-act="switchPane" data-pane="diff">对比与提升</button>
+            </div>
+          </div>
+
+          <!-- 草稿 -->
+          <div id="pane-draft" class="pane">
+            <div id="draft-groups" class="stack"></div>
+            <div class="card addcard">
+              <div class="addcard-title"><svg class="ic"><use href="#i-plus"/></svg>添加配置项</div>
+              <div class="addgrid">
+                <div class="field">
+                  <label for="new-item-group">组</label>
+                  <input class="in mono" id="new-item-group" list="group-list" placeholder="如 server">
+                  <datalist id="group-list"></datalist>
+                </div>
+                <div class="field">
+                  <label for="new-item-key">key</label>
+                  <input class="in mono" id="new-item-key" placeholder="如 max_conn">
+                </div>
+                <div class="field">
+                  <label for="new-item-type">类型</label>
+                  <select class="sel" id="new-item-type">
+                    <option value="string">string</option><option value="int">int</option>
+                    <option value="float">float</option><option value="bool">bool</option>
+                    <option value="json">json</option><option value="array">array</option>
+                    <option value="secret">secret</option>
+                  </select>
+                </div>
+                <div class="field span-all">
+                  <label for="new-item-val">值</label>
+                  <input class="in mono" id="new-item-val" placeholder='bool 填 true / false；array 逗号分隔；json 填 JSON 文本'>
+                </div>
+                <div class="addrow">
+                  <button type="button" class="btn" data-act="addDraftItem"><svg class="ic"><use href="#i-plus"/></svg>添加</button>
+                  <span id="add-item-err" class="field-err hidden" style="margin-top:0"></span>
+                </div>
+              </div>
+            </div>
+            <div class="card actionbar">
+              <span class="badge" id="draft-rev-badge" title="草稿修订号（乐观锁）">草稿 <span class="mono" id="draft-rev">r0</span></span>
+              <button type="button" class="btn" data-act="saveDraft">保存草稿</button>
+              <button type="button" class="btn primary" data-act="doPublish"><svg class="ic"><use href="#i-up"/></svg>发布版本</button>
+              <span class="hint">发布后，订阅该分支的客户端将收到变更事件</span>
+            </div>
+          </div>
+
+          <!-- 灰度 -->
+          <div id="pane-gray" class="pane hidden">
+            <div id="gray-summary" class="card gray-strip"></div>
+            <div class="card">
+              <div class="card-head">
+                <h3>灰度规则</h3>
+                <div class="card-actions">
+                  <button type="button" class="btn ghost" data-act="loadGrayRule"><svg class="ic"><use href="#i-refresh"/></svg>载入当前规则</button>
+                  <button type="button" class="btn ghost" id="btn-gray-mode" data-act="toggleGrayJson"><svg class="ic"><use href="#i-code"/></svg><span id="btn-gray-mode-label">JSON 模式</span></button>
+                </div>
+              </div>
+              <div id="gray-form">
+                <div class="field">
+                  <label>标签匹配（match_labels · 任一命中即命中）</label>
+                  <div id="label-rows"></div>
+                  <button type="button" class="btn ghost sm" data-act="addLabelRow"><svg class="ic ic-xs"><use href="#i-plus"/></svg>添加标签</button>
+                </div>
+                <div class="grid-2c">
+                  <div class="field">
+                    <label for="gray-cidrs">IP CIDR（每行一个）</label>
+                    <textarea class="in mono" id="gray-cidrs" rows="3" spellcheck="false" placeholder="10.0.0.0/8&#10;192.168.1.0/24"></textarea>
+                  </div>
+                  <div class="field">
+                    <label for="gray-pct">百分比（percentage · 0–100）</label>
+                    <input class="in" id="gray-pct" type="number" min="0" max="100" step="1" placeholder="留空 = 不按比例">
+                    <p class="hint">按客户端实例哈希分桶；标签 / CIDR / 百分比任一命中即进入灰度。</p>
+                  </div>
+                </div>
+              </div>
+              <textarea id="gray-rule" class="in mono hidden" rows="8" spellcheck="false" placeholder='{"match_labels":[{"key":"zone","value":"cn-north-1"}],"ip_cidrs":[],"percentage":null}'></textarea>
+              <div id="gray-err" class="field-err hidden"></div>
+              <div class="actionrow">
+                <button type="button" class="btn primary" data-act="doGrayPublish"><svg class="ic"><use href="#i-funnel"/></svg>发布灰度</button>
+                <span class="hint">以当前分支草稿生成灰度快照；命中规则的客户端读灰度快照，其余读稳定版。发布前请先保存草稿。</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 版本历史 -->
+          <div id="pane-versions" class="pane hidden">
+            <div class="card">
+              <div class="card-head">
+                <h3>版本历史</h3>
+                <div class="card-actions">
+                  <button type="button" class="btn ghost" data-act="refreshVersions"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button>
+                </div>
+              </div>
+              <p class="hint" style="margin:0 0 10px">回滚会以旧版本内容创建一个新版本，历史记录不可变。</p>
+              <div class="table-wrap">
+                <table class="table">
+                  <thead><tr><th>版本</th><th>类型</th><th>备注</th><th>结构</th><th>操作人</th><th>时间</th><th></th></tr></thead>
+                  <tbody id="versions-body"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <!-- 结构 -->
+          <div id="pane-structure" class="pane hidden">
+            <div class="card">
+              <div class="card-head">
+                <h3>结构草稿</h3>
+                <div class="card-actions">
+                  <button type="button" class="btn ghost" data-act="loadStructDraft"><svg class="ic"><use href="#i-refresh"/></svg>载入当前</button>
+                  <button type="button" class="btn" data-act="saveStructDraft">保存草稿</button>
+                  <button type="button" class="btn primary" data-act="publishStruct"><svg class="ic"><use href="#i-up"/></svg>发布结构</button>
+                </div>
+              </div>
+              <p class="hint" style="margin:0 0 4px">结构定义配置项的 key、类型与约束（required / secret）。发布结构将推进全部分支的版本。</p>
+              <p class="hint mono">{"base_version":N,"groups":[{"name":"…","items":[{"key":"…","type":"string","required":false,"secret":false}]}]}</p>
+              <textarea id="struct-draft" class="in mono" rows="16" spellcheck="false" style="margin-top:8px" placeholder='{"base_version":1,"groups":[]}'></textarea>
+              <div id="struct-err" class="field-err hidden"></div>
+            </div>
+          </div>
+
+          <!-- 对比与提升 -->
+          <div id="pane-diff" class="pane hidden">
+            <div class="card">
+              <div class="card-head"><h3>分支对比</h3></div>
+              <div class="row">
+                <select id="diff-a" class="sel" style="width:auto" aria-label="分支 A"></select>
+                <span class="muted small">对比</span>
+                <select id="diff-b" class="sel" style="width:auto" aria-label="分支 B"></select>
+                <button type="button" class="btn" data-act="showDiff"><svg class="ic"><use href="#i-diff"/></svg>对比</button>
+              </div>
+              <div id="diff-out" style="margin-top:12px"></div>
+            </div>
+            <div class="card">
+              <div class="card-head"><h3>值提升（Promote）</h3></div>
+              <div class="row">
+                <select id="promote-from" class="sel" style="width:auto" aria-label="提升源分支"></select>
+                <svg class="ic muted"><use href="#i-arrow-r"/></svg>
+                <select id="promote-to" class="sel" style="width:auto" aria-label="提升目标分支"></select>
+                <label class="check"><input type="checkbox" id="promote-force">force 覆盖已修改草稿</label>
+                <button type="button" class="btn primary" data-act="doPromote"><svg class="ic"><use href="#i-up"/></svg>提升</button>
+              </div>
+              <p class="hint">将源分支活动版本的值写入目标分支草稿（不自动发布）。目标分支已有草稿修改的项默认跳过，勾选 force 后覆盖。</p>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- ===== 共享库 ===== -->
+      <section id="view-shared" class="view hidden">
+        <header class="view-head with-actions">
+          <div>
+            <h1>共享库</h1>
+            <p class="view-sub">跨项目复用的公共配置项，发布后自动级联引用它的项目分支</p>
+          </div>
+          <div class="card-actions">
+            <button type="button" class="btn ghost" data-act="refreshShared"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button>
+            <button type="button" class="btn primary" data-act="publishShared"><svg class="ic"><use href="#i-up"/></svg>发布共享</button>
+          </div>
+        </header>
+        <div class="stack">
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-head"><h3>新增 / 更新共享项</h3></div>
+              <div class="grid-2" style="gap:0 16px">
+                <div class="field">
+                  <label for="sh-group">组</label>
+                  <input class="in mono" id="sh-group" placeholder="如 common">
+                </div>
+                <div class="field">
+                  <label for="sh-key">key</label>
+                  <input class="in mono" id="sh-key" placeholder="如 log_level">
+                </div>
+              </div>
+              <div class="grid-2" style="gap:0 16px">
+                <div class="field">
+                  <label for="sh-type">类型</label>
+                  <select class="sel" id="sh-type">
+                    <option value="string">string</option><option value="int">int</option>
+                    <option value="float">float</option><option value="bool">bool</option>
+                    <option value="json">json</option><option value="array">array</option>
+                    <option value="secret">secret</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label>标记</label>
+                  <div class="row" style="gap:14px">
+                    <label class="check"><input type="checkbox" id="sh-secret">secret</label>
+                    <label class="check"><input type="checkbox" id="sh-required">required</label>
+                  </div>
+                </div>
+              </div>
+              <div class="field">
+                <label for="sh-value">值（JSON）</label>
+                <textarea class="in mono" id="sh-value" rows="3" spellcheck="false" placeholder='{"type":"string","str_value":"info"}'></textarea>
+                <p class="hint">按类型取值字段：string → str_value，int → int_value，float → float_value，bool → bool_value，json → json_value，array → list_value。</p>
+              </div>
+              <div id="sh-err" class="field-err hidden"></div>
+              <button type="button" class="btn" data-act="saveShared">保存共享草稿</button>
+            </div>
+            <div class="card">
+              <div class="card-head"><h3>引用绑定</h3></div>
+              <p class="hint" style="margin:-4px 0 12px">把项目结构组（或单个 item）绑定到共享项；发布共享时自动物化到引用分支。</p>
+              <div class="grid-2" style="gap:0 16px">
+                <div class="field">
+                  <label for="ref-project">项目</label>
+                  <input class="in mono" id="ref-project" placeholder="project-id">
+                </div>
+                <div class="field">
+                  <label for="ref-group">结构组</label>
+                  <input class="in mono" id="ref-group" placeholder="group">
+                </div>
+              </div>
+              <div class="grid-2" style="gap:0 16px">
+                <div class="field">
+                  <label for="ref-item">item key（可选）</label>
+                  <input class="in mono" id="ref-item" placeholder="留空 = 整组引用">
+                </div>
+                <div class="field">
+                  <label for="ref-sg">共享组</label>
+                  <input class="in mono" id="ref-sg" placeholder="shared group">
+                </div>
+              </div>
+              <div class="field">
+                <label for="ref-sk">共享 key</label>
+                <input class="in mono" id="ref-sk" placeholder="shared key">
+              </div>
+              <div id="ref-err" class="field-err hidden"></div>
+              <button type="button" class="btn" data-act="bindRef">绑定引用</button>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <h3>共享项列表</h3>
+              <span class="hint" style="margin:0">草稿在前，已发布在后</span>
+            </div>
+            <div class="table-wrap">
+              <table class="table">
+                <thead><tr><th>组</th><th>key</th><th>类型</th><th>状态</th><th>值</th><th>标记</th></tr></thead>
+                <tbody id="shared-body"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== 审计 ===== -->
+      <section id="view-audit" class="view hidden">
+        <header class="view-head">
+          <h1>审计日志</h1>
+          <p class="view-sub">最近 200 条操作记录</p>
+        </header>
+        <div class="card">
+          <div class="card-head">
+            <h3>操作记录</h3>
+            <div class="card-actions">
+              <input class="in mono" id="audit-filter" placeholder="action 过滤，如 publish / gray_publish" style="width:280px">
+              <button type="button" class="btn ghost" data-act="refreshAudit"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead><tr><th>seq</th><th>时间</th><th>action</th><th>项目 / 分支</th><th>版本</th><th>操作人</th><th>request_id</th><th>明细</th></tr></thead>
+              <tbody id="audit-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== 集群 ===== -->
+      <section id="view-cluster" class="view hidden">
+        <header class="view-head with-actions">
+          <div>
+            <h1>集群节点</h1>
+            <p class="view-sub">Raft 成员、角色与节点管理（仅全局管理员）</p>
+          </div>
+          <div class="card-actions">
+            <button type="button" class="btn ghost" data-act="refreshCluster"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button>
+          </div>
+        </header>
+        <div id="cluster-out" class="stack"></div>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<!-- ========== 通用确认 / 输入弹窗 ========== -->
+<div id="modal-overlay" class="overlay hidden">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <h3 id="modal-title">确认</h3>
-    <input id="modal-input" placeholder="">
-    <div class="row" style="margin-top:10px">
-      <button class="primary" id="modal-ok">确定</button>
-      <button id="modal-cancel">取消</button>
+    <p id="modal-msg" class="modal-msg hidden"></p>
+    <div class="field" id="modal-field">
+      <label for="modal-input" id="modal-label"></label>
+      <input class="in" id="modal-input">
+    </div>
+    <div class="modal-foot">
+      <button type="button" class="btn" id="modal-cancel">取消</button>
+      <button type="button" class="btn primary" id="modal-ok">确定</button>
     </div>
   </div>
 </div>
 
-<!-- D-CSP：脚本外置（无 inline script / onclick，CSP 可移除 unsafe-inline） -->
-<script src="/admin/app.js" defer></script>
+<!-- ========== 配置预览弹窗 ========== -->
+<div id="cfg-overlay" class="overlay hidden">
+  <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="cfgm-title">
+    <div class="modal-head-row">
+      <h3 id="cfgm-title">配置预览 <span id="cfgm-ctx" class="mono small muted"></span></h3>
+      <button type="button" class="icon-btn" data-act="closeCfg" title="关闭" aria-label="关闭"><svg class="ic"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-toolbar">
+      <label class="check"><input type="checkbox" id="cfg-reveal" data-act="cfgReveal">明文显示（解密 secret，操作将审计）</label>
+      <span class="spacer"></span>
+      <select class="sel" id="cfg-format" data-act="cfgFormat" aria-label="渲染格式">
+        <option value="yaml">YAML</option>
+        <option value="json" selected>JSON</option>
+        <option value="toml">TOML</option>
+      </select>
+      <button type="button" class="icon-btn" data-act="refreshCfg" title="刷新" aria-label="刷新"><svg class="ic"><use href="#i-refresh"/></svg></button>
+      <button type="button" class="icon-btn" data-act="copyCfg" title="复制" aria-label="复制"><svg class="ic"><use href="#i-copy"/></svg></button>
+    </div>
+    <pre id="cfg-out" class="codeblock"></pre>
+  </div>
+</div>
+
+<!-- ========== 通知 ========== -->
+<div id="toasts" aria-live="polite"></div>
+
 </body>
 </html>

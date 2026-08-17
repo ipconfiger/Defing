@@ -2385,7 +2385,7 @@ async fn login(
                 &Command::MultiSessionLogin {
                     token_hash: hash,
                     issued_at: now,
-                    expires_at: (ttl.as_secs() > 0).then(|| now + ttl.as_secs() as i64),
+                    expires_at: (ttl.as_secs() > 0).then(|| now + ttl.as_millis() as i64),
                     session_id,
                 },
                 now,
@@ -2549,7 +2549,7 @@ async fn pa_login(
                     username: username.clone(),
                     token_hash: hash,
                     issued_at: now,
-                    expires_at: (ttl.as_secs() > 0).then(|| now + ttl.as_secs() as i64),
+                    expires_at: (ttl.as_secs() > 0).then(|| now + ttl.as_millis() as i64),
                     device_id: "cli".into(),
                     session_id,
                 },
@@ -2723,7 +2723,7 @@ async fn heartbeat(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiErrorBody>)> {
     let ttl = app.session_ttl;
     let now = now_ms();
-    let expires = (ttl.as_secs() > 0).then(|| now + ttl.as_secs() as i64);
+    let expires = (ttl.as_secs() > 0).then(|| now + ttl.as_millis() as i64);
     // multisession：token 带 sid → 续期自己的会话；旧格式 → 旧单会话命令
     let sid = token_session_id(
         headers
