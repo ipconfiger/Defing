@@ -10,7 +10,7 @@ cleanup() { [ -n "${PID:-}" ] && kill $PID 2>/dev/null || true; }
 trap cleanup EXIT
 
 echo "== 启动 dsh --dev-single（自动回滚：阈值 5% / 间隔 2s）=="
-$BIN --dev-single --admin-password admin123 --http-addr 127.0.0.1:$PORT \
+$BIN --dev-single --admin-password admin123 --allow-no-master-key --http-addr 127.0.0.1:$PORT \
   --gray-rollback-threshold 5 --gray-rollback-interval 2 >/tmp/dsh-obs.log 2>&1 &
 PID=$!
 for i in $(seq 1 20); do

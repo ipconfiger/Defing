@@ -72,9 +72,16 @@ struct Cli {
     /// 集群模式：节点 ID
     #[arg(long)]
     node_id: Option<u64>,
-    /// 集群模式：首节点自举
+    /// 集群模式：首节点自举（单节点建群，其余节点用 --join 加入）
     #[arg(long)]
     bootstrap: bool,
+    /// 集群模式：静态成员表建群（seed map，推荐）。
+    /// 格式：`node_id@raft_addr@http_addr[,node_id@raft_addr@http_addr...]`（三段式必填，
+    /// http_addr 用于 leader 重定向/join 跟随）。仅当数据目录为空（首次建群）时生效；
+    /// 所有节点必须传【完全相同】的值（不一致会 split-brain）；已有状态自动 resume
+    /// （若 seed 与集群成员表不一致会 WARN，不覆盖——运行期成员变更走 join/promote/remove-node）。
+    #[arg(long, conflicts_with = "bootstrap", conflicts_with = "join")]
+    bootstrap_peers: Option<String>,
     /// 集群模式：加入集群（指定任一实例的 HTTP 端点，如 http://127.0.0.1:8384）
     #[arg(long)]
     join: Option<String>,
@@ -93,12 +100,18 @@ struct Cli {
     /// 主密钥文件（raw 32B；或 DSH_MASTER_KEY 环境变量 base64）
     #[arg(long)]
     master_key_file: Option<String>,
+    /// 允许无主密钥启动（开发/演示模式；默认拒绝无密钥启动，design-v2 §7.4）
+    #[arg(long)]
+    allow_no_master_key: bool,
     /// 版本保留数（0=全量保留；后台裁剪任务仅在 >0 时启用）
     #[arg(long, default_value_t = 0)]
     version_retention: u64,
     /// 审计保留条数（0=不裁剪；默认 100k 条，design-v2）
     #[arg(long, default_value_t = 100000)]
     audit_retention: u64,
+    /// 进程内广播事件缓冲容量（design-v2 §6.3「最近 10k 事件」；重放仍走版本链）
+    #[arg(long, default_value_t = 10000)]
+    watch_event_retain: u64,
     /// 灰度自动回滚阈值（本地 HTTP 5xx 比例 %；0=禁用，G5/D33）
     #[arg(long, default_value_t = 0.0)]
     gray_rollback_threshold: f64,
@@ -312,12 +325,13 @@ async fn run_admin_cmd(
 }
 
 /// 加入集群：向目标端点发起 join（需命中 leader；带重试与超时）。
+/// 命中 follower 时跟随响应中的 leader_hint 切换目标（无需人工改 --join 指向）。
 /// join_token 为 Some 时请求携带 `Authorization: Bearer <token>`（与节点 --join-token 匹配）。
 async fn join_cluster(
     _raft: &dsh_raft::RaftHandle,
     node_id: u64,
     node: RaftNodeInfo,
-    join_url: &str,
+    join_url: &mut String,
     join_token: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::new();
@@ -337,6 +351,40 @@ async fn join_cluster(
             .await;
         match resp {
             Ok(r) if r.status().is_success() => return Ok(()),
+            // 409：本节点已在集群成员表（此前 join 已注册但响应丢失/节点崩溃于追赶中，
+            // 或重启时数据目录被重置但成员表仍含本节点）。视为幂等成功——本节点 resume
+            // 并启动 raft RPC 服务后，leader 会继续向它复制日志追赶，无需重试 join。
+            Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => {
+                eprintln!(
+                    "node {node_id} already in cluster membership (409); resuming to catch up"
+                );
+                return Ok(());
+            }
+            // 428 + leader_hint：--join 命中的节点不是 leader（如 leader 已切换）。
+            // 跟随 leader_hint 切换目标后继续重试，避免 30s 空转。
+            Ok(r) if r.status() == reqwest::StatusCode::PRECONDITION_REQUIRED => {
+                let hint: Option<String> = r
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|b| b["detail"]["leader_hint"].as_str().map(String::from));
+                if let Some(h) = hint {
+                    if !h.is_empty() && h != *join_url {
+                        // NodeInfo.http_addr 无 scheme（如 127.0.0.1:8612 / node2:8384）→ 补 http://
+                        let target = if h.starts_with("http://") || h.starts_with("https://") {
+                            h
+                        } else {
+                            format!("http://{h}")
+                        };
+                        eprintln!("node {node_id} join target not leader; following leader_hint -> {target}");
+                        *join_url = target;
+                    }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err("join timed out (no leader responded)".into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
             _ => {
                 if tokio::time::Instant::now() >= deadline {
                     return Err("join timed out (no leader responded)".into());
@@ -344,6 +392,178 @@ async fn join_cluster(
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }
         }
+    }
+}
+
+/// 解析 `--bootstrap-peers`：`node_id@raft_addr@http_addr` 逗号分隔 → 静态成员表。
+/// **三段式必填**：http_addr 是 leader 重定向/join 跟随/登录转发的依据，缺失会静默降级
+/// （写路径 hint 为空、登录不转发、join 428 无法跟随）。
+/// 校验：node_id 非 0；地址为 host:port 且端口合法；raft/http 地址各自不得重复
+/// （两个节点共用同一地址 = 复制目标冲突）；拒绝 0.0.0.0/:: 等不可路由通配地址（坑 C1）。
+fn parse_bootstrap_peers(
+    raw: &str,
+) -> Result<std::collections::BTreeMap<u64, RaftNodeInfo>, String> {
+    let mut map = std::collections::BTreeMap::new();
+    let mut seen_raft = std::collections::HashSet::new();
+    let mut seen_http = std::collections::HashSet::new();
+    for (i, entry) in raw.split(',').enumerate() {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue; // 容忍空段（如尾部逗号）
+        }
+        let parts: Vec<&str> = entry.split('@').collect();
+        let (id_str, raft_addr, http_addr) = match parts.as_slice() {
+            [id, raft, http] => (*id, *raft, *http),
+            [_, _] => {
+                return Err(format!(
+                    "--bootstrap-peers 第 {} 项缺少 http_addr（必须为 node_id@raft_addr@http_addr 三段式；http_addr 用于 leader 重定向/join 跟随）: {entry}",
+                    i + 1
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "--bootstrap-peers 第 {} 项格式错误（应为 node_id@raft_addr@http_addr）: {entry}",
+                    i + 1
+                ));
+            }
+        };
+        let node_id: u64 = id_str
+            .trim()
+            .parse()
+            .map_err(|_| format!("--bootstrap-peers 第 {} 项 node_id 非法: {id_str}", i + 1))?;
+        if node_id == 0 {
+            return Err(format!(
+                "--bootstrap-peers 第 {} 项 node_id 不能为 0",
+                i + 1
+            ));
+        }
+        for (label, addr) in [("raft_addr", raft_addr), ("http_addr", http_addr)] {
+            validate_seed_addr(label, addr, i + 1)?;
+        }
+        if !seen_raft.insert(raft_addr.to_string()) {
+            return Err(format!(
+                "--bootstrap-peers 第 {} 项 raft_addr 重复: {raft_addr}（两个节点不能共用同一 raft 地址）",
+                i + 1
+            ));
+        }
+        if !seen_http.insert(http_addr.to_string()) {
+            return Err(format!(
+                "--bootstrap-peers 第 {} 项 http_addr 重复: {http_addr}",
+                i + 1
+            ));
+        }
+        if map
+            .insert(
+                node_id,
+                RaftNodeInfo {
+                    grpc_addr: String::new(),
+                    http_addr: http_addr.to_string(),
+                    raft_addr: raft_addr.to_string(),
+                },
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "--bootstrap-peers 第 {} 项 node_id 重复: {node_id}",
+                i + 1
+            ));
+        }
+    }
+    if map.is_empty() {
+        return Err("--bootstrap-peers 为空（须包含集群全部节点）".into());
+    }
+    Ok(map)
+}
+
+/// 校验 seed 地址：host:port 形式、端口为 1-65535 数值、host 不得为不可路由通配地址。
+fn validate_seed_addr(label: &str, addr: &str, idx: usize) -> Result<(), String> {
+    let err = |msg: String| format!("--bootstrap-peers 第 {idx} 项 {label} {msg}: {addr}");
+    let parts: Vec<&str> = addr.split(':').collect();
+    if parts.len() != 2 {
+        return Err(err("须为 host:port 形式（暂不支持 IPv6 字面量）".into()));
+    }
+    let (host, port) = (parts[0], parts[1]);
+    if host.is_empty() || host == "0.0.0.0" || host == "::" {
+        return Err(err(
+            "host 不能为不可路由通配地址（0.0.0.0/::；容器内请用服务名或具体 IP，见坑 C1）".into(),
+        ));
+    }
+    let port_num: u16 = port
+        .parse()
+        .map_err(|_| err("端口须为 1-65535 的数值".into()))?;
+    if port_num == 0 {
+        return Err(err("端口不能为 0".into()));
+    }
+    Ok(())
+}
+
+/// 校验 seed map 与本节点启动参数一致（配置漂移 = split-brain 的根源，启动即失败）。
+fn validate_bootstrap_peers(
+    map: &std::collections::BTreeMap<u64, RaftNodeInfo>,
+    node_id: u64,
+    raft_addr: &str,
+    http_addr: &str,
+) -> Result<(), String> {
+    let local = map.get(&node_id).ok_or_else(|| {
+        format!("--bootstrap-peers 不含本节点 node_id={node_id}（seed map 必须包含集群全部节点）")
+    })?;
+    if local.raft_addr != raft_addr {
+        return Err(format!(
+            "--bootstrap-peers 中本节点 raft_addr({}) 与 --raft-addr({}) 不一致",
+            local.raft_addr, raft_addr
+        ));
+    }
+    if local.http_addr != http_addr {
+        return Err(format!(
+            "--bootstrap-peers 中本节点 http_addr({}) 与 --http-addr({}) 不一致",
+            local.http_addr, http_addr
+        ));
+    }
+    Ok(())
+}
+
+/// 比对 seed map 与集群当前（恢复后的）成员表，返回差异描述；一致返回 None。
+/// 语义（A2 修正）：seed 只用于首次建群；有持久化状态时以共识成员表为准，
+/// 不一致仅 WARN（不覆盖不阻断）——要么 seed 已过期（请更新配置），
+/// 要么有重整意图（集群在线走 join/promote/remove-node；推倒重建先清空数据目录再以 seed 建群）。
+fn membership_diff(
+    seed: &std::collections::BTreeMap<u64, RaftNodeInfo>,
+    current: &std::collections::BTreeMap<u64, RaftNodeInfo>,
+) -> Option<String> {
+    let mut diffs: Vec<String> = Vec::new();
+    for (id, node) in seed {
+        match current.get(id) {
+            None => diffs.push(format!(
+                "seed 含 node {id} 但集群成员表没有（若为新增节点请用 --join 加入，seed 不驱动运行期成员变更）"
+            )),
+            Some(cur) => {
+                if cur.raft_addr != node.raft_addr {
+                    diffs.push(format!(
+                        "node {id} raft_addr 不一致：seed={} 集群={}",
+                        node.raft_addr, cur.raft_addr
+                    ));
+                }
+                if cur.http_addr != node.http_addr {
+                    diffs.push(format!(
+                        "node {id} http_addr 不一致：seed={} 集群={}",
+                        node.http_addr, cur.http_addr
+                    ));
+                }
+            }
+        }
+    }
+    for (id, node) in current {
+        if !seed.contains_key(id) {
+            diffs.push(format!(
+                "集群成员表含 node {id}({}) 但 seed 没有（seed 已过期，请更新配置）",
+                node.raft_addr
+            ));
+        }
+    }
+    if diffs.is_empty() {
+        None
+    } else {
+        Some(diffs.join("；"))
     }
 }
 
@@ -471,7 +691,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(Command::Admin { cmd }) = &cli.cmd {
         return run_admin_cmd(&cli, cmd).await;
     }
-    let hub = WatchHub::new();
+    let hub = WatchHub::with_capacity(cli.watch_event_retain as usize);
     // 可信代理（F4）：解析失败直接报错退出
     let trusted_proxies = std::sync::Arc::new(match &cli.trusted_proxy {
         Some(s) => {
@@ -558,6 +778,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
+    // design-v2 §7.4：无主密钥默认拒绝启动（含 secret 场景必配）；开发/演示环境显式 --allow-no-master-key 逃生。
+    if master_key.is_none() && !cli.allow_no_master_key {
+        return Err(
+            "缺少主密钥（DSH_MASTER_KEY 或 --master-key-file）；若为无 secret 的开发/演示环境请显式 --allow-no-master-key"
+                .into(),
+        );
+    }
+
     if cli.dev_single {
         let store: Box<dyn dsh_core::Store> = match &cli.data_dir {
             Some(dir) => Box::new(RedbStorage::open(dir)?),
@@ -639,10 +867,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         db.clone(),
         cluster_rotation_hook(cli.master_key_file.as_deref(), cipher.clone()),
     ));
-    // 重启恢复：raft-meta 非空说明该节点已有持久化状态 → 无需 --bootstrap/--join，自动 resume
+    // A2：seed 与集群现实比对用——保留一份 store 引用（sm_store 随后被 new_raft_node 移走）。
+    // 直接读持久化成员表而非 raft.metrics()：metrics 在 Raft::new 后可能尚未发布（watch 异步），
+    // 读存储层是确定性的。
+    let sm_store_check = sm_store.clone();
+    // 幂等初始化（重启/崩溃恢复安全）：raft-meta 非空说明该节点已有持久化状态，
+    // 此时 --bootstrap/--bootstrap-peers/--join 一律忽略、直接 resume（auto-rejoin）。
+    // 由此 compose/k8s 可用静态启动命令（每次启动同一参数），无需 shell 判断数据目录。
+    // 崩溃窗口覆盖：
+    //   - 建群/join 前崩溃（无任何 raft 状态）→ 重跑建群/join；
+    //   - join 已注册但响应丢失/追赶中崩溃（leader 已记为 learner）→ join 幂等成功（leader 侧）+ resume；
+    //   - 已有完整状态 → 忽略初始化参数，resume。
     let has_state = sm_store.has_persisted_state();
-    if !cli.bootstrap && cli.join.is_none() && !has_state {
-        return Err("集群模式需要 --bootstrap、--join 或已有数据目录".into());
+    if !cli.bootstrap && cli.bootstrap_peers.is_none() && cli.join.is_none() && !has_state {
+        return Err("集群模式需要 --bootstrap、--bootstrap-peers、--join 或已有数据目录".into());
     }
     // 集群 watch：raft apply 事件 → hub（SSE）
     hub.spawn_raft_forward(sm_store.clone());
@@ -664,19 +902,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await?;
 
-    if cli.bootstrap {
+    // 首次初始化仅在无持久化状态时执行；已有状态一律 resume（忽略建群参数）。
+    if cli.bootstrap && !has_state {
         dsh_raft::initialize_single(&raft, node_id, node_info.clone()).await?;
-        eprintln!("node {node_id} bootstrap done");
+        eprintln!("node {node_id} bootstrap done (first init)");
+    } else if let Some(seed_raw) = &cli.bootstrap_peers {
+        if has_state {
+            // A2：seed 只用于首次建群；有持久化状态时以共识成员表为准。seed 与成员表不一致
+            // 仅 WARN（不覆盖不阻断）：要么 seed 过期（更新配置），要么有重整意图（在线走 API，
+            // 推倒重建先清卷再以 seed 建群）。
+            match parse_bootstrap_peers(seed_raw) {
+                Ok(seed) => {
+                    // 持久化成员表为空 = 崩溃于追平前（vote 已落盘但成员表未到），resume 后会自动
+                    // 追平，此时跳过比对（避免瞬态误报）。
+                    if let Ok(Some(current)) = sm_store_check.persisted_membership() {
+                        if let Some(diff) = membership_diff(&seed, &current) {
+                            eprintln!("WARNING: --bootstrap-peers 与集群当前成员表不一致：{diff}");
+                            eprintln!("         seed 仅用于首次建群；运行期成员变更请走 join/promote/remove-node；");
+                            eprintln!("         如需重整拓扑：集群在线走 API；推倒重建请先清空数据目录再以 seed 建群。");
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("WARNING: --bootstrap-peers 解析失败（本节点 resume 不受影响）：{e}")
+                }
+            }
+            eprintln!("node {node_id} has persisted state; ignoring --bootstrap-peers and resuming (auto-rejoin)");
+        } else {
+            // 静态成员表建群：解析 + 校验本地一致性后，所有节点并行 initialize 全量 map
+            // （openraft：同 map 并发安全；先到者首写，其余节点收到良性 NotAllowed 后经复制追平，
+            // 全员 voter，无需 join/promote）。
+            let seed = parse_bootstrap_peers(seed_raw)?;
+            validate_bootstrap_peers(&seed, node_id, &cli.raft_addr, &cli.http_addr)?;
+            let n = seed.len();
+            match dsh_raft::initialize_cluster(&raft, seed).await? {
+                true => eprintln!("node {node_id} cluster initialized from seed map ({n} peers, all voters)"),
+                false => eprintln!("node {node_id} cluster bootstrap delegated to a peer (catching up via replication)"),
+            }
+        }
     } else if let Some(join_url) = &cli.join {
-        join_cluster(
-            &raft,
-            node_id,
-            node_info.clone(),
-            join_url,
-            Some(join_token.as_str()),
-        )
-        .await?;
-        eprintln!("node {node_id} join requested -> {join_url}");
+        if has_state {
+            eprintln!(
+                "node {node_id} has persisted state; ignoring --join and resuming (auto-rejoin)"
+            );
+        } else {
+            let mut target = join_url.clone();
+            join_cluster(
+                &raft,
+                node_id,
+                node_info.clone(),
+                &mut target,
+                Some(join_token.as_str()),
+            )
+            .await?;
+            eprintln!("node {node_id} join requested -> {target}");
+        }
     } else if has_state {
         eprintln!("node {node_id} resuming from persisted state (auto-rejoin)");
     }
@@ -719,6 +999,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 leader_rx,
             );
         }
+    }
+
+    // B1：长时间无 leader 时周期提示（集群静默空转的可观测性兜底）。
+    // 适用：seed 建群但 quorum 未达成（如只有部分节点启动）、重启后多数派不可达等；
+    // 有成员表但 leader 未知持续 15s 以上 → 每 10s 提示一次（每段失联只提示一次，恢复后重置）。
+    {
+        let raft_warn = raft.clone();
+        let warn_node_id = node_id;
+        tokio::spawn(async move {
+            let mut warned = false;
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            loop {
+                let m = raft_warn.metrics().borrow().clone();
+                if m.current_leader.is_some() {
+                    warned = false;
+                } else {
+                    let voters = m.membership_config.membership().voter_ids().count();
+                    // voters == 0 = 尚无成员表（如 join 等待中）——join 流程有自己的超时退出，不在此提示
+                    if voters > 0 && !warned {
+                        eprintln!("WARNING: node {warn_node_id} 长时间未确认 leader（集群 quorum 未达成，voter 数 = {voters}）。请检查其他节点是否在线；leader 恢复后此提示自动停止。");
+                        warned = true;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        });
     }
 
     // Raft RPC 服务（raft_addr）
@@ -797,4 +1103,142 @@ fn spawn_grpc(cli: &Cli, state: ApiState) {
             eprintln!("dsh gRPC data plane listening on {grpc_addr}");
         }
     });
+}
+
+// ---------------- 单元测试 ----------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_map() -> std::collections::BTreeMap<u64, RaftNodeInfo> {
+        parse_bootstrap_peers(
+            "1@node1:8385@node1:8384,2@node2:8385@node2:8384,3@node3:8385@node3:8384",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn parse_full_map_three_part_required() {
+        let m = sample_map();
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[&1].raft_addr, "node1:8385");
+        assert_eq!(m[&1].http_addr, "node1:8384");
+        assert_eq!(m[&3].http_addr, "node3:8384");
+        assert_eq!(m[&2].grpc_addr, ""); // 与 join 模型一致，grpc 不落成员表
+    }
+
+    #[test]
+    fn parse_rejects_bad_entries() {
+        // 两段式（缺 http_addr）→ 拒绝（A1：http 是重定向/join 跟随的依据）
+        assert!(parse_bootstrap_peers("1@a:1").is_err());
+        assert!(parse_bootstrap_peers("1@node1:8385").is_err());
+        // 段数不对
+        assert!(parse_bootstrap_peers("1@a:1@b:2@c").is_err());
+        assert!(parse_bootstrap_peers("1").is_err());
+        // node_id 非法 / 为 0
+        assert!(parse_bootstrap_peers("x@a:1@b:2").is_err());
+        assert!(parse_bootstrap_peers("0@a:1@b:2").is_err());
+        // 地址非 host:port / 端口非法
+        assert!(parse_bootstrap_peers("1@nodomain@b:2").is_err());
+        assert!(parse_bootstrap_peers("1@a:1@b").is_err()); // http 段非 host:port
+        assert!(parse_bootstrap_peers("1@a:0@b:2").is_err()); // 端口 0
+        assert!(parse_bootstrap_peers("1@a:99999@b:2").is_err()); // 端口越界
+        assert!(parse_bootstrap_peers("1@a:1@b:abc").is_err()); // 端口非数值
+                                                                // 不可路由通配地址（坑 C1）
+        assert!(parse_bootstrap_peers("1@0.0.0.0:1@b:2").is_err()); // raft 0.0.0.0
+        assert!(parse_bootstrap_peers("1@a:1@0.0.0.0:2").is_err()); // http 0.0.0.0
+        assert!(parse_bootstrap_peers("1@:1@b:2").is_err()); // 空 host
+                                                             // 重复 node_id
+        assert!(parse_bootstrap_peers("1@a:1@a:2,1@b:3@b:4").is_err());
+        // 重复 raft_addr（两节点共用同一 raft 地址）
+        assert!(parse_bootstrap_peers("1@a:1@a:2,2@a:1@b:4").is_err());
+        // 重复 http_addr
+        assert!(parse_bootstrap_peers("1@a:1@b:2,2@c:3@b:2").is_err());
+        // 空
+        assert!(parse_bootstrap_peers("").is_err());
+        assert!(parse_bootstrap_peers(",").is_err());
+    }
+
+    #[test]
+    fn parse_tolerates_whitespace_and_trailing_comma() {
+        let m = parse_bootstrap_peers(" 1@a:1@x:1 , 2@b:2@y:2 ,").unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[&2].raft_addr, "b:2");
+        assert_eq!(m[&2].http_addr, "y:2");
+    }
+
+    #[test]
+    fn validate_local_consistency() {
+        let m = sample_map();
+        // 本节点在 map 中且地址一致 → ok
+        assert!(validate_bootstrap_peers(&m, 1, "node1:8385", "node1:8384").is_ok());
+        assert!(validate_bootstrap_peers(&m, 3, "node3:8385", "node3:8384").is_ok());
+        // 本节点不在 map 中
+        assert!(validate_bootstrap_peers(&m, 9, "node9:8385", "node9:8384").is_err());
+        // raft 地址不一致
+        assert!(validate_bootstrap_peers(&m, 1, "wrong:8385", "node1:8384").is_err());
+        // http 地址不一致（三段式下必填比对）
+        assert!(validate_bootstrap_peers(&m, 1, "node1:8385", "wrong:8384").is_err());
+        assert!(validate_bootstrap_peers(&m, 2, "node2:8385", "whatever:8384").is_err());
+    }
+
+    fn node(raft: &str, http: &str) -> RaftNodeInfo {
+        RaftNodeInfo {
+            grpc_addr: String::new(),
+            http_addr: http.into(),
+            raft_addr: raft.into(),
+        }
+    }
+
+    #[test]
+    fn membership_diff_reports_inconsistencies() {
+        let seed: std::collections::BTreeMap<u64, RaftNodeInfo> =
+            std::collections::BTreeMap::from([
+                (1, node("n1:8385", "n1:8384")),
+                (2, node("n2:8385", "n2:8384")),
+            ]);
+        // 完全一致 → None
+        let same: std::collections::BTreeMap<u64, RaftNodeInfo> =
+            std::collections::BTreeMap::from([
+                (1, node("n1:8385", "n1:8384")),
+                (2, node("n2:8385", "n2:8384")),
+            ]);
+        assert_eq!(membership_diff(&seed, &same), None);
+        // seed 多出节点（想用 config 加节点 → 应走 join）
+        let cur1: std::collections::BTreeMap<u64, RaftNodeInfo> =
+            std::collections::BTreeMap::from([(1, node("n1:8385", "n1:8384"))]);
+        let d = membership_diff(&seed, &cur1).expect("diff");
+        assert!(d.contains("seed 含 node 2"), "{d}");
+        // 集群多出节点（seed 过期）
+        let cur2: std::collections::BTreeMap<u64, RaftNodeInfo> =
+            std::collections::BTreeMap::from([
+                (1, node("n1:8385", "n1:8384")),
+                (2, node("n2:8385", "n2:8384")),
+                (3, node("n3:8385", "n3:8384")),
+            ]);
+        let d = membership_diff(&seed, &cur2).expect("diff");
+        assert!(d.contains("集群成员表含 node 3"), "{d}");
+        // 地址不一致
+        let cur3: std::collections::BTreeMap<u64, RaftNodeInfo> =
+            std::collections::BTreeMap::from([
+                (1, node("n1:8385", "n1:8384")),
+                (2, node("n2-new:8385", "n2:8384")),
+            ]);
+        let d = membership_diff(&seed, &cur3).expect("diff");
+        assert!(d.contains("raft_addr 不一致"), "{d}");
+        // 多类差异合并为一条
+        let cur4: std::collections::BTreeMap<u64, RaftNodeInfo> =
+            std::collections::BTreeMap::from([
+                (1, node("n1:8385", "n1-new:8384")),
+                (3, node("n3:8385", "n3:8384")),
+            ]);
+        let d = membership_diff(&seed, &cur4).expect("diff");
+        assert!(
+            d.contains("http_addr 不一致")
+                && d.contains("seed 含 node 2")
+                && d.contains("集群成员表含 node 3"),
+            "{d}"
+        );
+    }
 }

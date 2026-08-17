@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -30,6 +31,7 @@ type WatchEvent struct {
 	RequestID        string   `json:"request_id"`
 	Changes          []Change `json:"changes"`
 	SnapshotRequired bool     `json:"snapshot_required,omitempty"`
+	Gray             bool     `json:"gray,omitempty"`
 }
 
 // Member — 集群成员（gRPC ListMembers）。
@@ -48,17 +50,35 @@ type Snapshot struct {
 	Version          int64                     `json:"version"`
 	StructureVersion int64                     `json:"structure_version"`
 	Groups           map[string]map[string]any `json:"groups"`
+	Gray             bool                      `json:"gray,omitempty"`
+	ResolvedVersion  int64                     `json:"resolved_version,omitempty"`
 }
 
 type Client struct {
 	endpoints []string
-	http      *http.Client // 普通请求：5s 超时
-	sse       *http.Client // SSE 长连接：无整体超时（F-SDK：5s 整体超时会周期性掐断 watch）
-	token     string       // 数据面令牌（D2：配置时 Authorization Bearer 携带）
+	http      *http.Client      // 普通请求：5s 超时
+	sse       *http.Client      // SSE 长连接：无整体超时（F-SDK：5s 整体超时会周期性掐断 watch）
+	token     string            // 数据面令牌（D2：配置时 Authorization Bearer 携带）
+	instance  string            // 灰度身份：稳定身份键（G3/D26）
+	labels    map[string]string // 灰度身份：灰度标签（G3/D26）
 }
 
 // New 创建 HTTP 数据面客户端；opts[0] 为可选数据面令牌（--data-plane-token）。
 func New(endpoints []string, opts ...string) *Client {
+	token := ""
+	if len(opts) > 0 {
+		token = opts[0]
+	}
+	return newClient(endpoints, token, "", nil)
+}
+
+// NewWithIdentity 创建带灰度发布身份的 HTTP 数据面客户端（G3/D26）。
+// instance 为稳定身份键（如 Pod 名/部署单元 ID）；labels 为灰度标签（如 zone=cn-north-1）。
+func NewWithIdentity(endpoints []string, token, instance string, labels map[string]string) *Client {
+	return newClient(endpoints, token, instance, labels)
+}
+
+func newClient(endpoints []string, token, instance string, labels map[string]string) *Client {
 	// 普通请求 5s 超时
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 	// SSE 长连接：仅连接超时，不设整体超时（断线由服务端 keepalive/连接错误触发，客户端用 after_version 续传）
@@ -67,11 +87,14 @@ func New(endpoints []string, opts ...string) *Client {
 			DialContext: (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
 		},
 	}
-	token := ""
-	if len(opts) > 0 {
-		token = opts[0]
+	return &Client{
+		endpoints: endpoints,
+		http:      httpClient,
+		sse:       sseClient,
+		token:     token,
+		instance:  instance,
+		labels:    labels,
 	}
-	return &Client{endpoints: endpoints, http: httpClient, sse: sseClient, token: token}
 }
 
 func (c *Client) authHeaders() http.Header {
@@ -82,6 +105,30 @@ func (c *Client) authHeaders() http.Header {
 	return h
 }
 
+// identityHeaders 附加灰度发布身份头（G3/D26）：X-Dsh-Instance / X-Dsh-Labels。
+func (c *Client) identityHeaders(h http.Header) {
+	if c.instance != "" {
+		h.Set("X-Dsh-Instance", c.instance)
+	}
+	if len(c.labels) > 0 {
+		h.Set("X-Dsh-Labels", encodeLabels(c.labels))
+	}
+}
+
+// encodeLabels 将灰度标签 map 序列化为 k=v,k2=v2（按 key 排序，稳定输出）。
+func encodeLabels(labels map[string]string) string {
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+labels[k])
+	}
+	return strings.Join(parts, ",")
+}
+
 func (c *Client) request(path string) ([]byte, error) {
 	var lastErr error
 	for i, ep := range c.endpoints {
@@ -90,7 +137,9 @@ func (c *Client) request(path string) ([]byte, error) {
 			lastErr = err
 			continue
 		}
-		req.Header = c.authHeaders()
+		h := c.authHeaders()
+		c.identityHeaders(h)
+		req.Header = h
 		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = err
@@ -151,6 +200,11 @@ func (c *Client) Watch(project, branch string, listener func(WatchEvent), stop <
 			}
 		}
 		attempt++
+		// B1 契约：订阅/重连先做一次 snapshot 拉取，重锚版本游标
+		// （灰度 publish/abort 不写 v/ 记录，版本链重放不含 → 断线期间撤回的灰度须靠快照回落）。
+		if snap, serr := c.Get(project, branch); serr == nil && snap.Version > lastVersion {
+			lastVersion = snap.Version
+		}
 		resume := ""
 		if lastVersion > 0 {
 			resume = fmt.Sprintf("?after_version=%d", lastVersion)
@@ -172,10 +226,13 @@ func (c *Client) Watch(project, branch string, listener func(WatchEvent), stop <
 			if strings.HasPrefix(line, "data:") {
 				var e WatchEvent
 				if err := json.Unmarshal([]byte(strings.TrimSpace(line[5:])), &e); err == nil {
-					if e.Version <= lastVersion {
+					// G3/D25：灰度事件（gray=true）永不按版本过滤（promote/abort 补发可携带 ≤ last 的版本）。
+					if e.Version <= lastVersion && !e.Gray {
 						continue // 重放/重连重复投递 → 去重
 					}
-					lastVersion = e.Version
+					if e.Version > lastVersion {
+						lastVersion = e.Version // 游标只增不减（gray 事件版本可能 ≤ last，不倒挂）
+					}
 					listener(e)
 				}
 			}

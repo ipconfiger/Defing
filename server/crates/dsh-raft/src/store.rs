@@ -448,6 +448,26 @@ impl StateMachineStore {
         }
     }
 
+    /// 读取持久化成员表（dsh-cli A2：seed 与集群现实比对用）。
+    /// 返回 `None` = 尚无已持久化成员表（崩溃于追平前，resume 后会经复制追平）——
+    /// 调用方应跳过比对，避免瞬态误报。
+    pub fn persisted_membership(
+        &self,
+    ) -> Result<Option<std::collections::BTreeMap<NodeId, NodeInfo>>, String> {
+        let map: std::collections::BTreeMap<NodeId, NodeInfo> = self
+            .read_membership()
+            .map_err(|e| format!("read membership: {e:?}"))?
+            .membership()
+            .nodes()
+            .map(|(id, n)| (*id, n.clone()))
+            .collect();
+        if map.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(map))
+        }
+    }
+
     fn raft_meta_is_empty(&self) -> Result<bool, ErrOf> {
         let txn = self
             .db

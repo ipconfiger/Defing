@@ -57,6 +57,27 @@ pub async fn initialize_single(
     Ok(())
 }
 
+/// 按静态成员表建群（seed map，多节点并行自举）。
+///
+/// 语义（openraft 文档 + 实测）：所有节点用【完全相同】的 map 并发调用 `initialize` 是安全的——
+/// 先到者完成首写，其余节点若已收到同群竞选投票（vote 非 (0,0)）会返回 `NotAllowed` 这一
+/// 【良性错误】（节点保持安全，随后经 leader 复制追平成员表成为 voter）。
+///
+/// 返回 `true` = 本节点完成了建群首写；`false` = 建群已由他节点完成（本节点等待复制追平）。
+/// map 不一致（不同节点不同 map）是非法的 split-brain，调用方（dsh-cli）负责校验配置一致。
+pub async fn initialize_cluster(
+    raft: &RaftHandle,
+    members: std::collections::BTreeMap<NodeId, NodeInfo>,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    match raft.initialize(members).await {
+        Ok(()) => Ok(true),
+        Err(openraft::error::RaftError::APIError(
+            openraft::error::InitializeError::NotAllowed(_),
+        )) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// 等待成为 leader。
 pub async fn wait_for_leader(raft: &RaftHandle, timeout: std::time::Duration) -> Option<NodeId> {
     let deadline = tokio::time::Instant::now() + timeout;

@@ -70,7 +70,7 @@ watch：
 | **G4 灰度管理面 + UI** | ✅ **已完成**（`docs/design/g4-management.md`，D29-D30）：openapi 补 4 灰度路径 + GrayRule/GrayStatus 等 5 schema + ConfigSnapshot 加 gray/resolved_version（43 paths）；Admin UI 项目详情新增"灰度发布"卡（状态面板 + 规则 JSON 编辑 + 灰度发布/一键转正/一键下量，esc 转义 + data-act，D-CSP）；api-surface-test.sh 新增灰度全链路断言组（发布/状态/数据面联动/转正/下量/审计 action 覆盖，12 项全过） | openapi.v1.yaml、admin/index.html+app.js、api-surface-test.sh | api-surface 灰度断言组全过 ✅；UI 内嵌页面实测 ✅；contract 43 paths ✅；workspace 31 套件全绿 ✅ | ✅ |
 | **G5 百分比放量 + 观察** | ✅ **已完成**（`docs/design/g5-observability.md`，D31-D34）：分桶算法文档化（gray-release.md 附录三：FNV-1a 32 位常量/取模语义/跨节点确定性论证）；6 项指标——`dsh_gray_active`（扫描）+ `dsh_gray_publish/promote/abort_total`（审计计数）+ `dsh_http_requests_total`/`dsh_http_5xx_total`（进程内计数 + count_http middleware）；**自动回滚钩子**（可选）：`GrayHealthProbe` 抽象 + `LocalHttp5xxProbe` + leader-only `spawn_gray_auto_rollback`（raft 写路径 + 审计 gray_auto_abort + CLI `--gray-rollback-threshold`/`--gray-rollback-interval`，默认禁用）；集群一致性验证（3 节点同规则同桶实测） | observability、jobs、api lib.rs、cli main.rs、cluster.rs | 指标 e2e 断言全过 ✅；自动回滚正/负例集成测试 ✅；集群 3 节点 fnv1a 同桶实测 ✅；workspace 31 套件全绿 ✅ | ✅ |
 
-**SDK 三语言适配**（G3/G4 同步，每语言 1–2 天）：`ConfigClient` 增加 `instance/labels` 选项、watch 事件过滤（gray:true 永不按版本过滤、**重连必做一次 snapshot 拉取**——B1 契约）、缓存版本号只取 snapshot 响应（R1：version=active、resolved_version=gray_seq）。服务端数据面已就绪（G3 ✅），三语言适配是让灰度端到端可用的最后一环。
+**SDK 三语言适配**（✅ **已完成，后 G5 收口**）：`ConfigClient` 增加 `instance/labels` 选项、watch 事件过滤（gray:true 永不按版本过滤、**重连必做一次 snapshot 拉取**——B1 契约）、缓存版本号只取 snapshot 响应（R1：version=active、resolved_version=gray_seq）。三语言（TS/Go/Python）已落地，灰度端到端可用。
 
 ### 1.4 风险
 
@@ -141,6 +141,8 @@ watch：
 | 阶段 | 内容 | 交付物 | 验收 | 估时 |
 |------|------|--------|------|------|
 | **E0 契约硬化（D-TEST/D4 收尾）** | D4 自动化：RAFT-002 网络分区、WCH-002 慢消费者、SDK-002 幂等重试契约；HTTP version 参数生效或显式拒绝；GetItem RPC 二选一（服务端实现 or 从 proto 移除——建议保留并实现，契约最小化） | 测试脚本 + proto 调整 | 6 个 e2e 全过；新 3 个自动化脚本入 CI | 3–4 天 |
+
+> **E 线调研落档（2025-08-17）**：生态集成调研结论见 [research-ecosystem-integration.md](research-ecosystem-integration.md)（综合）与三份分线报告（K8s/K3s、Spring Cloud、竞品对标）。核心修订：① 新增 **E2a properties/profile 渲染（S）与 E2b Spring Cloud Config Server 协议兼容端点（S–M，Rust 原生）**，先于 E2 排期（竞品调研"最便宜先做"头号杠杆，白嫖官方 spring-cloud-config-client）；② E3 补"写后打 restartedAt annotation 触发滚动（可关，预留 Reloader 对接）"；③ E4 补 **K3s HelmChart CRD 一键安装**样例；④ 新增 **E7 token 化开放 API（写操作，S）** 对标 Nacos Open API/Apollo 开放平台；⑤ 明确不做：webhook sidecar 注入、Vault CSI、etcd v2、ZK、自研 operator、服务网格。
 | **E1 TLS 内置** | `--tls-cert/--tls-key`（或自动自签 + 提示）；HTTP/HTTPS 双栈、gRPC TLS、Admin UI HTTPS；SDK 三语言 TLS 选项（Python `tls no-op` 标注收尾）；compose/README 更新 | crypto/证书 + api 监听 + SDK | HTTPS/gRPC-TLS 实测；无证书明文告警 | 4–5 天 |
 | **E2 Java SDK + Spring Boot Starter** | `sdk/java`（gRPC+HTTP，复制 Go/TS 模式）+ `dsh-spring-boot-starter`：`@ConfigurationProperties` 注入、`@RefreshScope`、watch→refresh 事件、secret 解密注入 | sdk/java + starter 模块 | Java SDK 契约对拍（复用脚本模式）；starter 集成示例工程启动+热更新实测 | 6–8 天 |
 | **E3 K8s ConfigMap/Secret 控制器** | 独立可选二进制：watch (project,branch) → 渲染 → 写 ConfigMap/Secret（ownerRef/label 管理、防回写循环、secret 密文解密按策略）；对存量工作负载零改动 | 新 crate dsh-k8s-sync + manifest | 控制器 e2e（配置变更→ConfigMap 更新→Pod 挂载生效） | 6–8 天 |

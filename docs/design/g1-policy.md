@@ -94,7 +94,7 @@ pub enum ReadMode { #[default] Stale, Linear }   // 修订：默认 Stale（见�
 | `dsh-core/src/command.rs` | 4 个发布命令加 `#[serde(default)] policy`；SharedPublish 加 `#[serde(default)] cascade` |
 | `dsh-core/src/state.rs` | `materialize_resolved` 接受 policy（warn 跳过校验）；`apply_publish_structure`/`apply_shared_publish` 校验/级联按命令字段分支 |
 | `dsh-publish/src/lib.rs` | 各发布方法加 policy/cascade 参数（从配置注入）；PublishOutcome 带 warnings |
-| `dsh-api/src/lib.rs` | ApiState.read_mode（pub 默认 Linear）；`linearized_read()`；各读 handler 接线；warn 发布审计 detail/响应 warnings |
+| `dsh-api/src/lib.rs` | ApiState.read_mode（pub 默认 Stale，D37 修订）；`linearized_read()`；各读 handler 接线；warn 发布审计 detail/响应 warnings |
 | `dsh-api/src/grpc.rs` | get_config/get_item 开头 linearized_read |
 | `dsh-cli/src/main.rs` | `--publish-policy` / `--shared-cascade` / `--read-mode` 参数 → PublishService/ApiState 注入 |
 | 测试 | core（warn 放行 / manual 不级联 / 默认 block）；集群（linear 读一致性）；e2e（三旋钮断言） |

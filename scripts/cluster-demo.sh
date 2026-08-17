@@ -22,7 +22,7 @@ H3=http://$HA3
 start_node() { # $1=node_id $2=http $3=raft $4=data $5..=flags
   local id=$1 http=$2 raft=$3 data=$4; shift 4
   $BIN --node-id "$id" --http-addr "$http" --raft-addr "$raft" --grpc-addr "127.0.0.1:88$id" \
-       --data-dir "$data" --admin-password admin123 --join-token demo --raft-token demo "$@" >"$WORK/node$id.log" 2>&1 &
+       --data-dir "$data" --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo "$@" >"$WORK/node$id.log" 2>&1 &
   PIDS="$PIDS $!"
 }
 

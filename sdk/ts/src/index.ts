@@ -20,6 +20,7 @@ export interface WatchEvent {
   request_id: string;
   changes: Change[];
   snapshot_required?: boolean;
+  gray?: boolean;
 }
 
 export interface Snapshot {
@@ -28,6 +29,8 @@ export interface Snapshot {
   version: number;
   structure_version: number;
   groups: Record<string, Record<string, unknown>>;
+  gray?: boolean;
+  resolved_version?: number;
 }
 
 export interface Member {
@@ -53,6 +56,10 @@ export class ConfigError extends Error {
 export interface ConfigClientOptions {
   /** 数据面 gRPC/HTTP 令牌（metadata authorization: Bearer <token>） */
   token?: string;
+  /** 灰度稳定身份键（如 Pod 名/部署单元 ID；非空时经 gRPC instance_id / HTTP X-Dsh-Instance 上报） */
+  instance?: string;
+  /** 灰度标签（如 zone=cn-north-1；空/缺省 = 不参与标签匹配） */
+  labels?: Record<string, string>;
 }
 
 type GrpcClientLike = {
@@ -71,10 +78,14 @@ export class ConfigClient {
   private grpc: GrpcClientLike | null = null;
   private grpcReady: Promise<GrpcClientLike | null> | null = null;
   private token?: string;
+  private instance?: string;
+  private labels?: Record<string, string>;
 
   constructor(endpoints: Endpoint[], opts?: ConfigClientOptions) {
     this.endpoints = endpoints;
     this.token = opts?.token;
+    this.instance = opts?.instance;
+    this.labels = opts?.labels;
   }
 
   /** 懒加载 gRPC 客户端：仅当端点带 grpc 地址时动态 import（HTTP-only/浏览器零依赖）。
@@ -84,9 +95,15 @@ export class ConfigClient {
     if (this.grpcReady) return this.grpcReady;
     const ep = this.endpoints[0];
     if (ep && typeof ep === 'object' && ep.grpc) {
+      const grpcAddr = ep.grpc;
       this.grpcReady = import('./grpc.ts')
         .then((m) => {
-          this.grpc = new m.GrpcConfigClient({ grpc: ep.grpc, token: this.token }) as GrpcClientLike;
+          this.grpc = new m.GrpcConfigClient({
+            grpc: grpcAddr,
+            token: this.token,
+            instanceId: this.instance,
+            labels: this.labels,
+          }) as GrpcClientLike;
           return this.grpc;
         })
         .catch((e) => {
@@ -118,6 +135,13 @@ export class ConfigClient {
       try {
         const headers: Record<string, string> = {};
         if (this.token) headers['Authorization'] = 'Bearer ' + this.token;
+        if (this.instance) headers['X-Dsh-Instance'] = this.instance;
+        if (this.labels && Object.keys(this.labels).length > 0) {
+          headers['X-Dsh-Labels'] = Object.keys(this.labels)
+            .sort()
+            .map((k) => k + '=' + this.labels![k])
+            .join(',');
+        }
         // F-SDK：请求超时（默认 10s），挂死端点不再永久 pending
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
@@ -219,11 +243,16 @@ export class ConfigClient {
       const ctrl = new AbortController();
       const onAbort = () => ctrl.abort();
       signal?.addEventListener('abort', onAbort);
-      // 断线重连带 after_version 续传（design §6.2）
-      const resume = lastVersion > 0 ? '?after_version=' + lastVersion : '';
-      const headers: Record<string, string> = {};
-      if (this.token) headers['Authorization'] = 'Bearer ' + this.token;
-      fetch(this.httpEndpoint(this.endpoints[0]) + path + resume, { signal: ctrl.signal, headers })
+      // B1 契约：订阅/重连先做一次 snapshot 拉取，重锚版本游标
+      // （灰度 publish/abort 不写 v/ 记录，版本链重放不含 → 断线期间撤回的灰度须靠快照回落）。
+      this.get(project, branch)
+        .then((snap) => {
+          if (snap.version && snap.version > lastVersion) lastVersion = snap.version;
+          const resume = lastVersion > 0 ? '?after_version=' + lastVersion : '';
+          const headers: Record<string, string> = {};
+          if (this.token) headers['Authorization'] = 'Bearer ' + this.token;
+          return fetch(this.httpEndpoint(this.endpoints[0]) + path + resume, { signal: ctrl.signal, headers });
+        })
         .then(async (r) => {
           if (!r.ok || !r.body) throw new ConfigError('HTTP_' + r.status, 'watch failed');
           const reader = r.body.getReader();
@@ -240,8 +269,8 @@ export class ConfigClient {
               if (line.startsWith('data:')) {
                 try {
                   const ev = JSON.parse(line.slice(5).trim()) as WatchEvent;
-                  if (ev.version <= lastVersion) continue; // F-SDK：重放/重连重复投递去重
-                  lastVersion = ev.version;
+                  if (!ev.gray && ev.version <= lastVersion) continue; // F-SDK：重放/重连重复投递去重；灰度事件永不过滤
+                  if (!ev.gray) lastVersion = ev.version;
                   listener(ev);
                 } catch {
                   /* 忽略坏帧 */

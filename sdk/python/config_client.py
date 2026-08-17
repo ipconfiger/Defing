@@ -50,17 +50,21 @@ def _snapshot_from_proto(s) -> dict:
         "version": s.version,
         "structure_version": s.structure_version,
         "groups": groups,
+        "gray": s.gray,
+        "resolved_version": s.resolved_version,
     }
 
 
 class ConfigClient:
-    def __init__(self, endpoints, *, tls: bool = False, token=None):
+    def __init__(self, endpoints, *, tls: bool = False, token=None, instance=None, labels=None):
         # F-SDK：tls 参数保留仅为兼容签名——urllib 的 https 请求默认即校验证书，
         # 该参数为 no-op（见 _request）；如需自定义 CA 请传环境变量 SSL_CERT_FILE。
         if not endpoints:
             raise ConfigError("NO_ENDPOINT", "endpoints 不能为空")
         self.endpoints = endpoints
         self.token = token
+        self.instance = instance
+        self.labels = labels
         self._grpc_stub = None
         self._grpc_channel = None
         first = endpoints[0]
@@ -85,6 +89,12 @@ class ConfigClient:
                 headers = {}
                 if self.token:
                     headers["Authorization"] = "Bearer " + self.token
+                if self.instance:
+                    headers["X-Dsh-Instance"] = self.instance
+                if self.labels:
+                    headers["X-Dsh-Labels"] = ",".join(
+                        "%s=%s" % (k, v) for k, v in sorted(self.labels.items())
+                    )
                 req = urllib.request.Request(url + path, headers=headers)
                 with urllib.request.urlopen(req, timeout=5) as r:
                     return json.loads(r.read().decode())
@@ -103,10 +113,14 @@ class ConfigClient:
     def _grpc_get(self, project, branch, version):
         from config import v1_pb2
 
-        resp = self._grpc().GetConfig(
-            v1_pb2.GetConfigRequest(project=project, branch=branch, version=version),
-            metadata=self._meta,
+        req = v1_pb2.GetConfigRequest(
+            project=project,
+            branch=branch,
+            version=version,
+            instance_id=self.instance or "",
+            labels=self.labels or {},
         )
+        resp = self._grpc().GetConfig(req, metadata=self._meta)
         return _snapshot_from_proto(resp)
 
     # ---------------- 公共 API（双通道一致） ----------------
@@ -159,6 +173,16 @@ class ConfigClient:
         while not (stop and stop.is_set()):
             try:
                 attempt = 0  # 连接成功 → 退避计数清零
+                # B1 契约：订阅/重连先做一次 snapshot 拉取，重锚版本游标（灰度 publish/abort 不写 v/ 记录，重放不含）
+                try:
+                    snap = self._grpc_get(project, branch, 0)
+                    v = snap.get("version", 0)
+                    if v > after:
+                        after = v
+                    if v > last_emitted:
+                        last_emitted = v
+                except Exception:
+                    pass
                 for e in self._grpc().Watch(
                     v1_pb2.WatchRequest(project=project, branch=branch, after_version=after),
                     metadata=self._meta,
@@ -166,9 +190,10 @@ class ConfigClient:
                     if stop and stop.is_set():
                         return
                     after = max(after, e.version)
-                    if e.version <= last_emitted:
-                        continue  # F-SDK：重放/重连重复投递去重
-                    last_emitted = e.version
+                    if e.version <= last_emitted and not e.gray:
+                        continue  # F-SDK：重放/重连重复投递去重（灰度事件永不按版本过滤）
+                    if e.version > last_emitted:
+                        last_emitted = e.version  # 游标只增不减（gray 事件版本可能 ≤ last，不倒挂）
                     listener(
                         {
                             "version": e.version,
@@ -186,6 +211,7 @@ class ConfigClient:
                                 for c in e.changes
                             ],
                             "snapshot_required": e.snapshot_required,
+                            "gray": e.gray,
                         }
                     )
             except Exception:
@@ -204,6 +230,14 @@ class ConfigClient:
                 time.sleep(min(BACKOFF_BASE_MS * (2 ** attempt), 15000) / 1000)
             attempt += 1
             try:
+                # B1 契约：订阅/重连先做一次 snapshot 拉取，重锚版本游标（灰度 publish/abort 不写 v/ 记录，重放不含）
+                try:
+                    snap = self.get(project, branch)
+                    v = snap.get("version", 0)
+                    if v > last_version:
+                        last_version = v
+                except Exception:
+                    pass
                 resume = ("?after_version=%d" % last_version) if last_version > 0 else ""
                 url = self.endpoints[0] if isinstance(self.endpoints[0], str) else self.endpoints[0].get("http")
                 headers = {}
@@ -216,9 +250,10 @@ class ConfigClient:
                         if line.startswith("data:"):
                             try:
                                 ev = json.loads(line[5:].strip())
-                                if ev.get("version", 0) <= last_version:
-                                    continue  # F-SDK：重放/重连重复投递去重
-                                last_version = ev["version"]
+                                if ev.get("version", 0) <= last_version and not ev.get("gray"):
+                                    continue  # F-SDK：重放/重连重复投递去重（灰度事件永不按版本过滤）
+                                if ev.get("version", 0) > last_version:
+                                    last_version = ev["version"]  # 游标只增不减（gray 事件不倒挂）
                                 listener(ev)
                             except ValueError:
                                 pass

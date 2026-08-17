@@ -1,31 +1,59 @@
-# Defing 3 节点集群示例
+# Defing 3 节点集群示例（已修复版，含坑 C1/C3 全部修正；踩坑记录见 docs/defing-cluster.md）
 # 用法：DSH_ADMIN_PASSWORD=<强密码> DSH_CLUSTER_TOKEN=<随机串> docker compose up --build
 #   DSH_CLUSTER_TOKEN 同时作为 join-token 与 raft-token（集群内所有节点一致）
+#
+# 建群方式（推荐）：静态成员表 --bootstrap-peers —— 三节点传【完全相同】的三段式成员表
+# （node_id@raft_addr@http_addr，必填），并行启动直接选举，全员 voter，无需 join/promote；
+# dsh 按 raft-meta 判断：已有状态（重启/crash 恢复）自动 resume，忽略建群参数。
+# 修正要点：
+#   - 容器内 --http-addr/--raft-addr 与成员表均用服务名（NodeInfo 上报可路由地址，坑 C1）；
+#   - healthcheck 探测各自服务名（坑 C2）；
+#   - 启动命令静态幂等，无 shell 条件包装（坑 C3/C4）；
+#   - seed 与集群成员表不一致会 WARN（不覆盖），运行期扩缩容走 --join/promote/remove-node。
 version: "3.9"
 services:
   node1:
     build: .
-    command: dsh --node-id 1 --bootstrap --http-addr 0.0.0.0:8384 --raft-addr 0.0.0.0:8385 --data-dir /data --admin-password ${DSH_ADMIN_PASSWORD:-changeme} --join-token ${DSH_CLUSTER_TOKEN:-demo} --raft-token ${DSH_CLUSTER_TOKEN:-demo}
     environment:
+      DSH_BOOTSTRAP_PEERS: "1@node1:8385@node1:8384,2@node2:8385@node2:8384,3@node3:8385@node3:8384"
       DSH_ADMIN_PASSWORD: ${DSH_ADMIN_PASSWORD:-changeme}
+    command: dsh --node-id 1 --bootstrap-peers $${DSH_BOOTSTRAP_PEERS} --http-addr node1:8384 --raft-addr node1:8385 --data-dir /data --admin-password ${DSH_ADMIN_PASSWORD:-changeme} --join-token ${DSH_CLUSTER_TOKEN:-demo} --raft-token ${DSH_CLUSTER_TOKEN:-demo}
     volumes: [n1:/data]
     ports: ["18384:8384"]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/node1/8384"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
   node2:
     build: .
-    command: dsh --node-id 2 --join http://node1:8384 --http-addr 0.0.0.0:8384 --raft-addr 0.0.0.0:8385 --data-dir /data --admin-password ${DSH_ADMIN_PASSWORD:-changeme} --join-token ${DSH_CLUSTER_TOKEN:-demo} --raft-token ${DSH_CLUSTER_TOKEN:-demo}
     environment:
+      DSH_BOOTSTRAP_PEERS: "1@node1:8385@node1:8384,2@node2:8385@node2:8384,3@node3:8385@node3:8384"
       DSH_ADMIN_PASSWORD: ${DSH_ADMIN_PASSWORD:-changeme}
-    depends_on: [node1]
+    command: dsh --node-id 2 --bootstrap-peers $${DSH_BOOTSTRAP_PEERS} --http-addr node2:8384 --raft-addr node2:8385 --data-dir /data --admin-password ${DSH_ADMIN_PASSWORD:-changeme} --join-token ${DSH_CLUSTER_TOKEN:-demo} --raft-token ${DSH_CLUSTER_TOKEN:-demo}
     volumes: [n2:/data]
     ports: ["28384:8384"]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/node2/8384"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
   node3:
     build: .
-    command: dsh --node-id 3 --join http://node1:8384 --http-addr 0.0.0.0:8384 --raft-addr 0.0.0.0:8385 --data-dir /data --admin-password ${DSH_ADMIN_PASSWORD:-changeme} --join-token ${DSH_CLUSTER_TOKEN:-demo} --raft-token ${DSH_CLUSTER_TOKEN:-demo}
     environment:
+      DSH_BOOTSTRAP_PEERS: "1@node1:8385@node1:8384,2@node2:8385@node2:8384,3@node3:8385@node3:8384"
       DSH_ADMIN_PASSWORD: ${DSH_ADMIN_PASSWORD:-changeme}
-    depends_on: [node1]
+    command: dsh --node-id 3 --bootstrap-peers $${DSH_BOOTSTRAP_PEERS} --http-addr node3:8384 --raft-addr node3:8385 --data-dir /data --admin-password ${DSH_ADMIN_PASSWORD:-changeme} --join-token ${DSH_CLUSTER_TOKEN:-demo} --raft-token ${DSH_CLUSTER_TOKEN:-demo}
     volumes: [n3:/data]
     ports: ["38384:8384"]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/node3/8384"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
 volumes:
   n1: {}
   n2: {}

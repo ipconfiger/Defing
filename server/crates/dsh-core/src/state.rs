@@ -626,7 +626,8 @@ impl StateMachine {
     /// 保证最新保留版本是 checkpoint（full 基座），其后的 diff 链可完整重建。
     /// G2/Q5：灰度快照位于 gray-snap/ 独立前缀（Q1），不在本方法的 v/ 扫描范围内，
     /// 天然不会被裁剪（灰度客户端 resolve 目标永不 NotFound；Abort 后历史仍可查）。
-    /// 灰度快照的回收属后续维护任务（当前仅随分支删除级联清理）。
+    /// 灰度快照回收在 apply 路径（publish/promote/abort/结构发布 bump）删除旧序号快照（G5 后收口），
+    /// 此处仅保证 v/ 裁剪不误删当前灰度快照。
     pub fn prune_versions(
         &self,
         project: &ProjectId,
@@ -1464,8 +1465,11 @@ impl StateMachine {
             // D23：灰度活跃 → 灰度快照同步 bump（内容不变、序号前移；structure_version
             // 取 BranchState 最新值，灰度客户端重拉后拿到结构一致的灰度快照）。
             if st.gray_seq > 0 {
-                let gray_snap = self.gray_snapshot_of(id, branch, st.gray_seq)?;
+                let old_gray_seq = st.gray_seq;
+                let gray_snap = self.gray_snapshot_of(id, branch, old_gray_seq)?;
                 self.save_pending(&gray_snap_key(id, branch, gray_next), &gray_snap)?;
+                // 回收：旧灰度快照键（序号前移后旧键不再引用）
+                self.delete_pending(gray_snap_key(id, branch, old_gray_seq).as_bytes())?;
                 st.gray_seq = gray_next;
             }
             // D14：清理结构发布后不存在的 item 草稿值
@@ -1831,9 +1835,14 @@ impl StateMachine {
         let diff = compute_diff(&old, &gray_snap);
 
         // Q1：独立灰度序号 + 独立前缀（gray-snap/），与 active_version 版本号空间完全隔离
+        let old_seq = st.gray_seq;
         st.gray_seq += 1;
         let seq = st.gray_seq;
         self.save_pending(&gray_snap_key(id, branch, seq), &gray_snap)?;
+        // 回收：旧灰度快照（若有）不再被引用，删除防累积
+        if old_seq > 0 {
+            self.delete_pending(gray_snap_key(id, branch, old_seq).as_bytes())?;
+        }
         st.gray_rule = Some(rule.clone());
         st.last_request_id = Some(request_id.to_string());
         st.value_draft.clear();
@@ -1900,6 +1909,8 @@ impl StateMachine {
             gray: true, // 转正版本：重放时还原 gray 事件标记
         };
         self.write_version_snapshot(id, branch, vno, &old, &gray_snap, &mut record)?;
+        // 回收：转正后灰度快照已并入 v/，删除 gray-snap 键
+        self.delete_pending(gray_snap_key(id, branch, st.gray_seq).as_bytes())?;
         st.active_version = vno;
         st.gray_seq = 0;
         st.gray_rule = None;
@@ -1943,6 +1954,8 @@ impl StateMachine {
                 "no active gray on branch {branch}"
             )));
         }
+        // 回收：下量后删除灰度快照
+        self.delete_pending(gray_snap_key(id, branch, st.gray_seq).as_bytes())?;
         st.gray_seq = 0;
         st.gray_rule = None;
         st.last_request_id = Some(request_id.to_string());

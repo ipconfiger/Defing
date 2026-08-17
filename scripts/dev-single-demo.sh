@@ -9,7 +9,7 @@ cleanup() { [ -n "${PID:-}" ] && kill $PID 2>/dev/null || true; }
 trap cleanup EXIT
 
 echo "== 启动 dsh --dev-single =="
-$BIN --dev-single --admin-password admin123 --http-addr 127.0.0.1:$PORT >/tmp/dsh-dev-single.log 2>&1 &
+$BIN --dev-single --admin-password admin123 --allow-no-master-key --http-addr 127.0.0.1:$PORT >/tmp/dsh-dev-single.log 2>&1 &
 PID=$!
 sleep 1
 curl -sf $BASE/healthz >/dev/null && echo "  healthz OK" || { echo "  healthz FAIL"; cat /tmp/dsh-dev-single.log; exit 1; }

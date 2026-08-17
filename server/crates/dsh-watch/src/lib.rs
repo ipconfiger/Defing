@@ -23,7 +23,13 @@ impl Default for WatchHub {
 
 impl WatchHub {
     pub fn new() -> Self {
-        let (tx, _rx) = tokio::sync::broadcast::channel(1024);
+        Self::with_capacity(1024)
+    }
+
+    /// 以指定容量创建进程内广播事件缓冲（--watch-event-retain，design-v2 §6.3「最近 10k 事件」）。
+    /// 重放仍走版本链 diff 合成（design 优先版本链）；本缓冲约束实时扇出的慢消费者容忍度。
+    pub fn with_capacity(capacity: usize) -> Self {
+        let (tx, _rx) = tokio::sync::broadcast::channel(capacity);
         Self { tx }
     }
 
@@ -156,6 +162,14 @@ mod tests {
         let got = rx.try_recv().expect("event delivered");
         assert_eq!(got.version, 2);
         assert_eq!(got.project.as_str(), "p");
+    }
+
+    #[test]
+    fn hub_capacity_configurable() {
+        let hub = WatchHub::with_capacity(4);
+        let mut rx = hub.subscribe();
+        hub.publish(&event("p", "dev", 2));
+        assert_eq!(rx.try_recv().expect("event delivered").version, 2);
     }
 
     #[test]

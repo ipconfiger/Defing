@@ -2348,8 +2348,8 @@ fn gray_abort_reverts_to_stable() {
         cfg.groups["redis"]["host"],
         Value::String("stable-host".into())
     );
-    // Q5：灰度快照保留（历史可查），不再被解析到
-    assert!(s.gray_snapshot_of(&pid, &dev, 1).is_ok());
+    // 回收：下量后灰度快照已删除（「仅存当前灰度，非历史链」语义）
+    assert!(s.gray_snapshot_of(&pid, &dev, 1).is_err());
 }
 
 /// T5 I10 幂等：三个灰度命令同 request_id 重放 → 空事件、状态不重复推进。
@@ -2665,8 +2665,8 @@ fn structure_publish_with_active_gray_bumps_both() {
     // 灰度内容保留（D23 不失效）
     let snap = s.gray_snapshot_of(&pid, &dev, 4).unwrap();
     assert_eq!(snap["redis"]["host"], Value::String("gray-host".into()));
-    // 旧灰度快照仍在（历史可查）
-    assert!(s.gray_snapshot_of(&pid, &dev, 1).is_ok());
+    // 回收：结构发布灰度 bump 后旧灰度快照已删除（仅存当前 gray_seq 快照）
+    assert!(s.gray_snapshot_of(&pid, &dev, 1).is_err());
     // 灰度客户端解析到新灰度号；稳定客户端读到新稳定版
     assert_eq!(
         s.resolve_version(&pid, &dev, &ctx("web-1", &[("zone", "cn-north-1")], None))
@@ -2683,6 +2683,138 @@ fn structure_publish_with_active_gray_bumps_both() {
     let tst = s.get_branch_state(&pid, &test).unwrap().unwrap();
     assert_eq!(tst.active_version, 2);
     assert_eq!(tst.gray_seq, 0);
+}
+
+/// 回收：gray-snap/ 孤儿快照不累积——重复灰度发布回收旧序号、promote/abort 删除当前快照。
+#[test]
+fn gray_snapshot_recycled_on_lifecycle() {
+    fn gray_key_count(s: &StateMachine) -> usize {
+        s.dump_all()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| String::from_utf8_lossy(k).contains("/gray-snap/"))
+            .count()
+    }
+    let mut s = sm();
+    let (pid, dev) = gray_setup(&mut s);
+
+    // 首次灰度发布（gray_seq=1）
+    s.apply(
+        &Command::GrayPublish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            rule: label_rule("zone", "cn-north-1"),
+            comment: "g1".into(),
+            request_id: "g1".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        13,
+    )
+    .unwrap();
+    assert_eq!(gray_key_count(&s), 1, "首次灰度发布仅 1 个灰度快照");
+
+    // 再编辑草稿并二次灰度发布（gray_seq=2）→ 旧 seq=1 被回收
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "redis".into(),
+                key: "host".into(),
+                value: Value::String("gray-2".into()),
+            }],
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        14,
+    )
+    .unwrap();
+    s.apply(
+        &Command::GrayPublish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            rule: label_rule("zone", "cn-north-1"),
+            comment: "g2".into(),
+            request_id: "g2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        15,
+    )
+    .unwrap();
+    assert_eq!(gray_key_count(&s), 1, "重复灰度发布回收旧快照");
+    assert!(
+        s.gray_snapshot_of(&pid, &dev, 1).is_err(),
+        "旧灰度快照已删除"
+    );
+    assert!(s.gray_snapshot_of(&pid, &dev, 2).is_ok());
+
+    // 转正：灰度快照并入 v/ 后删除
+    s.apply(
+        &Command::GrayPromote {
+            project: pid.clone(),
+            branch: dev.clone(),
+            comment: "prom".into(),
+            request_id: "prom1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        16,
+    )
+    .unwrap();
+    assert_eq!(gray_key_count(&s), 0, "转正后灰度快照删除");
+
+    // 再灰度 + 下量：下量删除当前灰度快照
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "redis".into(),
+                key: "host".into(),
+                value: Value::String("gray-3".into()),
+            }],
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        17,
+    )
+    .unwrap();
+    s.apply(
+        &Command::GrayPublish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            rule: label_rule("zone", "cn-north-1"),
+            comment: "g3".into(),
+            request_id: "g3".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        18,
+    )
+    .unwrap();
+    assert_eq!(gray_key_count(&s), 1);
+    s.apply(
+        &Command::GrayAbort {
+            project: pid.clone(),
+            branch: dev.clone(),
+            comment: "ab".into(),
+            request_id: "ab1".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        19,
+    )
+    .unwrap();
+    assert_eq!(gray_key_count(&s), 0, "下量后灰度快照删除");
 }
 
 /// T7 Q2：无身份（instance_id 空）永不进灰度——即使标签命中。

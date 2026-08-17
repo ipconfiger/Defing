@@ -9,7 +9,7 @@
 ### 单节点联调（--dev-single）
 
 ```bash
-server/target/debug/dsh --dev-single --admin-password admin123 --http-addr 127.0.0.1:8384
+server/target/debug/dsh --dev-single --admin-password admin123 --allow-no-master-key --http-addr 127.0.0.1:8384
 # 管理面:  http://127.0.0.1:8384  （/admin 内嵌控制台，/metrics，/healthz）
 # 数据面:  GET  /v1/projects/{p}/branches/{b}/snapshot  （SDK 拉配置，纯值+版本号）
 #          SSE  /v1/projects/{p}/branches/{b}/watch      （订阅发布事件）
@@ -17,10 +17,25 @@ server/target/debug/dsh --dev-single --admin-password admin123 --http-addr 127.0
 
 ### 集群（3 节点）
 
+**方式一（推荐）：静态成员表 `--bootstrap-peers`** —— 三节点传**完全相同**的三段式成员表，
+并行启动直接选举，全员 voter，无需 join/promote（研究/设计见 `docs/research-cluster-bootstrap.md`）：
+
 ```bash
-dsh --node-id 1 --bootstrap --http-addr 127.0.0.1:8384 --raft-addr 127.0.0.1:8385 --data-dir ./n1 --admin-password admin123 --join-token demo --raft-token demo
-dsh --node-id 2 --join http://127.0.0.1:8384 --http-addr 127.0.0.1:8386 --raft-addr 127.0.0.1:8387 --data-dir ./n2 --admin-password admin123 --join-token demo --raft-token demo
-dsh --node-id 3 --join http://127.0.0.1:8384 --http-addr 127.0.0.1:8388 --raft-addr 127.0.0.1:8389 --data-dir ./n3 --admin-password admin123 --join-token demo --raft-token demo
+SEED="1@127.0.0.1:8385@127.0.0.1:8384,2@127.0.0.1:8387@127.0.0.1:8386,3@127.0.0.1:8389@127.0.0.1:8388"
+dsh --node-id 1 --bootstrap-peers "$SEED" --http-addr 127.0.0.1:8384 --raft-addr 127.0.0.1:8385 --data-dir ./n1 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
+dsh --node-id 2 --bootstrap-peers "$SEED" --http-addr 127.0.0.1:8386 --raft-addr 127.0.0.1:8387 --data-dir ./n2 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
+dsh --node-id 3 --bootstrap-peers "$SEED" --http-addr 127.0.0.1:8388 --raft-addr 127.0.0.1:8389 --data-dir ./n3 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
+# 三段式必填：node_id@raft_addr@http_addr；条目校验：地址查重、拒绝 0.0.0.0、端口 1-65535；
+# 已有数据（重启/crash 恢复）自动 resume，seed 与集群成员表不一致会 WARN（不覆盖）；
+# 运行期扩缩容走 --join / promote / remove-node
+```
+
+**方式二：bootstrap + join（动态扩容）**
+
+```bash
+dsh --node-id 1 --bootstrap --http-addr 127.0.0.1:8384 --raft-addr 127.0.0.1:8385 --data-dir ./n1 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
+dsh --node-id 2 --join http://127.0.0.1:8384 --http-addr 127.0.0.1:8386 --raft-addr 127.0.0.1:8387 --data-dir ./n2 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
+dsh --node-id 3 --join http://127.0.0.1:8384 --http-addr 127.0.0.1:8388 --raft-addr 127.0.0.1:8389 --data-dir ./n3 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
 # 提升为 voter：
 # POST /api/v1/cluster/promote {"node_id": 2} / {"node_id": 3}（需管理员 Bearer）
 # 重启自动恢复：同 data-dir 直接启动（无需 --bootstrap/--join）
@@ -44,7 +59,8 @@ gRPC 契约测试：`bash scripts/sdk-grpc-contract-test.sh`（依赖：npm inst
 
 ## 核心能力
 
-- **集群**：Raft 强一致、join/promote、leader 击杀容错、节点重启自动恢复
+- **集群**：Raft 强一致、静态成员表建群（--bootstrap-peers，全员 voter 无需 promote）、
+  join/promote 动态扩容、leader 击杀容错、节点重启自动恢复
 - **配置模型**：项目→分支→分组→item；结构强一致（仅值按分支）
 - **发布闭环**：草稿 → 版本（不可变）→ 发布 → 通知；回滚；共享配置项与级联
 - **安全**：secret 项 AES-256-GCM 信封加密（主密钥 env/文件）、多会话并存（每会话独立管理 + 草稿乐观锁防并发编辑冲突）、审计、CSP、
@@ -59,7 +75,7 @@ gRPC 契约测试：`bash scripts/sdk-grpc-contract-test.sh`（依赖：npm inst
 cd server
 source ../scripts/build-env.sh   # CARGO_HOME + CXXFLAGS（本机 /home 只读环境）
 cargo build --workspace
-cargo test --workspace           # 49 测试（core/storage/raft/crypto/render/jobs）
+cargo test --workspace           # 172 测试（core/storage/raft/crypto/render/jobs/watch/api…）
 # 端到端：
 bash ../scripts/dev-single-demo.sh   # 单节点全流程（含 watch）
 bash ../scripts/cluster-demo.sh      # 3 进程集群 kill 容错
@@ -74,6 +90,10 @@ bash ../scripts/check-contracts.sh   # proto/openapi/schema lint
 - 可行性分析：[docs/feasibility-report.md](docs/feasibility-report.md)
 - 详细设计：[docs/design-v3.md](docs/design-v3.md)、[docs/design-modules/](docs/design-modules/)（15 份模块规格）
 - 进度记录：[docs/progress.md](docs/progress.md)
+- 生态集成调研：[docs/research-ecosystem-integration.md](docs/research-ecosystem-integration.md)（综合结论 + 路线图）
+  - K8s/K3s：[docs/research-k8s-k3s-integration.md](docs/research-k8s-k3s-integration.md)
+  - Spring Cloud：[docs/research-spring-cloud-integration.md](docs/research-spring-cloud-integration.md)
+  - 竞品对标：[docs/research-competitor-benchmark.md](docs/research-competitor-benchmark.md)
 
 ## 许可
 

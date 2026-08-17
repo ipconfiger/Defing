@@ -8,6 +8,8 @@ import * as protoLoader from '@grpc/proto-loader';
 export interface GrpcOptions {
   grpc: string;
   token?: string;
+  instanceId?: string;
+  labels?: Record<string, string>;
 }
 
 /** 带错误码的错误（index.ts 包装为 ConfigError；code 形如 GRPC_<status>）。 */
@@ -65,6 +67,8 @@ function snapshotFromProto(s: any) {
     version: s.version,
     structure_version: s.structure_version,
     groups,
+    gray: !!s.gray,
+    resolved_version: s.resolved_version,
   };
 }
 
@@ -88,6 +92,7 @@ function eventFromProto(e: any) {
     request_id: e.request_id,
     changes: changesFromProto(e.changes),
     snapshot_required: !!e.snapshot_required,
+    gray: !!e.gray,
   };
 }
 
@@ -95,16 +100,23 @@ function eventFromProto(e: any) {
 export class GrpcConfigClient {
   private client: any;
   private meta: grpc.Metadata;
+  private instanceId?: string;
+  private labels?: Record<string, string>;
 
   constructor(opts: GrpcOptions) {
     this.client = new proto.ConfigService(opts.grpc, grpc.credentials.createInsecure());
     this.meta = new grpc.Metadata();
     if (opts.token) this.meta.add('authorization', 'Bearer ' + opts.token);
+    this.instanceId = opts.instanceId;
+    this.labels = opts.labels;
   }
 
   getConfig(project: string, branch: string, version = 0): Promise<any> {
     return new Promise((resolve, reject) => {
-      this.client.getConfig({ project, branch, version }, this.meta, (err: any, resp: any) => {
+      const req: Record<string, unknown> = { project, branch, version };
+      if (this.instanceId) req.instance_id = this.instanceId;
+      if (this.labels) req.labels = this.labels;
+      this.client.getConfig(req, this.meta, (err: any, resp: any) => {
         if (err) return reject(grpcError('GRPC_' + err.code, err.details || err.message));
         resolve(snapshotFromProto(resp));
       });
@@ -134,16 +146,23 @@ export class GrpcConfigClient {
     let lastEmitted = 0;
     const connect = () => {
       if (signal?.aborted) return;
-      const call = this.client.watch({ project, branch, after_version: after }, this.meta);
-      call.on('data', (e: any) => {
-        after = Math.max(after, e.version);
-        if (e.version <= lastEmitted) return; // F-SDK：重放/重连重复投递去重
-        lastEmitted = e.version;
-        listener(eventFromProto(e));
-      });
-      call.on('error', () => schedule());
-      call.on('end', () => schedule());
-      signal?.addEventListener('abort', () => call.cancel(), { once: true });
+      // B1 契约：订阅/重连先做一次 snapshot 拉取，重锚版本游标（灰度 publish/abort 不写 v/ 记录，重放不含）
+      this.getConfig(project, branch, 0)
+        .then((snap: any) => {
+          if (snap.version) after = Math.max(after, snap.version);
+          if (signal?.aborted) return;
+          const call = this.client.watch({ project, branch, after_version: after }, this.meta);
+          call.on('data', (e: any) => {
+            after = Math.max(after, e.version);
+            if (!e.gray && e.version <= lastEmitted) return; // F-SDK：重放/重连重复投递去重；灰度事件永不过滤
+            if (!e.gray) lastEmitted = e.version;
+            listener(eventFromProto(e));
+          });
+          call.on('error', () => schedule());
+          call.on('end', () => schedule());
+          signal?.addEventListener('abort', () => call.cancel(), { once: true });
+        })
+        .catch(() => schedule());
     };
     let timer: ReturnType<typeof setTimeout> | null = null;
     const schedule = () => {

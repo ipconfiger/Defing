@@ -29,22 +29,36 @@ const (
 
 // GrpcClient — gRPC 数据面客户端（Get/GetItem/Watch/ListMembers）。
 type GrpcClient struct {
-	stub  configv1.ConfigServiceClient
-	conn  *grpc.ClientConn
-	token string
-	mu    sync.Mutex
+	stub     configv1.ConfigServiceClient
+	conn     *grpc.ClientConn
+	token    string
+	instance string
+	labels   map[string]string
+	mu       sync.Mutex
 }
 
 // NewGrpc 建立到单个 gRPC 端点的客户端；token 为数据面令牌（--data-plane-token）。
 func NewGrpc(grpcAddr, token string) (*GrpcClient, error) {
+	return newGrpc(grpcAddr, token, "", nil)
+}
+
+// NewGrpcWithIdentity 建立带灰度发布身份的 gRPC 数据面客户端（G3/D26）。
+// instance 为稳定身份键（如 Pod 名/部署单元 ID）；labels 为灰度标签（如 zone=cn-north-1）。
+func NewGrpcWithIdentity(grpcAddr, token, instance string, labels map[string]string) (*GrpcClient, error) {
+	return newGrpc(grpcAddr, token, instance, labels)
+}
+
+func newGrpc(grpcAddr, token, instance string, labels map[string]string) (*GrpcClient, error) {
 	conn, err := grpc.NewClient(grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, err
 	}
 	return &GrpcClient{
-		stub:  configv1.NewConfigServiceClient(conn),
-		conn:  conn,
-		token: token,
+		stub:     configv1.NewConfigServiceClient(conn),
+		conn:     conn,
+		token:    token,
+		instance: instance,
+		labels:   labels,
 	}, nil
 }
 
@@ -98,6 +112,8 @@ func snapshotFromProto(s *configv1.ConfigSnapshot) *Snapshot {
 		Version:          s.GetVersion(),
 		StructureVersion: s.GetStructureVersion(),
 		Groups:           groups,
+		Gray:             s.GetGray(),
+		ResolvedVersion:  s.GetResolvedVersion(),
 	}
 }
 
@@ -105,6 +121,8 @@ func snapshotFromProto(s *configv1.ConfigSnapshot) *Snapshot {
 func (g *GrpcClient) Get(ctx context.Context, project, branch string, version int64) (*Snapshot, error) {
 	resp, err := g.stub.GetConfig(g.ctx(ctx), &configv1.GetConfigRequest{
 		Project: project, Branch: branch, Version: version,
+		InstanceId: g.instance,
+		Labels:     g.labels,
 	})
 	if err != nil {
 		return nil, err
@@ -135,12 +153,12 @@ func (g *GrpcClient) ListMembers(ctx context.Context) ([]Member, error) {
 	out := make([]Member, 0, len(resp.GetMembers()))
 	for _, m := range resp.GetMembers() {
 		out = append(out, Member{
-			NodeID:          m.GetNodeId(),
-			GrpcAddr:        m.GetGrpcAddr(),
-			HTTPAddr:        m.GetHttpAddr(),
-			IsLeader:        m.GetIsLeader(),
-			IsVoter:         m.GetIsVoter(),
-			CommittedIndex:  m.GetCommittedIndex(),
+			NodeID:         m.GetNodeId(),
+			GrpcAddr:       m.GetGrpcAddr(),
+			HTTPAddr:       m.GetHttpAddr(),
+			IsLeader:       m.GetIsLeader(),
+			IsVoter:        m.GetIsVoter(),
+			CommittedIndex: m.GetCommittedIndex(),
 		})
 	}
 	return out, nil
@@ -151,6 +169,10 @@ func (g *GrpcClient) ListMembers(ctx context.Context) ([]Member, error) {
 // F-SDK：流的创建使用调用方 ctx——ctx 取消会关闭流并返回 ctx.Err()（不再泄漏 goroutine）。
 func (g *GrpcClient) Watch(ctx context.Context, project, branch string, afterVersion int64, listener func(WatchEvent)) error {
 	for {
+		// B1 契约：订阅/重连先做一次 snapshot 拉取，重锚版本游标（灰度 publish/abort 不写 v/ 记录，重放不含）
+		if snap, serr := g.Get(ctx, project, branch, 0); serr == nil && snap.Version > afterVersion {
+			afterVersion = snap.Version
+		}
 		stream, err := g.stub.Watch(g.ctx(ctx), &configv1.WatchRequest{
 			Project: project, Branch: branch, AfterVersion: afterVersion,
 		})
@@ -173,6 +195,8 @@ func (g *GrpcClient) Watch(ctx context.Context, project, branch string, afterVer
 				time.Sleep(grpcReconnectDelay)
 				break // 重连（after_version 续传）
 			}
+			// 游标只增不减：灰度事件（gray=true）可携带 ≤ afterVersion 的版本（promote/abort 补发），
+			// 但事件本身永不按版本过滤（gRPC 无客户端侧版本过滤，服务端已按 after_version 重放）。
 			if e.GetVersion() > afterVersion {
 				afterVersion = e.GetVersion()
 			}
@@ -206,6 +230,7 @@ func (g *GrpcClient) Watch(ctx context.Context, project, branch string, afterVer
 				RequestID:        e.GetRequestId(),
 				Changes:          changes,
 				SnapshotRequired: e.GetSnapshotRequired(),
+				Gray:             e.GetGray(),
 			})
 		}
 	}

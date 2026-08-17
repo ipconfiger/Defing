@@ -68,9 +68,9 @@ PYEOF
 prep_project() {
     local base="$1" port="$2" data_dir="$3"
     if [ -n "$data_dir" ]; then
-        $BIN --dev-single --admin-password admin123 --http-addr 127.0.0.1:$port --data-dir "$data_dir" >"$WORK/server-$port.log" 2>&1 &
+        $BIN --dev-single --admin-password admin123 --allow-no-master-key --http-addr 127.0.0.1:$port --data-dir "$data_dir" >"$WORK/server-$port.log" 2>&1 &
     else
-        $BIN --dev-single --admin-password admin123 --http-addr 127.0.0.1:$port >"$WORK/server-$port.log" 2>&1 &
+        $BIN --dev-single --admin-password admin123 --allow-no-master-key --http-addr 127.0.0.1:$port >"$WORK/server-$port.log" 2>&1 &
     fi
     echo $! > "$WORK/pid-$port"
     for i in $(seq 1 20); do curl -sf "$base/healthz" >/dev/null 2>&1 && break; sleep 0.5; done

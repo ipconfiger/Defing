@@ -1,7 +1,7 @@
 # 未完成工作清单与下一轮优化计划
 
 > 生成时间：P0–P3 收尾落档 ｜ 依据：docs/progress.md + 上轮源码审计
-> 状态：M0–M8 + 后 M8 收尾（P0–P3）全部闭环；下列为仍存在的设计偏差/可选增强
+> 状态：M0–M8 + 后 M8 收尾（P0–P3）+ **后 G5 收口**全部闭环；下列为仍存在的可选增强（非缺陷）
 
 ---
 
@@ -29,7 +29,7 @@
 
 | # | 项 | 说明 |
 |---|-----|------|
-| D1 | CLI 配置旋钮未实现 | design §13.1 的 --read-mode/--publish-policy/--shared-cascade/--watch-event-retain/--allow-no-master-key 未实现；当前行为即 design 默认（本地读/block/auto/版本链重放）。--allow-no-master-key 若实现会要求无密钥拒启，与现有无密钥演示流程冲突，故维持现状 |
+| D1 | CLI 配置旋钮 | ✅ 已闭环（G1 + 后 G5 收口）：--read-mode/--publish-policy/--shared-cascade（G1 三旋钮）+ --watch-event-retain（进程内广播缓冲）+ --allow-no-master-key（启动强制 + 逃生阀，演示脚本已加 flag） |
 | D2 | HTTP 数据面无 token 鉴权 | **已闭环（P3）**：`--data-plane-token` 现同时保护 HTTP 数据面 /v1/*（Bearer 或 ?token=，SSE 兼容）与 gRPC；未配置仍开放（演示兼容），生产建议配置 + TLS 前置 |
 | D3 | SDK 未实现 leader redirect 跟随 | 数据面读请求任意节点本地可服务（无需转发）；管理面写请求的 ERR_LEADER_REDIRECT 跟随（现返回 428 + leader_hint）属于未来 SDK 管理能力 |
 | D4 | 具名用例未全覆盖 | design-v3 §5 的 RAFT-002（网络分区）、WCH-002（慢消费者自动化）、SDK-002（幂等重试契约）未自动化；WCH-002 的语义已实现（F5/D-PRUNED：慢消费者与裁剪起点均结束流并发 snapshot_required），仅缺自动化脚本 |
@@ -41,5 +41,5 @@
 - Go SDK 需 go ≥1.21（本地可用 .go-toolchain/ 内 go1.22）；grpc 依赖 `go mod tidy`
 - TS SDK：`cd sdk/ts && npm install`（@grpc/grpc-js + proto-loader）；Python：`pip install grpcio`
 - 端口约定：dev-single 8384/8383；cluster 演示 860x/870x/88xx；api-surface 用 8399
-- 端到端脚本：dev-single-demo / cluster-demo / chaos-test / api-surface-test /
-  sdk-contract-test / sdk-grpc-contract-test / check-contracts
+- 端到端脚本：dev-single-demo / cluster-demo / seed-demo（--bootstrap-peers 静态建群）/ chaos-test /
+  api-surface-test / sdk-contract-test / sdk-grpc-contract-test / check-contracts

@@ -591,6 +591,7 @@ dependencies = [
  "dsh-publish",
  "dsh-raft",
  "dsh-render",
+ "dsh-storage",
  "dsh-testkit",
  "dsh-watch",
  "futures",

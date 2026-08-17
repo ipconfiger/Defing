@@ -2889,35 +2889,39 @@ async fn cluster_join(
         .raft
         .as_ref()
         .ok_or_else(|| ApiError(dsh_core::Error::not_found("cluster mode")))?;
-    // F14：node_id 未占用 + 地址可解析（防重复 node_id 扰乱成员表 / 恶意 raft_addr 触发出站连接）
-    {
+    // F14：node_id 未占用 + 地址可解析（防重复 node_id 扰乱成员表 / 恶意 raft_addr 触发出站连接）。
+    // 幂等 join（崩溃恢复）：
+    //   - 已存在且是 voter → 拒绝（重启恢复走本地 resume，无需 join；确认重新注册请先
+    //     remove-node 并清空该节点数据目录，否则重启必然失败循环）。
+    //   - 已存在但是 learner → 视为幂等成功：说明此前 join 已注册但响应丢失 / 节点崩溃于
+    //     追赶中；openraft add_learner 对已存在节点是幂等 re-add（可刷新 NodeInfo），
+    //     客户端 resume 后经 Raft 复制追赶即可。
+    let (existing, is_voter) = {
         let metrics = raft.metrics().borrow().clone();
-        let existing: Vec<u64> = metrics
-            .membership_config
-            .membership()
-            .nodes()
-            .map(|(id, _)| *id)
-            .collect();
-        if existing.contains(&req.node_id) {
-            return Err(ApiError(dsh_core::Error::conflict(format!(
-                "node_id {} 已在集群中",
-                req.node_id
+        let membership = metrics.membership_config.membership();
+        (
+            membership.nodes().map(|(id, _)| *id).collect::<Vec<u64>>(),
+            membership.voter_ids().any(|id| id == req.node_id),
+        )
+    };
+    let already_member = existing.contains(&req.node_id);
+    if already_member && is_voter {
+        return Err(ApiError(dsh_core::Error::conflict(format!(
+            "node_id {} 已是集群 voter（重启恢复会自动 resume，无需 join；确认重新注册请先 remove-node 并清空该节点数据目录）",
+            req.node_id
+        )))
+        .into());
+    }
+    for (label, addr) in [("http_addr", &req.http_addr), ("raft_addr", &req.raft_addr)] {
+        let a = addr.trim();
+        if a.is_empty() {
+            return Err(ApiError(dsh_core::Error::validation(format!("{label} 不能为空"))).into());
+        }
+        if a.split(':').count() != 2 {
+            return Err(ApiError(dsh_core::Error::validation(format!(
+                "{label} 须为 host:port 形式"
             )))
             .into());
-        }
-        for (label, addr) in [("http_addr", &req.http_addr), ("raft_addr", &req.raft_addr)] {
-            let a = addr.trim();
-            if a.is_empty() {
-                return Err(
-                    ApiError(dsh_core::Error::validation(format!("{label} 不能为空"))).into(),
-                );
-            }
-            if a.split(':').count() != 2 {
-                return Err(ApiError(dsh_core::Error::validation(format!(
-                    "{label} 须为 host:port 形式"
-                )))
-                .into());
-            }
         }
     }
     let node = RaftNodeInfo {
@@ -2927,7 +2931,26 @@ async fn cluster_join(
     };
     raft.add_learner(req.node_id, node, false)
         .await
-        .map_err(|e| ApiError(dsh_core::Error::internal(e.to_string())))?;
+        .map_err(|e| {
+            // 本节点非 leader：返回 428 + leader_hint（与写路径同约定），让 join 客户端
+            // 跟随真实 leader 重试——--join 指向 follower 时不必 30s 空转（F14 场景扩展）。
+            if let Some(fwd) = e.forward_to_leader::<RaftNodeInfo>() {
+                let hint = fwd
+                    .leader_node
+                    .as_ref()
+                    .map(|n| n.http_addr.clone())
+                    .or_else(|| dsh_raft::leader_http_addr(raft))
+                    .unwrap_or_default();
+                return ApiError(
+                    dsh_core::Error::new(
+                        dsh_core::ErrorKind::LeaderRedirect,
+                        "not leader, follow leader_hint",
+                    )
+                    .with_leader_hint(hint),
+                );
+            }
+            ApiError(dsh_core::Error::internal(e.to_string()))
+        })?;
     app.audit
         .append(
             "cluster_join",
@@ -2935,11 +2958,14 @@ async fn cluster_join(
             None,
             None,
             None,
-            serde_json::json!({ "node_id": req.node_id }),
+            serde_json::json!({ "node_id": req.node_id, "rejoined": already_member }),
             "admin",
         )
         .await;
-    Ok(Json(serde_json::json!({ "added_learner": req.node_id })))
+    Ok(Json(serde_json::json!({
+        "added_learner": req.node_id,
+        "rejoined": already_member,
+    })))
 }
 
 async fn cluster_promote(

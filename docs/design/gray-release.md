@@ -283,17 +283,17 @@ WatchEvent（proto）：加 bool gray = 8（向后兼容）
 | 命令 | `command.rs` | **纯新增** `GrayPublish`/`GrayAbort`/`GrayPromote` 三个变体（旧命令不动，Raft wire 兼容） | ✅ |
 | 状态机 | `state.rs` | 三个 apply 方法 + `resolve_version`/`rule_matches`/`fnv1a_hash`/`ip_in_cidr`（读路径纯函数）+ 结构发布×灰度双号 bump（D23）+ `gray_snapshot_of` + `rewrap_deks` 覆盖灰度快照 | ✅ |
 | 存储 | `keys.rs` | 新增 `gray_snap_key(pid, branch, seq)`（独立前缀 gray-snap/，不与 v/ 冲突） | ✅ |
-| API | `lib.rs` | 4 个管理端点 + snapshot/render/watch 解析身份头 + snapshot 响应 `gray`/`resolved_version` | ⬜ G4（身份注入 ⬜ G3） |
-| proto | `config.v1.proto` | `GetConfigRequest`/`WatchRequest` 加 `instance_id`/`labels` 字段（向后兼容）；`WatchEvent` 加 `gray` 标记 | ⬜ G3 |
-| SDK | 三语言 | 加 `instance_id`/`labels` 配置项 + 上报 + watch 按 gray 过滤 | ⬜ G3/G4 |
-| UI | `admin/app.js` | 灰度 tab（规则编辑/状态/一键提升/一键回滚） | ⬜ G4 |
+| API | `lib.rs` | 4 个管理端点 + snapshot/render/watch 解析身份头 + snapshot 响应 `gray`/`resolved_version` | ✅ G3/G4 |
+| proto | `config.v1.proto` | `GetConfigRequest`/`WatchRequest` 加 `instance_id`/`labels` 字段（向后兼容）；`WatchEvent` 加 `gray` 标记 | ✅ G3 |
+| SDK | 三语言 | 加 `instance_id`/`labels` 配置项 + 上报 + watch 按 gray 过滤 | ✅ 后 G5 收口 |
+| UI | `admin/app.js` | 灰度 tab（规则编辑/状态/一键提升/一键回滚） | ✅ G4 |
 
 > G2 实现要点（与设计逐条对齐）：promote 的 `next = max(active, gray)+1` 单调分配器（Q1）；
 > 灰度快照存**全量 SnapshotMap**（非 diff 链——仅当前灰度一个活跃快照，读路径直接命中）；
 > 结构发布灰度活跃时 `stable_next = max+1`、`gray_next = stable_next+1` 分配两个不同号（Q1/D23）；
 > abort 不产生新版本，事件携带回落版本号 = active_version（Q4）；
 > 事件 `changes`：publish 为 diff(active, gray)（稳定→灰度的增量），promote 为 diff(old, gray)，abort 为空。
-> 已知限制（后续阶段处理）：gray-snap/ 快照随灰度发布累积（当前仅分支删除级联清理，回收策略留待 G4+）；
+> 已知限制（已收口）：gray-snap/ 快照在 apply 路径回收（publish/promote/abort/结构发布 bump 删除旧序号快照），不再累积；
 > watch 数据面按身份投递属 G3（G2 保证事件字段与重放 gray 标记正确）。
 
 ---

@@ -35,4 +35,5 @@ tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["sync", "net"] }
+dsh-storage = { path = "../dsh-storage" }
 dsh-testkit = { path = "../dsh-testkit" }

@@ -345,3 +345,55 @@
 - 全部 e2e 脚本通过：dev-single-demo / cluster-demo（含 remove-node）/ api-surface-test /
   sdk-contract-test（HTTP）/ sdk-grpc-contract-test（三语言 gRPC）/ check-contracts（37 paths）
 - Admin UI 浏览器自动化全流程验证（登录→建项目→结构→草稿→发布→对比→提升→回滚→共享→审计）
+
+---
+
+## ✅ 后 G5 收口（灰度端到端闭环 + D1 全落地 + 文档收口）
+
+> 依据：docs/remaining-work.md（review 检出 5 项未收口）逐项落地并验证。
+
+- **灰度 SDK 三语言适配**（端到端最后一环）：TS/Go/Python `ConfigClient` 增加 `instance/labels` 身份上报
+  （gRPC `instance_id`/`labels` + HTTP `X-Dsh-Instance`/`X-Dsh-Labels`）、响应/事件读取 `gray`/`resolved_version`、
+  watch「gray 事件永不按版本过滤」+ 断线 snapshot 拉取契约；Go/Python stubs 重新生成对齐 proto G3 字段。
+- **gray-snap/ 回收**：apply 路径（gray publish/promote/abort/结构发布 bump）删除旧序号灰度快照，
+  消除「随灰度发布累积」已知限制；新增 `gray_snapshot_recycled_on_lifecycle` 测试钉死（core 53 用例）。
+- **灰度 e2e 入 CI**：`g1-policy-demo.sh` / `gray-demo.sh` / `gray-obs-demo.sh` 三脚本加入 e2e job。
+- **D1 全落地**：`--watch-event-retain`（进程内广播缓冲容量，默认 10000）+ `--allow-no-master-key`
+  （启动强制 + 逃生阀；全部演示脚本/README 补 flag；api-surface-test/docker-compose 已自带主密钥无需改）。
+- **文档收口**：remaining-work D1 闭环、g1-policy 默认 Stale 修订一致、gray-release §6 表回填、本 progress 段。
+
+## 后 G5 收口（续）：集群建群与恢复加固 ✅ 完成（全部验证通过）
+
+**交付物**
+- **join 重启/崩溃恢复幂等**（对应踩坑 C3/C4，详见 docs/defing-cluster.md）：
+  - dsh-cli：有持久化状态（raft-meta 非空）→ 忽略 `--bootstrap`/`--join`/`--bootstrap-peers`，直接 resume；
+    join 收到 409（已在集群）视为幂等成功；join 命中 follower 跟随 428 `leader_hint` 切换目标；
+  - dsh-api：`/cluster/join` 对已存在 learner 幂等成功（openraft add_learner 幂等 re-add），
+    已是 voter 保留 409（防劫持）；非 leader 返回 428 + leader_hint（与写路径同约定）；
+  - 根因：join 端点对"已在成员表"的 node_id 返回 409 → 客户端 300ms 重试 30s → 崩溃循环。
+- **静态成员表建群 `--bootstrap-peers`**（研究报告 docs/research-cluster-bootstrap.md）：
+  - 三节点传完全相同三段式成员表（`node_id@raft_addr@http_addr` 必填），并行启动直接选举，
+    全员 voter，无需 join/promote；openraft 同 map 并发 initialize 安全（先到者首写，
+    其余收到良性 NotAllowed 后经复制追平）；
+  - 校验（启动即失败）：三段式必填、raft/http 地址各自查重、拒绝 0.0.0.0/:: 通配、端口 1-65535、
+    本节点在 map 中且地址与本地参数一致；
+  - A2：有状态且 seed 与持久化成员表不一致 → WARN 差异明细（不覆盖不阻断——成员表是共识复制数据，
+    单节点覆盖会分叉；运行期成员变更走 API，推倒重建先清卷）；
+  - B1：长时间无 leader（quorum 未达成）→ 15s 后每 10s 周期提示，消除静默空转。
+- **测试与回归**：dsh-cli 解析/校验/diff 单测 5 项；dsh-raft 新增三节点静态 map 自举测试；
+  dsh-api 新增 join 幂等集成测试（learner 重复 join 200 / voter 409 / 地址校验）；
+  `scripts/seed-demo.sh`（6 段全场景）入 CI e2e。
+
+**验证结果（全部通过）**
+| 检查 | 结果 |
+|------|------|
+| cargo fmt --check | ✅ 干净 |
+| cargo clippy --all-targets --all-features -- -D warnings | ✅ 无警告 |
+| cargo test --workspace | ✅ 全绿 |
+| scripts/seed-demo.sh（A1/A3 拒绝、B1 提示、建群、复制、同/异 seed 重启） | ✅ 全过 |
+| scripts/cluster-demo.sh / chaos-test.sh / dev-single-demo.sh（回归） | ✅ 全过 |
+| 真实二进制冒烟：kill -9 后同命令重启 resume；seed 建群写 leader 三节点复制一致 | ✅ |
+
+**文档**：defing-cluster.md（C3 重写/C4 新增/两种建群方式/校验清单）、docker-compose.yml.demo 与
+deploy/docker-compose.yml（seed 主推 + 坑 C1/C2/C3/C4 全部修正）、README（集群方式一 seed）、
+research-cluster-bootstrap.md（设计 + 实施状态 + 实测修正）。

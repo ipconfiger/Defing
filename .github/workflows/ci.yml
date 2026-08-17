@@ -142,10 +142,27 @@ jobs:
         env:
           BIN: ${{ github.workspace }}/server/target/debug/dsh
         run: ./scripts/cluster-demo.sh
+      - name: seed cluster demo (--bootstrap-peers 静态成员表建群)
+        env:
+          BIN: ${{ github.workspace }}/server/target/debug/dsh
+        run: ./scripts/seed-demo.sh
       - name: chaos test
         env:
           BIN: ${{ github.workspace }}/server/target/debug/dsh
         run: ./scripts/chaos-test.sh
+      # 灰度发布 e2e（G1/G3/G5）：三旋钮 + 数据面解析/watch + 指标/自动回滚
+      - name: g1 policy demo
+        env:
+          BIN: ${{ github.workspace }}/server/target/debug/dsh
+        run: ./scripts/g1-policy-demo.sh
+      - name: gray demo
+        env:
+          BIN: ${{ github.workspace }}/server/target/debug/dsh
+        run: ./scripts/gray-demo.sh
+      - name: gray observability demo
+        env:
+          BIN: ${{ github.workspace }}/server/target/debug/dsh
+        run: ./scripts/gray-obs-demo.sh
 
   # stage 8: 基准冒烟（结果归档，不 gate 合并）
   bench:

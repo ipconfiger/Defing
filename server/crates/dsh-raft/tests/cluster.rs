@@ -740,3 +740,94 @@ async fn gray_percentage_consistent_across_nodes() {
     let _ = std::fs::remove_dir_all(&n2.dir);
     let _ = std::fs::remove_dir_all(&n3.dir);
 }
+
+/// 静态成员表建群（seed map）：三节点用【相同 map】同时 initialize，直接选举出 leader，
+/// 全员 voter（无 join/promote 两阶段）。openraft 文档：同 map 并发 initialize 安全。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_node_static_map_bootstrap() {
+    let network = NetworkFactory::new();
+    let mut nodes = Vec::new();
+    let mut seed = std::collections::BTreeMap::new();
+    for id in 1..=3u64 {
+        let n = make_node(id, &format!("s{id}"), &network).await;
+        seed.insert(
+            id,
+            NodeInfo {
+                grpc_addr: format!("127.0.0.1:{}", 8000 + id as u32),
+                http_addr: format!("127.0.0.1:{}", 9000 + id as u32),
+                raft_addr: format!("127.0.0.1:{}", 7000 + id as u32),
+            },
+        );
+        nodes.push(n);
+    }
+    // 三节点并发用相同 map initialize。openraft 语义：同 map 并发安全；其中「先到者」成功，
+    // 其余节点若已收到竞选投票（vote 非 (0,0)）会返回 NotAllowed——这是文档认可的良性错误
+    // （节点保持安全，随后经 leader 复制追平成员表）。
+    let handles: Vec<_> = nodes
+        .iter()
+        .map(|n| {
+            let seed = seed.clone();
+            let raft = n.raft.clone();
+            tokio::spawn(async move { raft.initialize(seed).await })
+        })
+        .collect();
+    let mut initialized = 0usize;
+    for h in handles {
+        match h.await.unwrap() {
+            Ok(()) => initialized += 1,
+            Err(dsh_raft::openraft::error::RaftError::APIError(
+                dsh_raft::openraft::error::InitializeError::NotAllowed(_),
+            )) => {
+                // 良性：并发初始化中未抢到首写，等待 leader 复制追平
+            }
+            Err(e) => panic!("initialize failed: {e:?}"),
+        }
+    }
+    assert!(initialized >= 1, "at least one node must initialize");
+
+    // 等待选出 leader（全员 voter，无 promote）
+    let leader = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut leader = None;
+        while std::time::Instant::now() < deadline {
+            for n in &nodes {
+                if let Some(l) = n.raft.current_leader().await {
+                    leader = Some(l);
+                    break;
+                }
+            }
+            if leader.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        leader.expect("static map bootstrap should elect a leader")
+    };
+
+    // 写 + 三节点复制
+    let leader_raft = network.get(&leader).expect("leader raft");
+    let resp = client_write(
+        &leader_raft,
+        Command::ProjectCreate {
+            name: "static-map".into(),
+            operator: String::new(),
+            ts: 0,
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(resp.as_ref().unwrap().is_ok(), "write failed: {resp:?}");
+    assert!(
+        wait_until(
+            || nodes.iter().all(|n| sm_has_project(&n.sm, "static-map")),
+            Duration::from_secs(5),
+        )
+        .await,
+        "static-map project should replicate to all nodes"
+    );
+
+    for n in nodes {
+        let _ = std::fs::remove_dir_all(&n.dir);
+        drop(n.raft);
+    }
+}
