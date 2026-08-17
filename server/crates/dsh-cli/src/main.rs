@@ -111,8 +111,9 @@ struct Cli {
     /// 共享发布级联模式（G1/D36）：auto=自动级联引用分支（默认）| manual=只更共享版本
     #[arg(long, value_enum, default_value_t = CascadeArg::Auto)]
     shared_cascade: CascadeArg,
-    /// 读取模式（G1/D37）：linear=ReadIndex 门控读已提交（默认）| stale=本地直读
-    #[arg(long, value_enum, default_value_t = ReadArg::Linear)]
+    /// 读取模式（G1/D37 修订）：stale=本地直读（默认，零破坏）| linear=ReadIndex 门控
+    /// （集群下 follower 读返回 ERR_LEADER_REDIRECT + leader http，客户端跟随）
+    #[arg(long, value_enum, default_value_t = ReadArg::Stale)]
     read_mode: ReadArg,
     /// 管理员密码（缺省首启随机生成并打印；admin 客户端模式用于登录）
     #[arg(long, global = true)]

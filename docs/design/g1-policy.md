@@ -67,19 +67,22 @@ Command::SharedPublish { …, #[serde(default)] cascade: SharedCascadeMode }
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ReadMode { #[default] Linear, Stale }
-// ApiState 加 pub read_mode: ReadMode（默认 Linear；pub 字段，main 构造后设置，不破坏构造函数签名）
+pub enum ReadMode { #[default] Stale, Linear }   // 修订：默认 Stale（见下）
+// ApiState 加 pub read_mode: ReadMode（pub 字段，main 构造后设置，不破坏构造函数签名）
 ```
 
-- **linear（默认）**：同步读入口在读 sm 前先 `raft.ensure_linearizable().await`
-  （openraft 0.9 ReadIndex：leader 上立即、follower 上向 quorum 确认后等已提交）→ 本地读；
-  dev-single（无 raft）→ 恒满足直接读；
-- **stale**：直接本地读（现状）；
-- **覆盖入口**（全部同步读，避免"部分 linear 部分 stale"的混乱）：
-  HTTP snapshot / render_config / admin_config / branch_diff / promote 读取 / gRPC get_config / get_item；
-  watch 是事件流（apply 后广播 + 已提交重放），不适用 ReadIndex，保持现状；
-- **实现**：`ApiState::linearized_read()` 辅助（linear && raft.is_some() → ensure_linearizable），
-  各读 handler 开头调用；ensure_linearizable 失败（无 quorum）→ 读返回 503/错误（线性读不可用）。
+- **默认 Stale（修订）**：本地直接读（现状，零破坏）。design-v2 草案的 "linear 默认" 落空原因：
+  linear 需要读转发链路（见下），默认启用会破坏多节点集群下既有 SDK 的 follower 读
+  （读请求变成 428 重定向，SDK 尚无读跟随逻辑）；
+- **linear（显式开启）**：读前 `raft.ensure_linearizable()`（openraft 0.9 ReadIndex）。
+  **openraft 0.9 无 follower 侧 ReadIndex**——follower 上 `ensure_linearizable` 返回
+  `CheckIsLeaderError::ForwardToLeader`。处理：**复用写路径重定向机制**——
+  返回 `ERR_LEADER_REDIRECT`（HTTP 428）+ leader_hint = leader http_addr，客户端跟随；
+  leader 上 ensure_linearizable 通过后本地读；dev-single（无 raft）恒满足；
+- **覆盖入口**（全部同步读）：HTTP snapshot / render_config / admin_config / branch_diff /
+  gRPC get_config / get_item；watch 是事件流（apply 后广播 + 已提交重放），不适用；
+- **实现**：`ApiState::linearized_read()` 辅助 + `leader_http_hint()`（从
+  ForwardToLeader 提取 leader http）；各读 handler 开头调用。
 
 ---
 

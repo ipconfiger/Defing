@@ -387,13 +387,15 @@ pub enum SharedCascadeMode {
     Manual,
 }
 
-/// 读取模式（G1/D37：节点配置，读不产生日志无确定性问题）。
-/// 默认 Linear = 读前 ReadIndex 门控（读已提交）；Stale = 本地直接读（可能稍旧）。
+/// 读取模式（G1/D37 修订：节点配置，读不产生日志无确定性问题）。
+/// 默认 Stale = 本地直接读（现状，零破坏）；Linear = 读前 ReadIndex 门控（读已提交）——
+/// 集群下 follower 的 ensure_linearizable 返回 ForwardToLeader（openraft 0.9 无 follower
+/// 侧 ReadIndex）→ 复用写路径重定向：ERR_LEADER_REDIRECT + leader http（客户端跟随）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReadMode {
     #[default]
-    Linear,
     Stale,
+    Linear,
 }
 
 /// 跨项目共享项（集群级）。

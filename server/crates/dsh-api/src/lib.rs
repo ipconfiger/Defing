@@ -138,7 +138,7 @@ impl ApiState {
             login_throttle: std::sync::Arc::new(LoginThrottle::new()),
             trusted_proxies,
             data_plane_token,
-            read_mode: dsh_core::model::ReadMode::Linear,
+            read_mode: dsh_core::model::ReadMode::Stale,
         }
     }
 
@@ -146,14 +146,32 @@ impl ApiState {
     /// G1/D37：线性读门控——Linear 模式 + 集群下先做 ReadIndex（ensure_linearizable），
     /// 保证读已提交；Stale 或 dev-single 直接返回（本地读）。
     pub async fn linearized_read(&self) -> Result<(), ApiError> {
-        if self.read_mode == dsh_core::model::ReadMode::Linear {
-            if let Some(raft) = &self.raft {
-                raft.ensure_linearizable().await.map_err(|e| {
-                    ApiError(dsh_core::Error::internal(format!("linearized read: {e}")))
-                })?;
+        if self.read_mode != dsh_core::model::ReadMode::Linear {
+            return Ok(());
+        }
+        let Some(raft) = &self.raft else {
+            return Ok(()); // dev-single：无 raft，恒满足
+        };
+        match raft.ensure_linearizable().await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // 修订（openraft 0.9 无 follower 侧 ReadIndex）：follower 返回
+                // ForwardToLeader → 复用写路径重定向（ERR_LEADER_REDIRECT + leader http）
+                if let Some(hint) = leader_http_hint(&e) {
+                    Err(ApiError(
+                        dsh_core::Error::new(
+                            dsh_core::ErrorKind::LeaderRedirect,
+                            "linear read: forward to leader",
+                        )
+                        .with_leader_hint(hint),
+                    ))
+                } else {
+                    Err(ApiError(dsh_core::Error::internal(format!(
+                        "linearized read failed: {e}"
+                    ))))
+                }
             }
         }
-        Ok(())
     }
 
     async fn write(&self, cmd: &Command, now_ms: i64) -> Result<dsh_raft::WriteOutcome, ApiError> {
@@ -2081,6 +2099,24 @@ async fn version_history(
         .version_history(&ProjectId(pid), &BranchName(branch))
         .map_err(ApiError::from)?;
     Ok(Json(serde_json::to_value(versions).expect("serialize")))
+}
+
+/// G1/D37：从 ensure_linearizable 错误中提取 leader http_addr（ForwardToLeader 时）。
+fn leader_http_hint(
+    e: &dsh_raft::openraft::error::RaftError<
+        u64,
+        dsh_raft::openraft::error::CheckIsLeaderError<u64, dsh_raft::NodeInfo>,
+    >,
+) -> Option<String> {
+    match e {
+        dsh_raft::openraft::error::RaftError::APIError(check) => {
+            if let dsh_raft::openraft::error::CheckIsLeaderError::ForwardToLeader(f) = check {
+                return f.leader_node.as_ref().map(|n| n.http_addr.clone());
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 // ---------------- 数据面快照（纯值输出） ----------------
