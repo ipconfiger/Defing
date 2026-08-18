@@ -614,6 +614,64 @@ textarea.code { min-height: 140px; }
   box-shadow: var(--shadow-md);
 }
 
+/* ---------- 12b. 结构编辑器（组 → 配置项） ---------- */
+.struct-ghead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.struct-ghead .gname-in { max-width: 260px; font-weight: 600; }
+.struct-ghead .spacer { flex: 1; }
+
+.srow {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) 108px 82px 74px 32px;
+  gap: 10px;
+  align-items: center;
+  padding: 6px 0;
+  border-top: 1px solid var(--border);
+}
+.srow:first-child { border-top: 0; }
+.srow.srow-head {
+  padding: 2px 0 6px;
+  border-top: 0;
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+.srow .icon-btn { justify-self: end; }
+.srow .sel { font-size: 12.5px; padding: 4px 26px 4px 8px; }
+.srow-head .req-lab, .srow-head .sec-lab { text-align: center; }
+.srow .check { justify-self: center; }
+.addgroup-btn {
+  border-style: dashed;
+  border-color: var(--border-strong);
+  margin-top: 12px;
+  height: 38px;
+}
+.ty {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--fg-faint);
+  font-family: var(--mono);
+}
+#ni-type-cascade .ty {
+  padding: 5px 10px;
+  background: var(--surface-2);
+  border-radius: 7px;
+  color: var(--fg-muted);
+}
+.struct-item-empty { padding: 10px 0 4px; color: var(--fg-faint); font-size: 12.5px; }
+
+@media (max-width: 1024px) {
+  .srow { grid-template-columns: minmax(120px, 1fr) 96px 64px 64px 32px; gap: 8px; }
+  .struct-ghead .gname-in { max-width: 200px; }
+}
+
 /* ---------- 13. 灰度 ---------- */
 .gray-strip {
   display: flex;

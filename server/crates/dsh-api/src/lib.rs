@@ -763,6 +763,32 @@ async fn get_structure_draft(
     }
 }
 
+/// 已发布结构查询（级联选择器数据源）。
+async fn get_published_structure(
+    State(app): State<ApiState>,
+    AxumPath(pid): AxumPath<String>,
+) -> ApiResult<serde_json::Value> {
+    let sm = app.sm.read().map_err(lock_err)?;
+    if sm
+        .get_project(&ProjectId(pid.clone()))
+        .map_err(ApiError::from)?
+        .is_none()
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorBody {
+                code: "ERR_NOT_FOUND".into(),
+                message: "project not found".into(),
+                detail: None,
+            }),
+        ));
+    }
+    match sm.get_structure(&ProjectId(pid)).map_err(ApiError::from)? {
+        Some(st) => Ok(Json(serde_json::to_value(st).expect("serialize"))),
+        None => Ok(Json(serde_json::json!({ "version": 0, "groups": [] }))),
+    }
+}
+
 async fn set_structure_draft(
     principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
@@ -3798,6 +3824,10 @@ pub fn build_router(app: ApiState) -> Router {
         .route(
             "/api/v1/projects/{p}/structure-draft/publish",
             post(publish_structure),
+        )
+        .route(
+            "/api/v1/projects/{p}/structure",
+            get(get_published_structure),
         )
         .route("/api/v1/projects/{p}/branches/{b}/draft", put(update_draft))
         .route("/api/v1/projects/{p}/branches/{b}/publish", post(publish))

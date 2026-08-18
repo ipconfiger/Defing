@@ -31,6 +31,10 @@ const S = {
   // 未保存编辑保护：结构 textarea / 灰度规则有用户输入时，后台刷新不覆盖
   structDirty: false, structProj: '',
   grayDirty: false, grayBranch: '',
+  // 结构：编辑器工作副本 / 已发布结构（GET /structure 实时拉取，权威）
+  structDraft: null,          // {base_version, groups:[{name, items:[...]}]}
+  pubStruct: null,            // {version, groups} 最近拉取的已发布结构（值新增级联首选源 + 无草稿时的基线）
+  defs: { src: 'none', groups: [] }, // 值新增选择器数据源：①已发布 > ②结构草稿 > ③自由输入回退
 };
 
 /* ---------------- 请求层 ---------------- */
@@ -124,7 +128,7 @@ function initTheme() {
 }
 
 /* ---------------- 弹窗（确认 / 输入） ---------------- */
-let modalCb = null;
+let modalCb = null, modalCancelCb = null;
 function openModal(o) {
   $('modal-title').textContent = o.title || '确认';
   const msg = $('modal-msg');
@@ -142,10 +146,16 @@ function openModal(o) {
   ok.textContent = o.okText || '确定';
   ok.className = 'btn ' + (o.danger ? 'danger' : 'primary');
   modalCb = o.onOk || null;
+  modalCancelCb = o.onCancel || null;
   $('modal-overlay').classList.remove('hidden');
   if (o.input) input.focus(); else ok.focus();
 }
-function closeModal() { $('modal-overlay').classList.add('hidden'); modalCb = null; }
+function closeModal(committed) {
+  $('modal-overlay').classList.add('hidden');
+  const cc = modalCancelCb;
+  modalCb = null; modalCancelCb = null;
+  if (!committed && cc) cc(); // 取消 / Esc / 点遮罩 → 回滚类回调（如恢复组名）
+}
 
 /* ============================================================
    动作表（data-act 委托）
@@ -249,6 +259,8 @@ actions.selectProject = function (el) {
   S.project = id;
   S.branch = '';
   S.gray = null;
+  S.structV = 0;
+  S.pubStruct = null; // 切项目：立即丢弃旧项目数据，待 loadProject 拉取新项目的已发布结构
   stopWatch();
   renderProjects();
   loadProject();
@@ -317,24 +329,28 @@ async function loadProject() {
     const [bs, struct] = await Promise.all([
       j('GET', `/api/v1/projects/${S.project}/branches`),
       j('GET', `/api/v1/projects/${S.project}/structure-draft`),
+      loadPublishedStruct(),          // 已发布结构（级联首选源 + 无草稿时的权威基线）
     ]);
     S.branches = bs || [];
     renderBranchSelects();
-    // 结构 textarea 自动填充（切换项目或未编辑时；有未保存编辑则不覆盖）
-    if (!S.structDirty || S.structProj !== S.project) {
-      $('struct-draft').value = JSON.stringify(struct ?? { base_version: null, groups: [] }, null, 2);
-      hideErr('struct-err');
-      S.structDirty = false;
-    }
-    S.structProj = S.project;
+    applyServerStructDraft(struct);      // 规范化服务端草稿（无草稿 → 以已发布结构为基线与编辑起点）
+    recomputeDefs();                     // 值新增级联数据源：①已发布 ②草稿 ③自由输入
     if (S.branches.length) {
       const target = S.branches.some((b) => b.name === S.branch) ? S.branch : S.branches[0].name;
       $('sel-branch').value = target;
-      loadBranch();
+      await loadBranch();                // 先取分支详情（刷新 S.structV 徽章），与已发布版本交叉校验
     } else {
       S.branch = '';
       renderNoBranch();
     }
+    // 结构编辑器自动填充（切换项目或未编辑时；有未保存编辑则不覆盖）
+    if (!S.structDirty || S.structProj !== S.project) {
+      applyServerStructDraft(struct);
+      renderStructEditor();
+      hideErr('struct-err');
+      S.structDirty = false;
+    }
+    S.structProj = S.project;
   } catch (e) {
     if (!e.expired) toast(e.message, 'err');
   }
@@ -342,12 +358,14 @@ async function loadProject() {
 
 function renderNoBranch() {
   S.version = 0; S.structV = 0; S.draftRev = 0; S.gray = null;
+  S.draftValKeys = {};
   renderCtxBadges();
   $('draft-rev').textContent = 'r0';
   $('draft-groups').innerHTML =
     '<div class="empty mini"><svg class="ic"><use href="#i-branch"/></svg><h4>暂无分支</h4><p>新建分支后即可编辑草稿。</p></div>';
   $('versions-body').innerHTML = '';
   $('gray-summary').innerHTML = '<span class="muted small">选择分支后加载灰度状态</span>';
+  renderValueAddForm();
 }
 
 actions.selectBranch = function () { loadBranch(); }; // 仅响应 change（CHANGE_ONLY 过滤了 click）
@@ -414,6 +432,7 @@ async function loadBranch() {
     S.structV = b.structure_version || 0;
     renderCtxBadges();
     renderDraftEditor(b);
+    renderValueAddForm(); // 分支草稿变化 → 「已有草稿值」标记刷新
     loadGrayStatus();
     if (S.watchES) { stopWatch(); startWatch(); } // 切换分支后订阅跟随当前分支
   } catch (e) {
@@ -453,10 +472,12 @@ function renderDraftEditor(b) {
   S.draftRev = b.draft_rev || 0;
   $('draft-rev').textContent = 'r' + S.draftRev;
   const groups = Object.keys(b.draft || {});
-  $('group-list').innerHTML = groups.map((g) => `<option value="${esc(g)}"></option>`).join('');
+  // 现有草稿值索引（级联选择器标注「已有草稿值」）
+  S.draftValKeys = {};
+  for (const g of groups) for (const k of Object.keys(b.draft[g] || {})) S.draftValKeys[g + '/' + k] = true;
   if (!groups.length) {
     $('draft-groups').innerHTML =
-      '<div class="empty mini"><svg class="ic"><use href="#i-inbox"/></svg><h4>暂无草稿项</h4><p>在结构中定义后发布，或直接在下方添加配置项。</p></div>';
+      '<div class="empty mini"><svg class="ic"><use href="#i-inbox"/></svg><h4>暂无草稿项</h4><p>在下方选择组与配置项添加值；配置项需先在「结构」页定义并发布。</p></div>';
     return;
   }
   $('draft-groups').innerHTML = groups.map((g) => {
@@ -481,12 +502,200 @@ function buildValue(ty, raw) {
   }
 }
 
+/* ---------- 添加配置项（级联选择：组 → key → 按类型渲染值输入） ---------- */
+const TYPES = ['string', 'int', 'float', 'bool', 'json', 'array', 'secret'];
+
+// 已发布结构（GET /api/v1/projects/{p}/structure，权威）：值新增级联首选源 + 无草稿时的编辑基线。
+// 拉取失败 / 空分组 → 级联回退结构草稿 / 自由输入；基线回退分支 sv 徽章。
+async function loadPublishedStruct() {
+  if (!S.project) return;
+  try {
+    const p = await j('GET', `/api/v1/projects/${S.project}/structure`);
+    S.pubStruct = {
+      version: Number(p && p.version) || 0,
+      groups: normalizeGroups((p && p.groups) || []),
+    };
+  } catch (_) {
+    S.pubStruct = null; // 端点不可用/暂态失败 → 走 ②③ 回退（401 已由 j() 统一处理会话过期）
+  }
+}
+
+// 当前结构版本基线：已发布结构端点为权威，分支 sv 徽章交叉校验 / 回退（PUT base_version 须等于它）
+function structBaseline() {
+  const pv = S.pubStruct && typeof S.pubStruct.version === 'number' ? S.pubStruct.version : 0;
+  return pv || S.structV || 0;
+}
+
+function cloneGroups(gs) { return normalizeGroups(gs); }
+
+// 服务端 ItemDef 仅 key/type/required/secret（+可选 validate 等）；未知字段原样保留，JSON 往返不丢数据
+function extraItemFields(it) {
+  if (!it || typeof it !== 'object') return {};
+  const out = {};
+  for (const [k, v] of Object.entries(it)) {
+    if (k !== 'key' && k !== 'type' && k !== 'required' && k !== 'secret' && v !== undefined && v !== null) out[k] = v;
+  }
+  return out;
+}
+
+function normalizeGroups(gs) {
+  return (Array.isArray(gs) ? gs : []).map((g) => ({
+    name: String(g && g.name != null ? g.name : ''),
+    items: (g && Array.isArray(g.items) ? g.items : []).map((it) => ({
+      key: String(it && it.key != null ? it.key : ''),
+      type: TYPES.includes(it && it.type) ? it.type : 'string',
+      required: !!(it && it.required),
+      secret: !!(it && it.secret),
+      __extra: extraItemFields(it),
+    })),
+  }));
+}
+
+function serializeGroups(gs) {
+  return gs.map((g) => ({
+    name: g.name,
+    items: g.items.map((it) => ({ ...it.__extra, key: it.key, type: it.type, required: it.required, secret: it.secret })),
+  }));
+}
+
+// 规范化服务端结构草稿；base_version=null（无草稿）时以已发布结构为基线与编辑起点
+// （GET /structure 的 version 为权威，与分支 sv 徽章交叉校验）—— PUT 要求 base_version 为 u64 且等于当前结构版本
+function applyServerStructDraft(d) {
+  const noDraft = d === null || d === undefined || d.base_version === null || d.base_version === undefined;
+  S.structDraft = {
+    base_version: noDraft ? structBaseline() : Number(d.base_version),
+    groups: noDraft
+      ? cloneGroups((S.pubStruct && S.pubStruct.groups) || [])
+      : normalizeGroups(d.groups),
+  };
+}
+
+// 值新增的级联数据源（草稿值按「已发布结构」校验，服务端 unknown item → 422）：
+// ① GET /structure 已发布结构（权威，首选）→ ② 结构草稿（标注未发布）→ ③ 自由输入回退
+function recomputeDefs() {
+  const pub = S.pubStruct && S.pubStruct.groups;
+  if (pub && pub.length) S.defs = { src: 'published', groups: pub };
+  else if (S.structDraft && S.structDraft.groups.length) S.defs = { src: 'draft', groups: S.structDraft.groups };
+  else S.defs = { src: 'none', groups: [] };
+}
+
+const VAL_HINTS = {
+  string: '字符串值',
+  int: '整数',
+  float: '数值（可带小数）',
+  bool: '勾选 = true，取消 = false',
+  json: '填入合法 JSON 文本',
+  array: '多个值用逗号分隔',
+  secret: '输入明文，由服务端加密存储；留空不修改',
+};
+
+function addValueControlHtml(ty) {
+  const base = 'id="new-item-val" class="in mono"';
+  if (ty === 'bool') return `<label class="check"><input type="checkbox" id="new-item-val"> 启用（true）</label>`;
+  if (ty === 'int') return `<input type="number" step="1" ${base} placeholder="如 100">`;
+  if (ty === 'float') return `<input type="number" step="any" ${base} placeholder="如 0.5">`;
+  if (ty === 'json') return `<textarea ${base} rows="3" spellcheck="false" placeholder='{"retries": 3}'></textarea>`;
+  if (ty === 'array') return `<input ${base} placeholder="a, b, c（逗号分隔）">`;
+  if (ty === 'secret') return `<input type="password" ${base} placeholder="输入明文，由服务端加密存储" autocomplete="new-password">`;
+  return `<input ${base} placeholder="字符串值">`;
+}
+
+function setAddValueType(ty) {
+  $('new-item-val-wrap').innerHTML = addValueControlHtml(ty);
+  $('new-item-hint').textContent = '类型 ' + ty + ' · ' + (VAL_HINTS[ty] || '');
+}
+
+function renderValueAddForm() {
+  const cascade = S.defs.src !== 'none';
+  $('ni-group-cascade').classList.toggle('hidden', !cascade);
+  $('ni-key-cascade').classList.toggle('hidden', !cascade);
+  $('ni-type-cascade').classList.toggle('hidden', !cascade);
+  $('ni-group-fallback').classList.toggle('hidden', cascade);
+  $('ni-key-fallback').classList.toggle('hidden', cascade);
+  $('ni-type-fallback').classList.toggle('hidden', cascade);
+  if (!cascade) {
+    // 回退：结构尚未定义 —— 保留自由输入（服务端按已发布结构校验，未知项会被拒）
+    $('new-item-hint').textContent = '';
+    const cur = $('new-item-type') ? $('new-item-type').value : 'string';
+    setAddValueType(cur);
+    const hint = $('ni-group-fallback').closest('.card').querySelector('.addcard-title');
+    if (hint && !document.getElementById('fallback-note')) {
+      const p = document.createElement('p');
+      p.id = 'fallback-note';
+      p.className = 'hint';
+      p.style.margin = '-8px 0 10px';
+      p.textContent = '当前没有可用的结构定义：建议先在「结构」页定义组与配置项并发布，此处即可级联选择。';
+      hint.after(p);
+    }
+    return;
+  }
+  const note = document.getElementById('fallback-note');
+  if (note) note.remove();
+  // 组下拉（保持之前选择）
+  const gs = $('new-item-group');
+  const prevG = gs.value;
+  gs.innerHTML = S.defs.groups.map((g) => `<option value="${esc(g.name)}">${esc(g.name)}（${g.items.length} 项）</option>`).join('');
+  if (prevG && S.defs.groups.some((g) => g.name === prevG)) gs.value = prevG;
+  populateKeySel();
+  if (S.defs.src === 'published') {
+    $('new-item-hint').textContent = '选项来自已发布结构 sv' + (S.pubStruct ? S.pubStruct.version : '?');
+  } else if (S.defs.src === 'draft') {
+    $('new-item-hint').textContent = '以下定义来自未发布的结构草稿；新增值前请先在「结构」页发布，否则会被服务端拒绝。';
+  }
+}
+
+function populateKeySel() {
+  const g = S.defs.groups.find((x) => x.name === $('new-item-group').value);
+  const ks = $('new-item-key');
+  const prevK = ks.value;
+  if (!g || !g.items.length) {
+    ks.innerHTML = '<option value="">（该组暂无配置项）</option>';
+    setAddValueType('string');
+    return;
+  }
+  const draftKeys = S.draftValKeys || {};
+  ks.innerHTML = g.items.map((it) => {
+    const has = draftKeys[g.name + '/' + it.key] ? ' · 已有草稿值' : '';
+    return `<option value="${esc(it.key)}">${esc(it.key)} · ${esc(it.type)}${esc(has)}</option>`;
+  }).join('');
+  if (prevK && g.items.some((it) => it.key === prevK)) ks.value = prevK;
+  const def = g.items.find((it) => it.key === ks.value);
+  setAddItemTypeShow(def ? def.type : g.items[0].type);
+}
+
+function setAddItemTypeShow(ty) {
+  const el = $('new-item-type-show');
+  const lock = ty === 'secret' ? '<svg class="ic ic-xs"><use href="#i-lock"/></svg>' : '';
+  el.innerHTML = lock + esc(ty);
+  setAddValueType(ty);
+}
+
+actions.cascadeGroup = function () { populateKeySel(); }; // 仅响应 change
+actions.cascadeKey = function () {
+  const g = S.defs.groups.find((x) => x.name === $('new-item-group').value);
+  const def = g && g.items.find((it) => it.key === $('new-item-key').value);
+  if (def) setAddItemTypeShow(def.type);
+}; // 仅响应 change
+actions.addItemType = function (el) { setAddValueType(el.value); }; // 仅响应 change（回退模式类型下拉）
+
 actions.addDraftItem = async function (el) {
-  const g = $('new-item-group').value.trim();
-  const k = $('new-item-key').value.trim();
-  const ty = $('new-item-type').value;
-  const raw = $('new-item-val').value;
-  if (!g || !k) { showErr('add-item-err', '组与 key 必填'); return; }
+  const cascading = S.defs.src !== 'none';
+  let g, k, ty;
+  if (cascading) {
+    g = $('new-item-group').value;
+    k = $('new-item-key').value;
+    if (!g || !k) { showErr('add-item-err', '请选择组与配置项'); return; }
+    const grp = S.defs.groups.find((x) => x.name === g);
+    const def = grp && grp.items.find((it) => it.key === k);
+    ty = def ? def.type : 'string';
+  } else {
+    g = $('new-item-group-ft').value.trim();
+    k = $('new-item-key-ft').value.trim();
+    ty = $('new-item-type').value;
+    if (!g || !k) { showErr('add-item-err', '组与 key 必填'); return; }
+  }
+  const valEl = $('new-item-val');
+  const raw = (!valEl || valEl.type === 'checkbox') ? ((valEl && valEl.checked) ? 'true' : 'false') : valEl.value;
   let value;
   try { value = buildValue(ty, raw); } catch (e) { showErr('add-item-err', e.message); return; }
   hideErr('add-item-err');
@@ -495,7 +704,11 @@ actions.addDraftItem = async function (el) {
       await j('PUT', `/api/v1/projects/${S.project}/branches/${S.branch}/draft`, { updates: [{ group: g, key: k, value }], deletes: [] });
       toast('草稿项已添加');
       loadBranch();
-    } catch (e) { if (!e.expired) toast(e.message, 'err'); }
+    } catch (e) {
+      if (!e.expired) {
+        toast(e.message.includes('unknown item') ? '服务端没有该配置项定义：请先在「结构」页定义并发布' : e.message, 'err');
+      }
+    }
   });
 };
 
@@ -839,55 +1052,338 @@ actions.doRollback = function (el) {
   });
 };
 
-/* ---------- 结构 ---------- */
-actions.loadStructDraft = async function (el) {
-  if (!S.project) return;
-  await withBusy(el, async () => {
-    try {
-      const d = await j('GET', `/api/v1/projects/${S.project}/structure-draft`);
-      $('struct-draft').value = JSON.stringify(d, null, 2);
-      hideErr('struct-err');
-      S.structDirty = false; // 显式载入 = 以服务端为准
-      toast('已载入当前结构');
-    } catch (e) { if (!e.expired) toast(e.message, 'err'); }
+/* ---------- 结构（组 → 配置项 结构化编辑器 + JSON 模式） ---------- */
+const NAME_RE = /^[A-Za-z0-9._-]+$/;   // 镜像服务端 valid_key_name 字符集
+const NAME_MAX = 128;                  // MAX_KEY_BYTES / MAX_GROUP_NAME_BYTES
+const GROUP_LIMIT = 500;               // MAX_GROUPS_PER_PROJECT
+const ITEM_LIMIT = 10000;              // MAX_ITEMS_PER_PROJECT
+
+function structJsonActive() { return !$('struct-draft').classList.contains('hidden'); }
+function markStructDirty() { S.structDirty = true; }
+
+function syncStructJsonTextarea() {
+  $('struct-draft').value = JSON.stringify(
+    { base_version: S.structDraft.base_version, groups: serializeGroups(S.structDraft.groups) }, null, 2);
+}
+
+function renderStructEditor() {
+  const d = S.structDraft;
+  if (!d) return;
+  $('struct-base').textContent = 'sv' + d.base_version;
+  // 滞后判定：与 structBaseline()（已发布结构版本为权威，分支 sv 交叉校验）比较
+  const stale = d.base_version !== structBaseline();
+  $('struct-stale').classList.toggle('hidden', !stale);
+  $('struct-base-badge').classList.toggle('warn', stale);
+  if (structJsonActive()) { syncStructJsonTextarea(); return; }
+  if (!d.groups.length) {
+    $('struct-groups').innerHTML = '';
+    $('struct-empty').classList.remove('hidden');
+    return;
+  }
+  $('struct-empty').classList.add('hidden');
+  $('struct-groups').innerHTML = d.groups.map((g, gi) => structGroupHtml(g, gi)).join('');
+}
+
+function structGroupHtml(g, gi) {
+  const head = '<div class="srow srow-head"><span>配置项 key</span><span>类型</span><span class="req-lab">required</span><span class="sec-lab">secret</span><span></span></div>';
+  const rows = g.items.length
+    ? head + g.items.map((it, ii) => structItemRowHtml(it, gi, ii)).join('')
+    : '<div class="struct-item-empty">暂无配置项，点击右上「配置项」添加</div>';
+  return `<div class="card gcard struct-group" data-gi="${gi}">
+    <div class="struct-ghead">
+      <input class="in mono gname-in" data-sf="gname" data-act="renameStructGroup" data-orig="${esc(g.name)}" value="${esc(g.name)}" placeholder="分组名（字母 / 数字 / . _ -）" spellcheck="false">
+      <span class="badge">${g.items.length} 项</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn sm ghost" data-act="addStructItem" data-gi="${gi}"><svg class="ic ic-xs"><use href="#i-plus"/></svg>配置项</button>
+      <button type="button" class="icon-btn danger" data-act="delStructGroup" data-gi="${gi}" title="删除组" aria-label="删除组"><svg class="ic"><use href="#i-trash"/></svg></button>
+    </div>
+    <div>${rows}</div>
+  </div>`;
+}
+
+function structItemRowHtml(it, gi, ii) {
+  const tyOpts = TYPES.map((t) => `<option value="${t}"${t === it.type ? ' selected' : ''}>${t}</option>`).join('');
+  return `<div class="srow">
+    <input class="in mono" data-sf="ikey" value="${esc(it.key)}" placeholder="key（字母 / 数字 / . _ -）" spellcheck="false">
+    <select class="sel" data-act="structType" title="值类型">${tyOpts}</select>
+    <label class="check" title="发布前必须有值"><input type="checkbox" data-sf="ireq" ${it.required ? 'checked' : ''}></label>
+    <label class="check" title="敏感值（类型须为 secret）"><input type="checkbox" data-sf="isec" data-act="structSecret" ${it.secret ? 'checked' : ''}></label>
+    <button type="button" class="icon-btn danger" data-act="delStructItem" data-gi="${gi}" data-ii="${ii}" title="删除配置项" aria-label="删除配置项"><svg class="ic"><use href="#i-trash"/></svg></button>
+  </div>`;
+}
+
+// 纯校验（镜像服务端 validate_structure：字符集 / 长度 / 重名 / secret 依赖类型 / 限额）
+function validateGroups(groups) {
+  const errs = [];
+  const nameErr = (label, v) => {
+    if (!v) return label + '不能为空';
+    if (v.length > NAME_MAX) return label + '超过 128 字节上限';
+    if (!NAME_RE.test(v)) return label + '「' + v + '」仅允许字母、数字与 . _ -';
+    return '';
+  };
+  if (groups.length > GROUP_LIMIT) errs.push('分组数量超过上限（' + GROUP_LIMIT + '）');
+  const seenG = new Set();
+  let total = 0;
+  for (const g of groups) {
+    const ge = nameErr('组名', g.name);
+    if (ge) errs.push(ge);
+    if (g.name && seenG.has(g.name)) errs.push('分组名重复：' + g.name);
+    seenG.add(g.name);
+    const seen = new Set();
+    for (const it of g.items) {
+      const where = (g.name || '未命名组') + '/' + (it.key || '（未填 key）');
+      const ke = nameErr('key ', it.key);
+      if (ke) errs.push(where + '：' + ke);
+      else if (seen.has(it.key)) errs.push((g.name || '未命名组') + '/' + it.key + '：key 重复');
+      seen.add(it.key);
+      if (it.secret && it.type !== 'secret') errs.push(where + '：勾选 secret 需将类型设为 secret');
+    }
+    total += g.items.length;
+  }
+  if (total > ITEM_LIMIT) errs.push('配置项总数超过上限（' + ITEM_LIMIT + '）');
+  return errs;
+}
+
+// DOM → 模型（不校验，供渲染前同步，防止重建卡片丢失未保存输入）
+function collectStructDraft() {
+  const groups = [];
+  for (const card of $$('#struct-groups .struct-group')) {
+    const nameIn = card.querySelector('[data-sf="gname"]');
+    const items = [];
+    for (const row of card.querySelectorAll('.srow:not(.srow-head)')) {
+      const keyIn = row.querySelector('[data-sf="ikey"]');
+      const sel = row.querySelector('select[data-act="structType"]');
+      const req = row.querySelector('[data-sf="ireq"]');
+      const sec = row.querySelector('[data-sf="isec"]');
+      items.push({
+        key: keyIn ? keyIn.value.trim() : '',
+        type: sel && TYPES.includes(sel.value) ? sel.value : 'string',
+        required: !!(req && req.checked),
+        secret: !!(sec && sec.checked),
+        __extra: {},
+      });
+    }
+    groups.push({ name: nameIn ? nameIn.value.trim() : '', items });
+  }
+  if (!groups.length && S.structDraft && S.structDraft.groups.length) {
+    // 表单尚未渲染（如 JSON 模式切换中）→ 保留模型
+    return S.structDraft.groups;
+  }
+  return groups;
+}
+
+actions.addStructGroup = function () {
+  S.structDraft.groups = collectStructDraft();
+  S.structDraft.groups.push({ name: '', items: [] });
+  markStructDirty();
+  renderStructEditor();
+  const cards = $$('#struct-groups .struct-group');
+  const last = cards[cards.length - 1];
+  if (last) last.querySelector('[data-sf="gname"]').focus();
+};
+
+actions.delStructGroup = function (el) {
+  const gi = Number(el.dataset.gi);
+  S.structDraft.groups = collectStructDraft();
+  const g = S.structDraft.groups[gi];
+  const name = g ? g.name : '';
+  openModal({
+    title: '删除组' + (name ? '「' + name + '」' : ''),
+    message: '该组下未发布的草稿值将在结构发布后自动清理，已发布版本不受影响。确认删除该组？',
+    okText: '删除组', danger: true,
+    onOk: () => {
+      S.structDraft.groups = collectStructDraft();
+      S.structDraft.groups.splice(gi, 1);
+      markStructDirty();
+      renderStructEditor();
+      toast('组已删除（保存并发布结构后生效）');
+    },
   });
 };
 
-function parseStruct() {
-  try { return { ok: true, data: JSON.parse($('struct-draft').value) }; }
-  catch (e) { return { ok: false, err: e.message }; }
+actions.renameStructGroup = function (el) { // 仅响应 change（失焦确认）
+  const orig = el.dataset.orig || '';
+  const v = el.value.trim();
+  if (v === orig) return;
+  if (!orig) { el.dataset.orig = v; markStructDirty(); return; } // 新组首次命名，无需确认
+  if (!v) { el.value = orig; showErr('struct-err', '组名不能为空，已恢复为「' + orig + '」'); return; }
+  openModal({
+    title: '重命名组',
+    message: `将组「${orig}」重命名为「${v}」？重命名视为删除旧组并新建组，旧组名下的草稿值将在结构发布后清理；已发布版本不受影响。`,
+    okText: '重命名', danger: true,
+    onOk: () => { el.dataset.orig = v; markStructDirty(); },
+    onCancel: () => { el.value = orig; },
+  });
+};
+
+actions.addStructItem = function (el) {
+  const gi = Number(el.dataset.gi);
+  S.structDraft.groups = collectStructDraft();
+  const g = S.structDraft.groups[gi];
+  if (!g) return;
+  g.items.push({ key: '', type: 'string', required: false, secret: false, __extra: {} });
+  markStructDirty();
+  renderStructEditor();
+  const cards = $$('#struct-groups .struct-group');
+  const card = cards[gi];
+  if (card) {
+    const rows = card.querySelectorAll('.srow:not(.srow-head) [data-sf="ikey"]');
+    const inp = rows[rows.length - 1];
+    if (inp) inp.focus();
+  }
+};
+
+actions.delStructItem = function (el) {
+  const gi = Number(el.dataset.gi), ii = Number(el.dataset.ii);
+  S.structDraft.groups = collectStructDraft();
+  const g = S.structDraft.groups[gi];
+  const it = g && g.items[ii];
+  const label = (g ? g.name : '') + '/' + (it ? it.key || '（未填 key）' : '');
+  openModal({
+    title: '删除配置项 ' + label,
+    message: '该配置项未发布的草稿值将在结构发布后自动清理，已发布版本不受影响。确认删除？',
+    okText: '删除', danger: true,
+    onOk: () => {
+      S.structDraft.groups = collectStructDraft();
+      const gg = S.structDraft.groups[gi];
+      if (gg) gg.items.splice(ii, 1);
+      markStructDirty();
+      renderStructEditor();
+      toast('配置项已删除（保存并发布结构后生效）');
+    },
+  });
+};
+
+// 类型 / secret 联动：secret 勾选 → 类型自动切 secret；类型改离 secret → 取消勾选（服务端规则）
+actions.structType = function (el) {
+  if (el.value !== 'secret') {
+    const sec = el.closest('.srow').querySelector('[data-sf="isec"]');
+    if (sec && sec.checked) sec.checked = false;
+  }
+  markStructDirty();
+}; // 仅响应 change
+actions.structSecret = function (el) {
+  if (el.checked) {
+    const sel = el.closest('.srow').querySelector('select[data-act="structType"]');
+    if (sel) sel.value = 'secret';
+  }
+  markStructDirty();
+}; // 仅响应 change
+
+actions.toggleStructJson = function () {
+  if (structJsonActive()) {
+    // JSON → 表单：解析 + 语义校验，未通过则留在 JSON 模式
+    let d;
+    try { d = JSON.parse($('struct-draft').value || '{}'); }
+    catch (e) { showErr('struct-err', 'JSON 非法，无法转回表单：' + e.message); return; }
+    const noBase = d.base_version === null || d.base_version === undefined;
+    S.structDraft = {
+      base_version: noBase ? structBaseline() : Number(d.base_version),
+      groups: normalizeGroups(d.groups),
+    };
+    const errs = validateGroups(S.structDraft.groups);
+    if (errs.length) { showErr('struct-err', '结构定义有误：' + errs.join('；')); return; }
+    hideErr('struct-err');
+    $('struct-draft').classList.add('hidden');   // 先切模式，renderStructEditor 才会渲染表单 DOM
+    $('struct-form').classList.remove('hidden');
+    renderStructEditor();
+    $('btn-struct-mode-label').textContent = 'JSON 模式';
+  } else {
+    S.structDraft.groups = collectStructDraft();
+    syncStructJsonTextarea();
+    hideErr('struct-err');
+    $('struct-form').classList.add('hidden');
+    $('struct-draft').classList.remove('hidden');
+    $('struct-draft').focus();
+    $('btn-struct-mode-label').textContent = '表单模式';
+  }
+};
+
+async function loadStructNow() {
+  try {
+    const [d] = await Promise.all([
+      j('GET', `/api/v1/projects/${S.project}/structure-draft`),
+      loadPublishedStruct(), // 同步刷新已发布结构（基线交叉校验 + 级联源）
+    ]);
+    applyServerStructDraft(d);
+    renderStructEditor();
+    recomputeDefs();
+    renderValueAddForm();
+    hideErr('struct-err');
+    S.structDirty = false;
+    return true;
+  } catch (e) {
+    if (!e.expired) toast(e.message, 'err');
+    return false;
+  }
 }
 
+actions.loadStructDraft = function (el) {
+  withBusy(el, async () => { if (await loadStructNow()) toast('已载入当前结构'); });
+};
+
 actions.saveStructDraft = async function (el) {
-  const p = parseStruct();
-  if (!p.ok) { showErr('struct-err', '结构 JSON 非法：' + p.err); return; }
+  if (!S.project) return;
+  if (structJsonActive()) {
+    // JSON 模式：以 textarea 为准（非法 JSON / 语义错误 → 内联报错，不发请求）
+    let d;
+    try { d = JSON.parse($('struct-draft').value || '{}'); }
+    catch (e) { showErr('struct-err', '结构 JSON 非法：' + e.message); return; }
+    const noBase = d.base_version === null || d.base_version === undefined;
+    S.structDraft = {
+      base_version: noBase ? structBaseline() : Number(d.base_version),
+      groups: normalizeGroups(d.groups),
+    };
+    const errs = validateGroups(S.structDraft.groups);
+    if (errs.length) { showErr('struct-err', errs.join('；')); return; }
+  } else {
+    const groups = collectStructDraft();
+    S.structDraft.groups = groups;
+    const errs = validateGroups(groups);
+    if (errs.length) { showErr('struct-err', errs.join('；')); return; }
+  }
   hideErr('struct-err');
   await withBusy(el, async () => {
     try {
-      await j('PUT', `/api/v1/projects/${S.project}/structure-draft`, p.data);
-      S.structDirty = false; // 已保存，textarea 与服务端一致
+      await j('PUT', `/api/v1/projects/${S.project}/structure-draft`, {
+        base_version: S.structDraft.base_version,
+        groups: serializeGroups(S.structDraft.groups),
+      });
+      S.structDirty = false; // 已保存，与服务端一致
       toast('结构草稿已保存');
-    } catch (e) { if (!e.expired) toast(e.message, 'err'); }
+      recomputeDefs();
+      renderValueAddForm();
+    } catch (e) {
+      if (e.status === 409) {
+        toast('结构已被他人更新（base_version 不匹配），已载入当前结构，请检查后重试', 'warn');
+        loadStructNow();
+      } else if (!e.expired) toast(e.message, 'err');
+    }
   });
 };
 
 actions.publishStruct = function () {
   if (!S.project) return;
-  const p = parseStruct();
-  if (!p.ok) { showErr('struct-err', '结构 JSON 非法：' + p.err); return; }
-  hideErr('struct-err');
+  if (S.structDirty) { showErr('struct-err', '结构有未保存的修改，请先「保存草稿」再发布'); return; }
   openModal({
     title: '发布结构',
-    message: '发布结构将推进全部分支的版本，订阅客户端会收到结构变更事件。',
+    message: '发布结构将推进全部分支的版本；结构中已不存在的组 / 配置项，其未发布的草稿值将被自动清理，已发布版本不受影响。',
     input: true, label: '备注', placeholder: '备注（可选）',
     okText: '发布结构',
     onOk: async (comment) => {
       try {
         const r = await j('POST', `/api/v1/projects/${S.project}/structure-draft/publish`, { comment, request_id: rid() });
-        const s = JSON.stringify(r);
-        toast('结构已发布 ' + (s.length > 90 ? s.slice(0, 90) + '…' : s));
+        // 服务端发布后草稿即删除、结构版本推进；loadProject 内 GET /structure 重拉权威数据
+        // （既作值新增级联源，也作结构编辑器的下一轮基线）
+        S.structDirty = false;
+        toast('结构已发布：' + ((r.affected_branches || []).length) + ' 个分支版本推进');
         loadProject();
-      } catch (e) { if (!e.expired) toast(e.message, 'err'); }
+      } catch (e) {
+        if (e.status === 409) {
+          toast('结构已更新（base_version 不匹配），已载入当前结构，请检查后重试', 'warn');
+          loadStructNow();
+        } else if (!e.expired) toast(e.message, 'err');
+      }
     },
   });
 };
@@ -1163,7 +1659,11 @@ actions.removeNode = function (el) {
 /* ============================================================
    事件绑定与启动
    ============================================================ */
-const CHANGE_ONLY = new Set(['selectBranch', 'cfgFormat', 'cfgReveal']); // 仅响应 change，避免 click 误触发
+const CHANGE_ONLY = new Set([
+  'selectBranch', 'cfgFormat', 'cfgReveal',          // 下拉/复选：仅响应 change，避免 click 误触发
+  'cascadeGroup', 'cascadeKey', 'addItemType',       // 值新增级联选择
+  'structType', 'structSecret', 'renameStructGroup', // 结构编辑器行内控件
+]);
 
 function bindEvents() {
   // data-act 委托（D-CSP：无 onclick 属性）
@@ -1189,11 +1689,11 @@ function bindEvents() {
   $('modal-ok').addEventListener('click', () => {
     const v = $('modal-input').value;
     const cb = modalCb;
-    closeModal();
+    closeModal(true);
     if (cb) cb(v);
   });
-  $('modal-cancel').addEventListener('click', closeModal);
-  $('modal-overlay').addEventListener('mousedown', (e) => { if (e.target === $('modal-overlay')) closeModal(); });
+  $('modal-cancel').addEventListener('click', () => closeModal(false));
+  $('modal-overlay').addEventListener('mousedown', (e) => { if (e.target === $('modal-overlay')) closeModal(false); });
   $('modal-input').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); $('modal-ok').click(); }
   });
@@ -1202,7 +1702,7 @@ function bindEvents() {
   // Esc 关闭弹窗
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
-    if (!$('modal-overlay').classList.contains('hidden')) closeModal();
+    if (!$('modal-overlay').classList.contains('hidden')) closeModal(false);
     else if (!$('cfg-overlay').classList.contains('hidden')) actions.closeCfg();
   });
 
@@ -1211,8 +1711,8 @@ function bindEvents() {
     if (e.key === 'Enter') { e.preventDefault(); loadAudit(); }
   });
 
-  // 未保存编辑标记（结构 / 灰度规则）：有输入时后台刷新不覆盖
-  $('struct-draft').addEventListener('input', () => { S.structDirty = true; });
+  // 未保存编辑标记：结构（表单输入 + JSON textarea）与灰度规则
+  $('pane-structure').addEventListener('input', () => { S.structDirty = true; });
   $('pane-gray').addEventListener('input', (e) => {
     if (e.target.closest('#gray-form') || e.target.id === 'gray-rule') S.grayDirty = true;
   });

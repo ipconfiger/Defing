@@ -152,6 +152,26 @@ paths:
       responses:
         '204': { description: 成功 }
         '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/projects/{p}/structure:
+    get:
+      summary: 查询已发布结构（当前生效版本）
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [version, groups]
+                properties:
+                  version: { type: integer, format: int64, description: 当前已发布结构版本 }
+                  groups:
+                    type: array
+                    items: { $ref: '#/components/schemas/GroupDef' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /api/v1/projects/{p}/structure-draft:
     get:
       summary: 读取结构草稿（含基础版本）

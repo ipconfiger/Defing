@@ -166,25 +166,30 @@
               <div class="addgrid">
                 <div class="field">
                   <label for="new-item-group">组</label>
-                  <input class="in mono" id="new-item-group" list="group-list" placeholder="如 server">
-                  <datalist id="group-list"></datalist>
+                  <div id="ni-group-cascade"><select class="sel mono" id="new-item-group" data-act="cascadeGroup" aria-label="选择组"></select></div>
+                  <div id="ni-group-fallback" class="hidden"><input class="in mono" id="new-item-group-ft" placeholder="如 server"></div>
                 </div>
                 <div class="field">
                   <label for="new-item-key">key</label>
-                  <input class="in mono" id="new-item-key" placeholder="如 max_conn">
+                  <div id="ni-key-cascade"><select class="sel mono" id="new-item-key" data-act="cascadeKey" aria-label="选择配置项"></select></div>
+                  <div id="ni-key-fallback" class="hidden"><input class="in mono" id="new-item-key-ft" placeholder="如 max_conn"></div>
                 </div>
                 <div class="field">
                   <label for="new-item-type">类型</label>
-                  <select class="sel" id="new-item-type">
-                    <option value="string">string</option><option value="int">int</option>
-                    <option value="float">float</option><option value="bool">bool</option>
-                    <option value="json">json</option><option value="array">array</option>
-                    <option value="secret">secret</option>
-                  </select>
+                  <div id="ni-type-cascade"><span class="ty" id="new-item-type-show">string</span></div>
+                  <div id="ni-type-fallback" class="hidden">
+                    <select class="sel" id="new-item-type" data-act="addItemType">
+                      <option value="string">string</option><option value="int">int</option>
+                      <option value="float">float</option><option value="bool">bool</option>
+                      <option value="json">json</option><option value="array">array</option>
+                      <option value="secret">secret</option>
+                    </select>
+                  </div>
                 </div>
                 <div class="field span-all">
                   <label for="new-item-val">值</label>
-                  <input class="in mono" id="new-item-val" placeholder='bool 填 true / false；array 逗号分隔；json 填 JSON 文本'>
+                  <div id="new-item-val-wrap"></div>
+                  <p class="hint" id="new-item-hint"></p>
                 </div>
                 <div class="addrow">
                   <button type="button" class="btn" data-act="addDraftItem"><svg class="ic"><use href="#i-plus"/></svg>添加</button>
@@ -263,14 +268,25 @@
               <div class="card-head">
                 <h3>结构草稿</h3>
                 <div class="card-actions">
+                  <span class="badge" id="struct-base-badge" title="草稿基于的结构版本；保存时必须等于当前结构版本，否则需重新载入">基于 <span class="mono" id="struct-base">sv0</span></span>
+                  <span class="badge warn hidden" id="struct-stale" title="当前结构版本已更新，请「载入当前」后再保存"><span class="dot"></span>结构已更新</span>
                   <button type="button" class="btn ghost" data-act="loadStructDraft"><svg class="ic"><use href="#i-refresh"/></svg>载入当前</button>
+                  <button type="button" class="btn ghost" data-act="toggleStructJson" id="btn-struct-mode"><svg class="ic"><use href="#i-code"/></svg><span id="btn-struct-mode-label">JSON 模式</span></button>
                   <button type="button" class="btn" data-act="saveStructDraft">保存草稿</button>
                   <button type="button" class="btn primary" data-act="publishStruct"><svg class="ic"><use href="#i-up"/></svg>发布结构</button>
                 </div>
               </div>
-              <p class="hint" style="margin:0 0 4px">结构定义配置项的 key、类型与约束（required / secret）。发布结构将推进全部分支的版本。</p>
-              <p class="hint mono">{"base_version":N,"groups":[{"name":"…","items":[{"key":"…","type":"string","required":false,"secret":false}]}]}</p>
-              <textarea id="struct-draft" class="in mono" rows="16" spellcheck="false" style="margin-top:8px" placeholder='{"base_version":1,"groups":[]}'></textarea>
+              <p class="hint" style="margin:0 0 12px">结构以「组 → 配置项」两级定义 key、类型与约束（required / secret）。发布结构将推进全部分支的版本；结构中已不存在的组 / 配置项，其<b>未发布的草稿值</b>会在发布后自动清理，<b>已发布版本不受影响</b>。</p>
+              <div id="struct-form">
+                <div id="struct-groups" class="stack"></div>
+                <div id="struct-empty" class="empty mini hidden">
+                  <svg class="ic"><use href="#i-inbox"/></svg>
+                  <h4>暂无分组</h4>
+                  <p>添加第一个分组，并在其中定义配置项；草稿值只能为已发布结构中的配置项赋值。</p>
+                </div>
+                <button type="button" class="btn ghost block addgroup-btn" data-act="addStructGroup"><svg class="ic"><use href="#i-plus"/></svg>添加组</button>
+              </div>
+              <textarea id="struct-draft" class="in mono hidden" rows="16" spellcheck="false" placeholder='{"base_version":1,"groups":[{"name":"server","items":[{"key":"max_conn","type":"int","required":true,"secret":false}]}]}'></textarea>
               <div id="struct-err" class="field-err hidden"></div>
             </div>
           </div>

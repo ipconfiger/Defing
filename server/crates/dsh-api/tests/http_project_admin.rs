@@ -663,3 +663,53 @@ async fn expired_session_auto_relogin() {
     let (c, _) = req(&s.base, "GET", "/api/v1/projects/p1", Some(token), None).await;
     assert_eq!(c, 200);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn structure_endpoint_returns_published_structure() {
+    let s = start().await;
+    let admin = admin_login(&s.base).await;
+    setup_p1_structure(&s.base, &admin).await;
+
+    // 已发布结构：返回当前结构版本与分组
+    let (c, b) = req(
+        &s.base,
+        "GET",
+        "/api/v1/projects/p1/structure",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(c, 200, "body: {b}");
+    assert_eq!(b["version"], 2, "发布后结构版本应为 2: {b}");
+    assert_eq!(b["groups"][0]["name"], "g", "body: {b}");
+    assert_eq!(b["groups"][0]["items"][0]["key"], "k", "body: {b}");
+    assert_eq!(b["groups"][0]["items"][0]["type"], "string", "body: {b}");
+
+    // 未发布结构的项目：空分组 + 版本 1（创建时初始结构）
+    let (c, b) = req(
+        &s.base,
+        "GET",
+        "/api/v1/projects/p2/structure",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(c, 200, "body: {b}");
+    assert_eq!(b["version"], 1, "body: {b}");
+    assert_eq!(b["groups"].as_array().map(Vec::len), Some(0), "body: {b}");
+
+    // 项目不存在：404
+    let (c, b) = req(
+        &s.base,
+        "GET",
+        "/api/v1/projects/nope/structure",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(c, 404, "body: {b}");
+
+    // 未认证：401
+    let (c, _) = req(&s.base, "GET", "/api/v1/projects/p1/structure", None, None).await;
+    assert_eq!(c, 401);
+}
