@@ -1,4 +1,4 @@
-//! dsh 二进制（组装器）：解析 CLI → 装配存储/Raft/状态 → dsh-api 路由 → 监听。
+//! defing 二进制（组装器）：解析 CLI → 装配存储/Raft/状态 → dsh-api 路由 → 监听。
 //! HTTP handler 见 dsh-api；发布编排见 dsh-publish；可观测见 dsh-observability；
 //! watch 见 dsh-watch；状态机见 dsh-core。本文件仅负责启动装配。
 
@@ -16,7 +16,7 @@ use dsh_watch::WatchHub;
 
 // ---------------- 配置 ----------------
 
-/// `dsh admin <子命令>`：管理员运维客户端（design-v2 §13.2 / design-v3 §6）。
+/// `defing admin <子命令>`：管理员运维客户端（design-v2 §13.2 / design-v3 §6）。
 #[derive(Subcommand, Debug)]
 enum AdminCmd {
     /// 生成新主密钥（base64 32B）并打印指引
@@ -64,7 +64,7 @@ enum Command {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "dsh", version, about = "Defing 分布式配置文档服务")]
+#[command(name = "defing", version, about = "Defing 分布式配置文档服务")]
 struct Cli {
     /// 单节点联调模式（无 Raft，直接 apply 状态机）
     #[arg(long)]
@@ -159,7 +159,7 @@ struct Cli {
     /// 管理面会话令牌（客户端模式；缺省时用 --admin-password 登录；单会话下建议直接传 token）
     #[arg(long, global = true)]
     admin_token: Option<String>,
-    /// 顶层子命令（dsh admin <cmd>；客户端模式，不启动服务）
+    /// 顶层子命令（defing admin <cmd>；客户端模式，不启动服务）
     #[command(subcommand)]
     cmd: Option<Command>,
 }
@@ -195,7 +195,7 @@ async fn admin_token(cli: &Cli) -> Result<String, Box<dyn std::error::Error + Se
     Ok(token.to_string())
 }
 
-/// `dsh admin <cmd>` 分派（客户端模式，调管理面 HTTP）。
+/// `defing admin <cmd>` 分派（客户端模式，调管理面 HTTP）。
 async fn run_admin_cmd(
     cli: &Cli,
     cmd: &AdminCmd,
@@ -687,7 +687,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_max_level(tracing::Level::INFO)
         .init();
     let cli = Cli::parse();
-    // `dsh admin <cmd>` 客户端模式（不启动服务；需 --admin-endpoint）
+    // `defing admin <cmd>` 客户端模式（不启动服务；需 --admin-endpoint）
     if let Some(Command::Admin { cmd }) = &cli.cmd {
         return run_admin_cmd(&cli, cmd).await;
     }
@@ -833,7 +833,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         spawn_grpc(&cli, app.clone());
         let router = dsh_api::build_router(app);
         let listener = tokio::net::TcpListener::bind(&cli.http_addr).await?;
-        eprintln!("dsh --dev-single listening on http://{}", cli.http_addr);
+        eprintln!("defing --dev-single listening on http://{}", cli.http_addr);
         axum::serve(
             listener,
             router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -1067,7 +1067,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let router = dsh_api::build_router(app);
     let listener = tokio::net::TcpListener::bind(&cli.http_addr).await?;
     eprintln!(
-        "dsh node {node_id} listening on http://{} (raft {})",
+        "defing node {node_id} listening on http://{} (raft {})",
         cli.http_addr, cli.raft_addr
     );
     axum::serve(
@@ -1100,7 +1100,7 @@ fn spawn_grpc(cli: &Cli, state: ApiState) {
         {
             eprintln!("grpc server on {grpc_addr} failed: {e}");
         } else {
-            eprintln!("dsh gRPC data plane listening on {grpc_addr}");
+            eprintln!("defing gRPC data plane listening on {grpc_addr}");
         }
     });
 }

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # 重启追赶专项调试：3 节点 → kill leader → 重启 → 观察 node1 完整日志
 set -u
-BIN=/home/alex/Projects/Defing/server/target/debug/dsh
+BIN=/home/alex/Projects/Defing/server/target/debug/defing
 W=$(mktemp -d /tmp/dsh-rt.XXXXXX)
-cleanup() { pkill -x dsh 2>/dev/null || true; }
+cleanup() { pkill -x defing 2>/dev/null || true; }
 trap cleanup EXIT
 
 for id in 1 2 3; do

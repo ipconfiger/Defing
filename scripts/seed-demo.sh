@@ -7,13 +7,13 @@
 #   5) kill node2 → 相同 seed 重启 → resume（无 WARN）且数据可读
 #   6) A2：不一致 seed 重启 → WARN 差异明细 + 仍 resume
 set -u
-BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/dsh}
+BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/defing}
 WORK=$(mktemp -d /tmp/dsh-seed-demo.XXXXXX)
 PIDS=""
 
 cleanup() {
   for p in $PIDS; do kill "$p" 2>/dev/null || true; done
-  pkill -x dsh 2>/dev/null || true
+  pkill -x defing 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT

@@ -3,10 +3,10 @@ name = "dsh-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Defing config service - binary: dsh (assembler: storage/raft/state -> dsh-api router)"
+description = "Defing config service - binary: defing (assembler: storage/raft/state -> dsh-api router)"
 
 [[bin]]
-name = "dsh"
+name = "defing"
 path = "src/main.rs"
 
 [dependencies]

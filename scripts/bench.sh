@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# dsh 基准冒烟（A3）：读 QPS / 写 QPS（内存 vs redb 落盘对比）/ watch 延迟 / 二进制大小 / 内存 RSS。
+# defing 基准冒烟（A3）：读 QPS / 写 QPS（内存 vs redb 落盘对比）/ watch 延迟 / 二进制大小 / 内存 RSS。
 # 用法: scripts/bench.sh [--release]
 # 设计目标（design-v2 §12）：写 QPS ≥10k、watch ≥10k、发布→SDK ≤1s、内存 ≤128MB、二进制 ≤50MB(release)
 # perf 方案①：写 QPS 对比行（WRITE_QPS_MEM / WRITE_QPS_REDB）——落盘模式为生产形态。
 # 说明：写/读基准用 Python3 实现（零依赖，避免 Go 工具链跨机兼容问题）。
 set -u
-BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/dsh}
+BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/defing}
 BASE=${BASE:-http://127.0.0.1:8384}
 PORT=${PORT:-8384}
 WORK=$(mktemp -d /tmp/dsh-bench.XXXXXX)
 RELEASE=0
-[ "${1:-}" = "--release" ] && RELEASE=1 && BIN=/home/alex/Projects/Defing/server/target/release/dsh
+[ "${1:-}" = "--release" ] && RELEASE=1 && BIN=/home/alex/Projects/Defing/server/target/release/defing
 
-cleanup() { pkill -x dsh 2>/dev/null || true; rm -rf "$WORK"; }
+cleanup() { pkill -x defing 2>/dev/null || true; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 # Python 写基准（草稿+发布循环，与 Go 版 writeBench 同语义）

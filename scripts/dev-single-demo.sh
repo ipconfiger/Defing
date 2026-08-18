@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# M1 验收演示：dsh --dev-single 全流程（建项目→结构→草稿→发布→GetConfig）
+# M1 验收演示：defing --dev-single 全流程（建项目→结构→草稿→发布→GetConfig）
 set -euo pipefail
-BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/dsh}
+BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/defing}
 BASE=${BASE:-http://127.0.0.1:8384}
 PORT=${PORT:-8384}
 
 cleanup() { [ -n "${PID:-}" ] && kill $PID 2>/dev/null || true; }
 trap cleanup EXIT
 
-echo "== 启动 dsh --dev-single =="
+echo "== 启动 defing --dev-single =="
 $BIN --dev-single --admin-password admin123 --allow-no-master-key --http-addr 127.0.0.1:$PORT >/tmp/dsh-dev-single.log 2>&1 &
 PID=$!
 sleep 1

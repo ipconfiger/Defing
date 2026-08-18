@@ -3,14 +3,14 @@
 #   项目详情/删除、分支详情/删除、分支对比、值提升、共享库 CRUD+发布、共享引用绑定、
 #   （cluster/remove 由 cluster-demo 扩展覆盖，本脚本 dev-single 无 raft）
 set -euo pipefail
-BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/dsh}
+BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/defing}
 PORT=${PORT:-8384}
 BASE=${BASE:-http://127.0.0.1:$PORT}
 
 cleanup() { [ -n "${PID:-}" ] && kill $PID 2>/dev/null || true; }
 trap cleanup EXIT
 
-echo "== 启动 dsh --dev-single =="
+echo "== 启动 defing --dev-single =="
 head -c 32 /dev/urandom > /tmp/dsh-api-surface.key
 $BIN --dev-single --admin-password admin123 --http-addr 127.0.0.1:$PORT \
   --master-key-file /tmp/dsh-api-surface.key >/tmp/dsh-api-surface.log 2>&1 &

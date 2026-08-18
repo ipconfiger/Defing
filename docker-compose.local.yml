@@ -4,7 +4,7 @@
 #   1) 构建并拷贝二进制到 local-bin/：
 #      docker compose -f docker-compose.local.yml run --rm builder
 #   2) 启动单实例（HTTP API 映射到本机 8384）：
-#      docker compose -f docker-compose.local.yml up -d dsh
+#      docker compose -f docker-compose.local.yml up -d defing
 #   3) 初始化 example 站点配置并启动站点（http://127.0.0.1:8000）：
 #      docker compose -f docker-compose.local.yml run --rm example-setup
 #      docker compose -f docker-compose.local.yml up -d example-site
@@ -16,8 +16,8 @@
 #   - 宿主为 Apple Silicon，Docker 引擎 linux/arm64，容器内原生编译产物即 arm64 Linux ELF。
 #   - 公共 target 目录复用 server/target（已在 .gitignore 中），容器内 CARGO_TARGET_DIR 指向该挂载。
 #   - Cargo/Rustup 工具链与 registry 缓存放在 named volume，重复构建无需重新下载。
-#   - dsh 运行期只读环境变量 DSH_MASTER_KEY（base64 32B），其余均为 CLI 参数。
-#   - example 站点经 compose 网络以服务名 dsh 访问配置服务（HTTP/SSE 数据面通道）。
+#   - defing 运行期只读环境变量 DSH_MASTER_KEY（base64 32B），其余均为 CLI 参数。
+#   - example 站点经 compose 网络以服务名 defing 访问配置服务（HTTP/SSE 数据面通道）。
 
 name: dsh-local
 
@@ -57,12 +57,12 @@ services:
         rustup default 1.97.0
         cd /src/server
         cargo build --release -p dsh-cli
-        cp -f "$$CARGO_TARGET_DIR/release/dsh" /app/dsh
-        chmod +x /app/dsh
-        echo "=== OK: $(ls -lh /app/dsh) ==="
+        cp -f "$$CARGO_TARGET_DIR/release/defing" /app/defing
+        chmod +x /app/defing
+        echo "=== OK: $(ls -lh /app/defing) ==="
 
   # 单实例运行（dev-single 模式，Raft 关闭，数据落 /app/data = 宿主 local-bin/data）
-  dsh:
+  defing:
     <<: *ubuntu
     init: true
     environment:
@@ -75,7 +75,7 @@ services:
     ports:
       - "127.0.0.1:8384:8384"         # HTTP API 仅绑定本机
     command:
-      - /app/dsh
+      - /app/defing
       - --dev-single
       - --http-addr=0.0.0.0:8384
       - --admin-password=dev-admin-pass
@@ -87,25 +87,25 @@ services:
       retries: 12
       start_period: 5s
 
-  # 一次性：通过 dsh admin API 初始化 example 站点配置（project/配置项/发布）
+  # 一次性：通过 defing admin API 初始化 example 站点配置（project/配置项/发布）
   example-setup:
     <<: *ubuntu
     profiles: ["tools"]
     environment:
       DEBIAN_FRONTEND: noninteractive
-      DSH_ENDPOINT: http://dsh:8384
+      DSH_ENDPOINT: http://defing:8384
       DSH_PROJECT: example-site
       DSH_BRANCH: dev
       DSH_GROUP: site
       ADMIN_PASSWORD: dev-admin-pass
-      TITLE: "dsh 演示站"
+      TITLE: "defing 演示站"
       LOGIN_USERNAME: admin
       LOGIN_PASSWORD: example-pass-123
     volumes:
       - ./example:/site:ro
       - ./sdk/python:/app/sdk:ro
     depends_on:
-      dsh:
+      defing:
         condition: service_healthy
     command:
       - bash
@@ -115,14 +115,14 @@ services:
         apt-get install -y -qq --no-install-recommends python3 >/dev/null
         exec python3 /site/app.py setup
 
-  # example 站点：从 dsh 拉配置 + watch 热更新，登录账号/密码/标题均为配置项
+  # example 站点：从 defing 拉配置 + watch 热更新，登录账号/密码/标题均为配置项
   example-site:
     <<: *ubuntu
     init: true
     environment:
       DEBIAN_FRONTEND: noninteractive
       PORT: "8000"
-      DSH_ENDPOINT: http://dsh:8384
+      DSH_ENDPOINT: http://defing:8384
       DSH_PROJECT: example-site
       DSH_BRANCH: dev
       DSH_GROUP: site
@@ -132,7 +132,7 @@ services:
     ports:
       - "127.0.0.1:8000:8000"         # 站点仅绑定本机
     depends_on:
-      dsh:
+      defing:
         condition: service_healthy
     command:
       - bash

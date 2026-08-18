@@ -2,14 +2,14 @@
 # G5 验收演示：灰度指标（/metrics 6 项）+ 自动回滚负例（低错误率不误伤）+ 生命周期指标联动
 # 依据 docs/design/g5-observability.md（D31-D34）
 set -euo pipefail
-BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/dsh}
+BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/defing}
 PORT=${PORT:-8397}
 BASE=${BASE:-http://127.0.0.1:$PORT}
 
 cleanup() { [ -n "${PID:-}" ] && kill $PID 2>/dev/null || true; }
 trap cleanup EXIT
 
-echo "== 启动 dsh --dev-single（自动回滚：阈值 5% / 间隔 2s）=="
+echo "== 启动 defing --dev-single（自动回滚：阈值 5% / 间隔 2s）=="
 $BIN --dev-single --admin-password admin123 --allow-no-master-key --http-addr 127.0.0.1:$PORT \
   --gray-rollback-threshold 5 --gray-rollback-interval 2 >/tmp/dsh-obs.log 2>&1 &
 PID=$!

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # M1 集群模式 e2e：3 进程 bootstrap/join/promote → 写 → kill 节点2 → 多数派继续写
 set -u
-BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/dsh}
+BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/defing}
 WORK=$(mktemp -d /tmp/dsh-cluster-demo.XXXXXX)
 PIDS=""
 
 cleanup() {
   for p in $PIDS; do kill "$p" 2>/dev/null || true; done
-  pkill -x dsh 2>/dev/null || true
+  pkill -x defing 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT

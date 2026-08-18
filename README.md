@@ -9,7 +9,7 @@
 ### 单节点联调（--dev-single）
 
 ```bash
-server/target/debug/dsh --dev-single --admin-password admin123 --allow-no-master-key --http-addr 127.0.0.1:8384
+server/target/debug/defing --dev-single --admin-password admin123 --allow-no-master-key --http-addr 127.0.0.1:8384
 # 管理面:  http://127.0.0.1:8384  （/admin 内嵌控制台，/metrics，/healthz）
 # 数据面:  GET  /v1/projects/{p}/branches/{b}/snapshot  （SDK 拉配置，纯值+版本号）
 #          SSE  /v1/projects/{p}/branches/{b}/watch      （订阅发布事件）
@@ -22,9 +22,9 @@ server/target/debug/dsh --dev-single --admin-password admin123 --allow-no-master
 
 ```bash
 SEED="1@127.0.0.1:8385@127.0.0.1:8384,2@127.0.0.1:8387@127.0.0.1:8386,3@127.0.0.1:8389@127.0.0.1:8388"
-dsh --node-id 1 --bootstrap-peers "$SEED" --http-addr 127.0.0.1:8384 --raft-addr 127.0.0.1:8385 --data-dir ./n1 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
-dsh --node-id 2 --bootstrap-peers "$SEED" --http-addr 127.0.0.1:8386 --raft-addr 127.0.0.1:8387 --data-dir ./n2 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
-dsh --node-id 3 --bootstrap-peers "$SEED" --http-addr 127.0.0.1:8388 --raft-addr 127.0.0.1:8389 --data-dir ./n3 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
+defing --node-id 1 --bootstrap-peers "$SEED" --http-addr 127.0.0.1:8384 --raft-addr 127.0.0.1:8385 --data-dir ./n1 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
+defing --node-id 2 --bootstrap-peers "$SEED" --http-addr 127.0.0.1:8386 --raft-addr 127.0.0.1:8387 --data-dir ./n2 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
+defing --node-id 3 --bootstrap-peers "$SEED" --http-addr 127.0.0.1:8388 --raft-addr 127.0.0.1:8389 --data-dir ./n3 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
 # 三段式必填：node_id@raft_addr@http_addr；条目校验：地址查重、拒绝 0.0.0.0、端口 1-65535；
 # 已有数据（重启/crash 恢复）自动 resume，seed 与集群成员表不一致会 WARN（不覆盖）；
 # 运行期扩缩容走 --join / promote / remove-node
@@ -33,9 +33,9 @@ dsh --node-id 3 --bootstrap-peers "$SEED" --http-addr 127.0.0.1:8388 --raft-addr
 **方式二：bootstrap + join（动态扩容）**
 
 ```bash
-dsh --node-id 1 --bootstrap --http-addr 127.0.0.1:8384 --raft-addr 127.0.0.1:8385 --data-dir ./n1 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
-dsh --node-id 2 --join http://127.0.0.1:8384 --http-addr 127.0.0.1:8386 --raft-addr 127.0.0.1:8387 --data-dir ./n2 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
-dsh --node-id 3 --join http://127.0.0.1:8384 --http-addr 127.0.0.1:8388 --raft-addr 127.0.0.1:8389 --data-dir ./n3 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
+defing --node-id 1 --bootstrap --http-addr 127.0.0.1:8384 --raft-addr 127.0.0.1:8385 --data-dir ./n1 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
+defing --node-id 2 --join http://127.0.0.1:8384 --http-addr 127.0.0.1:8386 --raft-addr 127.0.0.1:8387 --data-dir ./n2 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
+defing --node-id 3 --join http://127.0.0.1:8384 --http-addr 127.0.0.1:8388 --raft-addr 127.0.0.1:8389 --data-dir ./n3 --admin-password admin123 --allow-no-master-key --join-token demo --raft-token demo
 # 提升为 voter：
 # POST /api/v1/cluster/promote {"node_id": 2} / {"node_id": 3}（需管理员 Bearer）
 # 重启自动恢复：同 data-dir 直接启动（无需 --bootstrap/--join）

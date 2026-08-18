@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # M3 契约测试：三语言 SDK（TS/Go/Python）对同一 dev-single 服务：get + watch。
 set -u
-BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/dsh}
+BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/defing}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 BASE=${BASE:-http://127.0.0.1:8384}
 PORT=${PORT:-8384}
 PROJECT=sdk-project
 
-cleanup() { [ -n "${PID:-}" ] && kill $PID 2>/dev/null || true; pkill -x dsh 2>/dev/null || true; }
+cleanup() { [ -n "${PID:-}" ] && kill $PID 2>/dev/null || true; pkill -x defing 2>/dev/null || true; }
 trap cleanup EXIT
 
 echo "== 启动 dev-single =="

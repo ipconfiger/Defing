@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # M4 混沌测试：leader 击杀 → 重新选举 → 继续写入 → 重启追赶；follower 击杀重启追赶。
 set -u
-BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/dsh}
+BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/defing}
 WORK=$(mktemp -d /tmp/dsh-chaos.XXXXXX)
 PIDS=""
 
 cleanup() {
   for p in $PIDS; do kill "$p" 2>/dev/null || true; done
-  pkill -x dsh 2>/dev/null || true
+  pkill -x defing 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT

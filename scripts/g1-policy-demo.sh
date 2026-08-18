@@ -2,14 +2,14 @@
 # G1 验收演示：三旋钮（--publish-policy / --shared-cascade / --read-mode）
 # 依据 docs/design/g1-policy.md（D35-D37）
 set -euo pipefail
-BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/dsh}
+BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/defing}
 PORT=${PORT:-8398}
 BASE=${BASE:-http://127.0.0.1:$PORT}
 
 cleanup() { [ -n "${PID:-}" ] && kill $PID 2>/dev/null || true; }
 trap cleanup EXIT
 
-echo "== 启动 dsh --dev-single（warn + manual + linear）=="
+echo "== 启动 defing --dev-single（warn + manual + linear）=="
 $BIN --dev-single --admin-password admin123 --allow-no-master-key --http-addr 127.0.0.1:$PORT \
   --publish-policy warn --shared-cascade manual --read-mode linear >/tmp/dsh-g1.log 2>&1 &
 PID=$!

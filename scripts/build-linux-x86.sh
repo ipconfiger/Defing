@@ -4,14 +4,14 @@
 # 核心指令：cargo zigbuild --release --target x86_64-unknown-linux-gnu
 # 依赖：cargo-zigbuild（cargo install cargo-zigbuild）、zig（https://ziglang.org）、rustup
 #
-# 产物：bin/dsh-linux-x86_64（静态链接 glibc；可用 ldd/file 验证）
+# 产物：bin/defing-linux-x86_64（静态链接 glibc；可用 ldd/file 验证）
 # 覆盖：CARGO_TARGET_DIR（默认 $REPO/server/target）、CARGO_HOME（缺省 rustup 默认）
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 TARGET=x86_64-unknown-linux-gnu
 CRATE=dsh-cli
-BIN_NAME=dsh
+BIN_NAME=defing
 OUT="$REPO/bin"
 
 # ---------- 1. 依赖检查 ----------

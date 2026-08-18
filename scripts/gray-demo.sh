@@ -2,14 +2,14 @@
 # G3 验收演示：灰度数据面三路解析 + watch 灰度事件（design/g3-dataplane.md）
 # 流程：建项目→结构→稳定发布 v2→灰度发布→HTTP 三路身份解析→watch promote 补发事件→abort 回落
 set -euo pipefail
-BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/dsh}
+BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/defing}
 PORT=${PORT:-8385}
 BASE=${BASE:-http://127.0.0.1:$PORT}
 
 cleanup() { [ -n "${PID:-}" ] && kill $PID 2>/dev/null || true; }
 trap cleanup EXIT
 
-echo "== 启动 dsh --dev-single =="
+echo "== 启动 defing --dev-single =="
 $BIN --dev-single --admin-password admin123 --allow-no-master-key --http-addr 127.0.0.1:$PORT >/tmp/dsh-gray.log 2>&1 &
 PID=$!
 for i in $(seq 1 20); do

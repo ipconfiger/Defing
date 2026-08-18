@@ -2,14 +2,14 @@
 # P1 SDK gRPC 契约测试：三语言（TS/Go/Python）对同一 dev-single 的 :8383 数据面：
 # GetConfig / GetItem / Watch / ListMembers。
 set -u
-BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/dsh}
+BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/defing}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 BASE=${BASE:-http://127.0.0.1:8384}
 PORT=${PORT:-8384}
 GRPC_PORT=${GRPC_PORT:-8383}
 PROJECT=sdk-project
 
-cleanup() { [ -n "${PID:-}" ] && kill $PID 2>/dev/null || true; pkill -x dsh 2>/dev/null || true; }
+cleanup() { [ -n "${PID:-}" ] && kill $PID 2>/dev/null || true; pkill -x defing 2>/dev/null || true; }
 trap cleanup EXIT
 
 echo "== 启动 dev-single (HTTP :$PORT / gRPC :$GRPC_PORT) =="

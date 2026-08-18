@@ -104,16 +104,16 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: cargo-${{ hashFiles('server/Cargo.lock') }}
-      - name: build dsh
+      - name: build defing
         working-directory: server
         run: cargo build -p dsh-cli
       - name: sdk contract test (HTTP/SSE)
         env:
-          BIN: ${{ github.workspace }}/server/target/debug/dsh
+          BIN: ${{ github.workspace }}/server/target/debug/defing
         run: ./scripts/sdk-contract-test.sh
       - name: sdk contract test (gRPC 数据面)
         env:
-          BIN: ${{ github.workspace }}/server/target/debug/dsh
+          BIN: ${{ github.workspace }}/server/target/debug/defing
         run: ./scripts/sdk-grpc-contract-test.sh
 
   # stage 7: 多进程 e2e（dev-single / 3 节点集群 / 混沌）
@@ -131,37 +131,37 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: cargo-${{ hashFiles('server/Cargo.lock') }}
-      - name: build dsh
+      - name: build defing
         working-directory: server
         run: cargo build -p dsh-cli
       - name: dev-single demo
         env:
-          BIN: ${{ github.workspace }}/server/target/debug/dsh
+          BIN: ${{ github.workspace }}/server/target/debug/defing
         run: ./scripts/dev-single-demo.sh
       - name: cluster demo
         env:
-          BIN: ${{ github.workspace }}/server/target/debug/dsh
+          BIN: ${{ github.workspace }}/server/target/debug/defing
         run: ./scripts/cluster-demo.sh
       - name: seed cluster demo (--bootstrap-peers 静态成员表建群)
         env:
-          BIN: ${{ github.workspace }}/server/target/debug/dsh
+          BIN: ${{ github.workspace }}/server/target/debug/defing
         run: ./scripts/seed-demo.sh
       - name: chaos test
         env:
-          BIN: ${{ github.workspace }}/server/target/debug/dsh
+          BIN: ${{ github.workspace }}/server/target/debug/defing
         run: ./scripts/chaos-test.sh
       # 灰度发布 e2e（G1/G3/G5）：三旋钮 + 数据面解析/watch + 指标/自动回滚
       - name: g1 policy demo
         env:
-          BIN: ${{ github.workspace }}/server/target/debug/dsh
+          BIN: ${{ github.workspace }}/server/target/debug/defing
         run: ./scripts/g1-policy-demo.sh
       - name: gray demo
         env:
-          BIN: ${{ github.workspace }}/server/target/debug/dsh
+          BIN: ${{ github.workspace }}/server/target/debug/defing
         run: ./scripts/gray-demo.sh
       - name: gray observability demo
         env:
-          BIN: ${{ github.workspace }}/server/target/debug/dsh
+          BIN: ${{ github.workspace }}/server/target/debug/defing
         run: ./scripts/gray-obs-demo.sh
 
   # stage 8: 基准冒烟（结果归档，不 gate 合并）
@@ -182,12 +182,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: cargo-${{ hashFiles('server/Cargo.lock') }}
-      - name: build dsh
+      - name: build defing
         working-directory: server
         run: cargo build -p dsh-cli
       - name: benchmark smoke
         env:
-          BIN: ${{ github.workspace }}/server/target/debug/dsh
+          BIN: ${{ github.workspace }}/server/target/debug/defing
         run: ./scripts/bench.sh 2>&1 | tee /tmp/dsh-bench.out
 
   # stage 9: release 构建 + SBOM（A4）
@@ -217,4 +217,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-binary
-          path: server/target/release/dsh
+          path: server/target/release/defing
