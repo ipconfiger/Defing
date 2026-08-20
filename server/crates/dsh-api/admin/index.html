@@ -161,42 +161,6 @@
           <!-- 草稿 -->
           <div id="pane-draft" class="pane">
             <div id="draft-groups" class="stack"></div>
-            <div class="card addcard">
-              <div class="addcard-title"><svg class="ic"><use href="#i-plus"/></svg>添加配置项</div>
-              <div class="addgrid">
-                <div class="field">
-                  <label for="new-item-group">组</label>
-                  <div id="ni-group-cascade"><select class="sel mono" id="new-item-group" data-act="cascadeGroup" aria-label="选择组"></select></div>
-                  <div id="ni-group-fallback" class="hidden"><input class="in mono" id="new-item-group-ft" placeholder="如 server"></div>
-                </div>
-                <div class="field">
-                  <label for="new-item-key">key</label>
-                  <div id="ni-key-cascade"><input class="in mono" id="new-item-key" list="new-item-key-list" data-act="cascadeKey" placeholder="输入 key，或从结构建议中选择" spellcheck="false" aria-label="配置项 key"><datalist id="new-item-key-list"></datalist></div>
-                  <div id="ni-key-fallback" class="hidden"><input class="in mono" id="new-item-key-ft" placeholder="如 max_conn"></div>
-                </div>
-                <div class="field">
-                  <label for="new-item-type">类型</label>
-                  <div id="ni-type-cascade"><span class="ty" id="new-item-type-show">string</span></div>
-                  <div id="ni-type-fallback" class="hidden">
-                    <select class="sel" id="new-item-type" data-act="addItemType">
-                      <option value="string">string</option><option value="int">int</option>
-                      <option value="float">float</option><option value="bool">bool</option>
-                      <option value="json">json</option><option value="array">array</option>
-                      <option value="secret">secret</option>
-                    </select>
-                  </div>
-                </div>
-                <div class="field span-all">
-                  <label for="new-item-val">值</label>
-                  <div id="new-item-val-wrap"></div>
-                  <p class="hint" id="new-item-hint"></p>
-                </div>
-                <div class="addrow">
-                  <button type="button" class="btn" data-act="addDraftItem"><svg class="ic"><use href="#i-plus"/></svg>添加</button>
-                  <span id="add-item-err" class="field-err hidden" style="margin-top:0"></span>
-                </div>
-              </div>
-            </div>
             <div class="card actionbar">
               <span class="badge" id="draft-rev-badge" title="草稿修订号（乐观锁）">草稿 <span class="mono" id="draft-rev">r0</span></span>
               <button type="button" class="btn" data-act="saveDraft">保存草稿</button>

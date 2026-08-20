@@ -202,9 +202,11 @@ pub struct SharedItem {
 
 ### 7.3 配置管理页 · 草稿页（pane-draft，P5 可发现性）
 
+> 修订（2026-08-20 用户反馈）：草稿页范式由「添加配置项」改为**结构驱动的全量编辑**——key 由结构定义故保持下拉/只读，草稿一次性展示已发布结构的全部组与配置项，直接改值保存（空值 = 删除该草稿值）。原「添加配置项」卡片及其级联代码已移除。
+
 - 组卡片头新增「管理分组」按钮（data-act="manageGroups"，跳转结构 pane 并定位该组，沿用现有组 CRUD）。
-- shared_ref 项在草稿组内以只读行展示：徽标「引用共享项 {key} · v{version}」+ 共享值（secret masked，点击解密走既有 reveal 审计路径）。
-- 「添加配置项」卡片（new-item）：级联 key 下拉中 shared_ref 项置灰并标注「引用共享项」；fallback 输入若命中 shared_ref 项 → 提交前提示不可添加本地值。
+- 草稿页按已发布结构（GET /structure）全量渲染：每个本地项显示 key/type/required/secret/描述 + 可编辑值控件（有草稿值则回填，secret 留空不修改）；shared_ref 项以只读行展示：徽标「引用共享项 {key} · v{version}」+ 共享值（secret masked）。
+- 保存草稿：有值 → upsert；原草稿有值但清空 → delete；乐观锁 expected_draft_rev 不变。
 - 分支「查看配置」预览不变（发布快照已含物化值）。
 
 ### 7.4 状态与数据源
