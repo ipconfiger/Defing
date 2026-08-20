@@ -62,9 +62,8 @@ pub struct ApiState {
     login_throttle: std::sync::Arc<LoginThrottle>,
     /// 可信代理 CIDR（F4）：仅来自这些网段的请求才信任 X-Forwarded-For；空 = 一律忽略 XFF。
     trusted_proxies: std::sync::Arc<TrustedProxies>,
-    /// HTTP 数据面访问令牌（D2）：配置时 /v1/* 需 Bearer 或 ?token=（兼容 SSE EventSource）；
-    /// 未配置开放（与 gRPC data_plane_interceptor 同语义）。
-    data_plane_token: Option<std::sync::Arc<str>>,
+    /// dev-single 开发数据面 token（全局有效，仅 dev 模式注入；集群模式恒 None）
+    dev_token: Option<std::sync::Arc<str>>,
     /// 读取模式（G1/D37：Linear=ReadIndex 门控 / Stale=本地直读；CLI --read-mode 注入，默认 Linear）
     pub read_mode: dsh_core::model::ReadMode,
 }
@@ -112,7 +111,7 @@ impl ApiState {
         audit_retention: u64,
         join_token: Option<std::sync::Arc<str>>,
         trusted_proxies: std::sync::Arc<TrustedProxies>,
-        data_plane_token: Option<std::sync::Arc<str>>,
+        dev_token: Option<std::sync::Arc<str>>,
     ) -> Self {
         let publish = PublishService::new(
             sm.clone(),
@@ -137,7 +136,7 @@ impl ApiState {
             join_token,
             login_throttle: std::sync::Arc::new(LoginThrottle::new()),
             trusted_proxies,
-            data_plane_token,
+            dev_token,
             read_mode: dsh_core::model::ReadMode::Stale,
         }
     }
@@ -510,6 +509,60 @@ fn project_segment(path: &str) -> Option<String> {
     }
 }
 
+/// 从 /v1/projects/{p}/... 路径提取 {p}（数据面；字符集同 N2，非法 → None → 401）。
+fn data_plane_project_segment(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/v1/projects/")?;
+    let seg = rest.split('/').next()?;
+    if !seg.is_empty()
+        && seg
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        Some(seg.to_string())
+    } else {
+        None
+    }
+}
+
+/// 从请求提取数据面 token：Authorization: Bearer <t> 优先，其次 ?token=<t>（SSE EventSource 兼容）。
+fn extract_data_token(req: &axum::extract::Request) -> Option<String> {
+    if let Some(v) = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|a| a.strip_prefix("Bearer "))
+    {
+        return Some(v.to_string());
+    }
+    req.uri().query().and_then(|q| {
+        q.split('&')
+            .find_map(|kv| kv.strip_prefix("token=").map(|t| t.to_string()))
+    })
+}
+
+/// 数据面鉴权：dev token 全局有效；否则按项目校验（单次 KV 读）。
+fn data_plane_authorized(app: &ApiState, req: &axum::extract::Request) -> bool {
+    let Some(raw) = extract_data_token(req) else {
+        return false;
+    };
+    if let Some(dev) = &app.dev_token {
+        if raw == dev.as_ref() {
+            return true;
+        }
+    }
+    let Some(pid) = data_plane_project_segment(req.uri().path()) else {
+        return false;
+    };
+    let sm = match app.sm.read() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    match sm.get_data_token(&dsh_core::token_hash(&raw)) {
+        Ok(Some(rec)) => !rec.revoked && rec.project.0 == pid,
+        _ => false,
+    }
+}
+
 /// 项目管理员授权矩阵（§4：默认拒绝、显式放行）。
 /// 返回 true=放行。全局管理员永远放行（调用方判断）。
 fn pa_allowed(principal: &dsh_core::Principal, method: &str, path: &str) -> bool {
@@ -540,10 +593,10 @@ fn pa_allowed(principal: &dsh_core::Principal, method: &str, path: &str) -> bool
         if &p != pid {
             return false; // 跨项目
         }
-        // PA 账号管理端点（全局面）拒绝
+        // PA 账号管理端点 + 访问令牌（全局面）拒绝
         if path
             .strip_prefix(&format!("/api/v1/projects/{pid}"))
-            .is_some_and(|r| r.starts_with("/admins"))
+            .is_some_and(|r| r.starts_with("/admins") || r.starts_with("/tokens"))
         {
             return false;
         }
@@ -607,37 +660,25 @@ async fn auth_middleware(
         }
         req.extensions_mut().insert(principal);
     } else if path.starts_with("/v1/") {
-        // D2：HTTP 数据面 token（配置时校验；Authorization Bearer 或 ?token= 查询参数，
-        // 后者兼容 SSE EventSource 无法携带自定义头的限制）。未配置 → 开放（与 gRPC 同语义）。
-        if let Some(tok) = &app.data_plane_token {
-            let header_ok = req
-                .headers()
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|a| a.strip_prefix("Bearer "))
-                .map(|t| t == tok.as_ref())
-                .unwrap_or(false);
-            let query_ok = req
+        // 项目访问令牌鉴权：/v1/projects/{p}/... 需该项目有效 token（Bearer 或 ?token=，
+        // 后者兼容 SSE EventSource）；dev-single 开发 token 全局有效。无有效 token → 401。
+        // 例外：渲染端点 + reveal=true → 走 handler 内会话鉴权（B2：PA 仅能 reveal 自己项目），
+        // 不经数据面 token（reveal 属管理面能力，见 render_config）。
+        let reveal_render = path.ends_with("/config")
+            && req
                 .uri()
                 .query()
-                .map(|q| {
-                    q.split('&').any(|kv| {
-                        kv.strip_prefix("token=")
-                            .map(|t| t == tok.as_ref())
-                            .unwrap_or(false)
-                    })
-                })
+                .map(|q| q.split('&').any(|kv| kv == "reveal=true"))
                 .unwrap_or(false);
-            if !header_ok && !query_ok {
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    Json(ApiErrorBody {
-                        code: "ERR_UNAUTHORIZED".into(),
-                        message: "data-plane token required".into(),
-                        detail: None,
-                    }),
-                ));
-            }
+        if !reveal_render && !data_plane_authorized(&app, &req) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ApiErrorBody {
+                    code: "ERR_UNAUTHORIZED".into(),
+                    message: "data-plane token required".into(),
+                    detail: None,
+                }),
+            ));
         }
     }
     Ok(next.run(req).await)
@@ -1997,6 +2038,159 @@ async fn delete_project_admin(
             StatusCode::NOT_FOUND,
             Json(ApiErrorBody {
                 code: "ERR_ACCOUNT_NOT_FOUND".into(),
+                message: e.0.message.clone(),
+                detail: e.0.detail.clone(),
+            }),
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateProjectTokenReq {
+    name: String,
+}
+
+/// 创建项目访问令牌（仅全局管理员；PA 由 pa_allowed 拒 403，此处防御性再校验）。
+/// 明文 token 复用模块级 new_token()（16B → 32 hex，见路由区定义）。
+async fn create_project_token(
+    principal: axum::Extension<dsh_core::Principal>,
+    State(app): State<ApiState>,
+    AxumPath(pid): AxumPath<String>,
+    Json(req): Json<CreateProjectTokenReq>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<ApiErrorBody>)> {
+    if !matches!(&*principal, dsh_core::Principal::Admin) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiErrorBody {
+                code: "ERR_FORBIDDEN".into(),
+                message: "仅全局管理员可管理访问令牌".into(),
+                detail: None,
+            }),
+        ));
+    }
+    let now = now_ms();
+    let raw = new_token();
+    let token_hash = dsh_core::token_hash(&raw);
+    let cmd = Command::ProjectTokenCreate {
+        project: ProjectId(pid.clone()),
+        name: req.name.clone(),
+        token_hash: token_hash.clone(),
+        operator: principal_op(&principal),
+        ts: now,
+    };
+    match app.write(&cmd, now).await {
+        Ok(_) => {
+            app.audit
+                .append(
+                    "token_create",
+                    Some(pid.clone()),
+                    Some(req.name.clone()),
+                    None,
+                    None,
+                    serde_json::json!({}),
+                    &principal_op(&principal),
+                )
+                .await;
+            Ok((
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "id": token_hash.chars().take(16).collect::<String>(),
+                    "name": req.name,
+                    "token": raw,            // 明文仅此一次
+                    "created_at": now,
+                })),
+            ))
+        }
+        Err(e) if e.0.kind == ErrorKind::Conflict => Err((
+            StatusCode::CONFLICT,
+            Json(ApiErrorBody {
+                code: "ERR_TOKEN_NAME_EXISTS".into(),
+                message: e.0.message.clone(),
+                detail: e.0.detail.clone(),
+            }),
+        )),
+        Err(e) if e.0.kind == ErrorKind::NotFound => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorBody {
+                code: "ERR_NOT_FOUND".into(),
+                message: e.0.message.clone(),
+                detail: e.0.detail.clone(),
+            }),
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// 项目 token 列表（不含明文与 hash；含 revoked 标记）。
+async fn list_project_tokens(
+    State(app): State<ApiState>,
+    AxumPath(pid): AxumPath<String>,
+) -> ApiResult<serde_json::Value> {
+    let sm = app.sm.read().map_err(lock_err)?;
+    let tokens = sm
+        .list_project_tokens(&ProjectId(pid.clone()))
+        .map_err(ApiError::from)?;
+    let out: Vec<serde_json::Value> = tokens
+        .into_iter()
+        .map(|t| {
+            serde_json::json!({
+                "id": t.id,
+                "name": t.name,
+                "created_at": t.created_at,
+                "created_by": t.created_by,
+                "revoked": t.revoked,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!(out)))
+}
+
+/// 吊销项目 token（幂等；不存在 → 404）。
+async fn delete_project_token(
+    principal: axum::Extension<dsh_core::Principal>,
+    State(app): State<ApiState>,
+    AxumPath((pid, tid)): AxumPath<(String, String)>,
+) -> Result<StatusCode, (StatusCode, Json<ApiErrorBody>)> {
+    if !matches!(&*principal, dsh_core::Principal::Admin) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiErrorBody {
+                code: "ERR_FORBIDDEN".into(),
+                message: "仅全局管理员可管理访问令牌".into(),
+                detail: None,
+            }),
+        ));
+    }
+    let now = now_ms();
+    match app
+        .write(
+            &Command::ProjectTokenRevoke {
+                project: ProjectId(pid.clone()),
+                token_id: tid.clone(),
+            },
+            now,
+        )
+        .await
+    {
+        Ok(_) => {
+            app.audit
+                .append(
+                    "token_revoke",
+                    Some(pid.clone()),
+                    Some(tid.clone()),
+                    None,
+                    None,
+                    serde_json::json!({}),
+                    &principal_op(&principal),
+                )
+                .await;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(e) if e.0.kind == ErrorKind::NotFound => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorBody {
+                code: "ERR_NOT_FOUND".into(),
                 message: e.0.message.clone(),
                 detail: e.0.detail.clone(),
             }),
@@ -3788,6 +3982,14 @@ pub fn build_router(app: ApiState) -> Router {
         .route(
             "/api/v1/projects/{p}/admins",
             get(list_project_admins).post(create_project_admin),
+        )
+        .route(
+            "/api/v1/projects/{p}/tokens",
+            get(list_project_tokens).post(create_project_token),
+        )
+        .route(
+            "/api/v1/projects/{p}/tokens/{id}",
+            delete(delete_project_token),
         )
         .route(
             "/api/v1/projects/{p}/admins/{u}",

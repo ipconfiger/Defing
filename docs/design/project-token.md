@@ -80,6 +80,9 @@ ProjectTokenRecord {
 
 - 中间件 `/v1/` 分支：先用新 helper 从路径提取项目（现有 `project_segment` 只解析
   `/api/v1/projects/`，需新增数据面变体，校验字符集同 N2），再查该项目 token 集合：
+- **例外（渲染/reveal）**：`GET .../config?reveal=true` 属管理面能力（解密输出 + 审计，
+  B2：PA 仅能 reveal 自己项目），**不**经数据面 token —— 由 render_config 内会话鉴权（豁免
+  在中间件按 `path.ends_with("/config") && query 含 reveal=true` 判定）；非 reveal 渲染走项目 token。
   - `Authorization: Bearer <token>` 或 `?token=<token>`（保留 SSE EventSource 兼容）；
   - 命中集合内任一 token 的 SHA-256 → 放行；否则 401 `ERR_UNAUTHORIZED`。
 - 删除现有全局 `data_plane_token` 比对分支。
