@@ -12,7 +12,7 @@ next: {title: 07 访问令牌与 SDK, url: /07-tokens/}
 
 左侧导航「共享库」：
 
-![共享库](assets/images/09-shared.png)
+![共享库]({{ site.baseurl }}/assets/images/09-shared.png)
 
 上方表单创建 / 更新共享项，下方列表展示全部共享项（含草稿与已发布状态、被引用处数）。
 
@@ -35,7 +35,7 @@ next: {title: 07 访问令牌与 SDK, url: /07-tokens/}
 
 在项目「结构」页给配置项选「共享引用」→ 共享项：
 
-![草稿页引用共享](assets/images/03-draft.png)
+![草稿页引用共享]({{ site.baseurl }}/assets/images/03-draft.png)
 
 - 引用项在草稿页**只读**，显示「引用共享」徽章与物化值
 - 共享项 `timeout` 发布 v2 后，所有引用它的项目分支自动产生 shared_cascade 版本
@@ -49,4 +49,4 @@ next: {title: 07 访问令牌与 SDK, url: /07-tokens/}
 
 ## 下一步
 
-- [07 访问令牌与 SDK](07-tokens/)：应用如何安全读取配置
+- [07 访问令牌与 SDK]({{ site.baseurl }}/07-tokens/)：应用如何安全读取配置

@@ -53,7 +53,7 @@ DEPLOY__TAG=dev-gray-2025.08
 
 项目「访问令牌」页签顶部直接展示当前项目的 curl 命令（自动带入项目名与当前分支，格式可切换）：
 
-![访问令牌与 curl](assets/images/07-tokens.png)
+![访问令牌与 curl]({{ site.baseurl }}/assets/images/07-tokens.png)
 
 复制命令后把 `<项目访问令牌>` 替换为你的令牌即可使用。
 
@@ -72,4 +72,4 @@ make build  # 编译时使用环境变量
 
 ## 下一步
 
-- [09 管理员与审计](09-admin/)：管理员账号与审计日志
+- [09 管理员与审计]({{ site.baseurl }}/09-admin/)：管理员账号与审计日志

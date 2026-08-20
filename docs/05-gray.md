@@ -12,7 +12,7 @@ next: {title: 06 共享库, url: /06-shared/}
 
 「灰度发布」页签（当前分支有灰度进行中时的界面）：
 
-![灰度发布页](assets/images/05-gray.png)
+![灰度发布页]({{ site.baseurl }}/assets/images/05-gray.png)
 
 顶部状态卡显示：灰度序号 `#1`、稳定版版本号、当前灰度规则摘要。
 
@@ -52,4 +52,4 @@ curl -s "http://<host>:8384/v1/projects/{p}/branches/dev/snapshot" \
 
 ## 下一步
 
-- [06 共享库](06-shared/)：跨项目复用配置项与自动级联
+- [06 共享库]({{ site.baseurl }}/06-shared/)：跨项目复用配置项与自动级联

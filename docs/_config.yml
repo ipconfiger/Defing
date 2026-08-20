@@ -2,7 +2,9 @@
 # 用法：GitHub 仓库 Settings → Pages → Deploy from a branch → Source 选 /docs 即可
 title: Defing 配置中心使用教程
 description: 分布式配置文档服务（Rust + Raft + 三语言 SDK）——项目介绍与 Admin UI 使用教程
-baseurl: ""
+# GitHub Pages 项目站点路径前缀（仓库名）；站点部署在 /Defing/ 下，
+# 站内链接/图片必须带此前缀，否则 /quickstart/ 等子页内的相对链接会解析错位 404
+baseurl: /Defing
 markdown: kramdown
 highlighter: rouge
 permalink: pretty

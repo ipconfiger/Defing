@@ -10,14 +10,14 @@ next: {title: 05 灰度发布, url: /05-gray/}
 
 ## 4.1 草稿页
 
-![草稿页](assets/images/03-draft.png)
+![草稿页]({{ site.baseurl }}/assets/images/03-draft.png)
 
 草稿页按**已发布结构**全量展示配置项：
 
 | 元素 | 说明 |
 |---|---|
 | 普通配置项 | 输入框 / 下拉直接编辑（类型化控件） |
-| **引用共享项** | 只读，显示「引用共享」徽章 + 物化值（见 [03 §3.3](03-structure/)） |
+| **引用共享项** | 只读，显示「引用共享」徽章 + 物化值（见 [03 §3.3]({{ site.baseurl }}/03-structure/)） |
 | secret 项 | 密码框，留空不修改；已加密显示占位 |
 | 未保存 / 草稿未发布徽章 | 实时提示当前界面有多少未保存修改、多少已保存未发布 |
 | 活动版本标记 | 无草稿值时输入框显示**已发布版本的值**（发布后草稿清空也不会是空框） |
@@ -42,13 +42,13 @@ next: {title: 05 灰度发布, url: /05-gray/}
 
 发布前可点「查看配置」预览将发布的文档（YAML / JSON / TOML / ENV 格式，勾选明文显示可解密 secret 并记录审计）：
 
-![配置预览](assets/images/08-preview-env.png)
+![配置预览]({{ site.baseurl }}/assets/images/08-preview-env.png)
 
 ## 4.4 版本历史与回滚
 
 「版本历史」页签列出该分支全部版本：
 
-![版本历史](assets/images/06-versions.png)
+![版本历史]({{ site.baseurl }}/assets/images/06-versions.png)
 
 - 每个版本：版本号、类型（value_publish / structure_publish / shared_cascade / rollback）、备注、操作人、时间
 - **回滚**：基于旧版本内容创建新版本（历史不可变，回滚也是新版本）
@@ -56,9 +56,9 @@ next: {title: 05 灰度发布, url: /05-gray/}
 ## 4.5 多分支协作提示
 
 - 结构变化（新增/删除配置项）会同时推进所有分支的版本
-- 分支间「值提升」见 [02 §2.4](02-project/)
+- 分支间「值提升」见 [02 §2.4]({{ site.baseurl }}/02-project/)
 - 不同分支互不影响，同一分支多人编辑时靠草稿修订号乐观锁防冲突
 
 ## 下一步
 
-- [05 灰度发布](05-gray/)：按标签 / IP / 百分比灰度上线
+- [05 灰度发布]({{ site.baseurl }}/05-gray/)：按标签 / IP / 百分比灰度上线

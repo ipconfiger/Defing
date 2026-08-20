@@ -12,7 +12,7 @@ next: {title: 08 构建脚本取值（curl）, url: /08-curl/}
 
 项目内「访问令牌」页签：
 
-![访问令牌](assets/images/07-tokens.png)
+![访问令牌]({{ site.baseurl }}/assets/images/07-tokens.png)
 
 1. 点「创建令牌」→ 输入名称（如 `build-svc`）
 2. 响应弹窗**明文仅展示这一次**，立即复制保存（服务端只存 SHA-256，无法再次查看）
@@ -21,7 +21,7 @@ next: {title: 08 构建脚本取值（curl）, url: /08-curl/}
 > 令牌**永不过期**，管理靠主动吊销；泄露即吊销重建。
 > 同一项目可建多个令牌：轮换 = 新令牌先分发到客户端，旧令牌下次发版后吊销，零中断。
 
-同一页签顶部提供**构建脚本 curl 命令**（格式可切 YAML / JSON / TOML / ENV），详见 [08 构建脚本取值](08-curl/)。
+同一页签顶部提供**构建脚本 curl 命令**（格式可切 YAML / JSON / TOML / ENV），详见 [08 构建脚本取值]({{ site.baseurl }}/08-curl/)。
 
 ## 7.2 三语言 SDK
 
@@ -69,8 +69,8 @@ snap = c.get('my-app', 'dev')
 | gRPC 优先 / HTTP 降级 | 端点含 `grpc` 地址走 gRPC（:8383），否则 HTTP/SSE |
 | watch 断线续传 | 重连携带 `after_version`，不丢事件 |
 | secret 脱敏 | 数据面恒返回 `***`（服务端不解密） |
-| 灰度身份 | 传 `instance` / `labels` 参与灰度解析（见 [05 灰度发布](05-gray/)） |
+| 灰度身份 | 传 `instance` / `labels` 参与灰度解析（见 [05 灰度发布]({{ site.baseurl }}/05-gray/)） |
 
 ## 下一步
 
-- [08 构建脚本取值（curl）](08-curl/)：编译脚本无需 SDK 直接拉配置
+- [08 构建脚本取值（curl）]({{ site.baseurl }}/08-curl/)：编译脚本无需 SDK 直接拉配置

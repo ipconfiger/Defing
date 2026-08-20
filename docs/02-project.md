@@ -12,7 +12,7 @@ next: {title: 03 结构配置与共享引用, url: /03-structure/}
 
 登录后首页点击「新建项目」，输入项目名（小写字母 / 数字 / 连字符）：
 
-![配置管理首页](assets/images/02-home.png)
+![配置管理首页]({{ site.baseurl }}/assets/images/02-home.png)
 
 项目创建后**自动带 dev / test / prod 三个分支**。
 
@@ -23,7 +23,7 @@ next: {title: 03 结构配置与共享引用, url: /03-structure/}
 - 项目：点项目名（chip）切换；当前项目高亮
 - 分支：下拉选择分支，切换后草稿 / 版本 / 灰度等页签全部跟随该分支
 
-![配置管理首页](assets/images/02-home.png)
+![配置管理首页]({{ site.baseurl }}/assets/images/02-home.png)
 
 分支选择旁显示当前状态徽章：
 
@@ -51,5 +51,5 @@ next: {title: 03 结构配置与共享引用, url: /03-structure/}
 
 ## 下一步
 
-- [03 结构配置与共享引用](03-structure/)：定义组与配置项、共享引用
-- [04 草稿与发布](04-draft/)：为各分支填值并发布
+- [03 结构配置与共享引用]({{ site.baseurl }}/03-structure/)：定义组与配置项、共享引用
+- [04 草稿与发布]({{ site.baseurl }}/04-draft/)：为各分支填值并发布

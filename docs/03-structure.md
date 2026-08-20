@@ -12,7 +12,7 @@ next: {title: 04 草稿与发布, url: /04-draft/}
 
 项目内切到「结构」页签：
 
-![结构页](assets/images/04-structure.png)
+![结构页]({{ site.baseurl }}/assets/images/04-structure.png)
 
 ## 3.2 分组与配置项
 
@@ -37,7 +37,7 @@ next: {title: 04 草稿与发布, url: /04-draft/}
 
 ## 3.3 共享引用
 
-配置项可以引用**共享库**中的共享项（详见 [06 共享库](06-shared/)）：
+配置项可以引用**共享库**中的共享项（详见 [06 共享库]({{ site.baseurl }}/06-shared/)）：
 
 1. 先在「共享库」创建并发布共享项（如 `timeout`）
 2. 结构编辑器里给配置项选「共享引用」下拉 → 选择共享项
@@ -45,7 +45,7 @@ next: {title: 04 草稿与发布, url: /04-draft/}
 
 草稿页中引用项显示「引用共享」徽章且不可编辑：
 
-![草稿页引用共享](assets/images/03-draft.png)
+![草稿页引用共享]({{ site.baseurl }}/assets/images/03-draft.png)
 
 > 引用项的类型 / 必填 / 敏感属性继承共享项定义；被引用的共享项不可直接删除（需先移除引用）。
 
@@ -57,4 +57,4 @@ next: {title: 04 草稿与发布, url: /04-draft/}
 
 ## 下一步
 
-- [04 草稿与发布](04-draft/)：为各分支填值、校验、发布版本
+- [04 草稿与发布]({{ site.baseurl }}/04-draft/)：为各分支填值、校验、发布版本

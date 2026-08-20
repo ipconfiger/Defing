@@ -9,7 +9,7 @@ prev: {title: 08 构建脚本取值（curl）, url: /08-curl/}
 
 左侧导航「管理员」（仅全局管理员可见）：
 
-![管理员视图](assets/images/11-admins.png)
+![管理员视图]({{ site.baseurl }}/assets/images/11-admins.png)
 
 包含两块：
 
@@ -28,7 +28,7 @@ prev: {title: 08 构建脚本取值（curl）, url: /08-curl/}
 
 左侧导航「审计日志」：
 
-![审计日志](assets/images/10-audit.png)
+![审计日志]({{ site.baseurl }}/assets/images/10-audit.png)
 
 记录全部管理面操作：
 
@@ -47,7 +47,7 @@ prev: {title: 08 构建脚本取值（curl）, url: /08-curl/}
 「集群节点」视图展示 Raft 集群成员（node id、gRPC/HTTP 地址、leader / voter 状态、提交日志序号）：
 
 - `--dev-single` 单节点模式无集群成员
-- 集群模式（[01 §1.3](01-install/)）下可查看成员，供 SDK 配置端点池
+- 集群模式（[01 §1.3]({{ site.baseurl }}/01-install/)）下可查看成员，供 SDK 配置端点池
 - 项目管理员可只读查看节点端点（用于配置 SDK 连接）；join / promote / remove 等管理操作仍仅限全局管理员
 
 ## 结语
