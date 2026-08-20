@@ -1,0 +1,75 @@
+---
+layout: default
+title: 08 构建脚本取值（curl）
+prev: {title: 07 访问令牌与 SDK, url: /07-tokens/}
+next: {title: 09 管理员与审计, url: /09-admin/}
+---
+# 08 构建脚本取值（curl）
+
+编译 / 构建脚本无需引入 SDK，直接 `curl` 拉取指定分支的配置，输出任意格式 —— 特别适合在 CI / 编译脚本里预先获取参数。
+
+## 8.1 接口
+
+```text
+GET /v1/projects/{project}/branches/{branch}/config?format={yaml|json|toml|env}&version={n}
+鉴权：Authorization: Bearer <项目访问令牌>   （或 ?token=<令牌> 查询参数）
+```
+
+| 参数 | 说明 |
+|---|---|
+| `project` | 项目名 |
+| `branch` | 分支名（dev / test / prod / 自定义） |
+| `format` | `yaml`（默认）/ `json` / `toml` / `env` |
+| `version` | 可选，指定版本（缺省 = 活动版本） |
+
+## 8.2 用法示例
+
+```bash
+# YAML 输出
+curl -s "http://<host>:8384/v1/projects/my-app/branches/dev/config?format=yaml" \
+  -H "Authorization: Bearer <项目访问令牌>"
+
+# JSON 输出（?token= 查询参数方式，适合无法带自定义头的环境）
+curl -s "http://<host>:8384/v1/projects/my-app/branches/dev/config?format=json&token=<项目访问令牌>"
+
+# 直接落盘 .env 文件
+curl -s "http://<host>:8384/v1/projects/my-app/branches/dev/config?format=env" \
+  -H "Authorization: Bearer <项目访问令牌>" > .env
+```
+
+输出示例（`format=env`）：
+
+```text
+BUILD__CC=gcc
+REDIS__HOST=10.0.0.1
+REDIS__PORT=6379
+REDIS__TIMEOUT=60
+DEPLOY__TAG=dev-gray-2025.08
+```
+
+> ENV 约定：`GROUP__KEY=VALUE`，组 / 键转大写、双下划线分隔；含空格 / 特殊字符自动加引号转义；secret 恒为 `***`。
+
+## 8.3 在 Admin UI 中获取命令
+
+项目「访问令牌」页签顶部直接展示当前项目的 curl 命令（自动带入项目名与当前分支，格式可切换）：
+
+![访问令牌与 curl](assets/images/07-tokens.png)
+
+复制命令后把 `<项目访问令牌>` 替换为你的令牌即可使用。
+
+## 8.4 编译脚本实战
+
+```bash
+# 编译前拉取 prod 分支配置并生成 .env
+curl -sf "$DEFING_URL/v1/projects/$APP/branches/prod/config?format=env" \
+  -H "Authorization: Bearer $DEFING_TOKEN" > .env
+source .env
+make build  # 编译时使用环境变量
+```
+
+- 用 `curl -f`（失败即报错），令牌过期 / 分支不存在时构建脚本直接失败而不是静默用旧值
+- secret 项在数据面恒脱敏，**不要**依赖该接口获取密钥（密钥应走独立的密钥管理）
+
+## 下一步
+
+- [09 管理员与审计](09-admin/)：管理员账号与审计日志

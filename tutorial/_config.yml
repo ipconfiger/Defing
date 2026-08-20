@@ -1,0 +1,31 @@
+# Defing 配置中心 —— Jekyll 站点配置（GitHub Pages 兼容）
+# 用法：GitHub 仓库 Settings → Pages → Deploy from a branch → Source 选 /tutorial 即可
+title: Defing 配置中心使用教程
+description: 分布式配置文档服务（Rust + Raft + 三语言 SDK）——项目介绍与 Admin UI 使用教程
+baseurl: ""
+markdown: kramdown
+highlighter: rouge
+permalink: pretty
+
+# 导航章节（tutorial 根目录，顺序即导航顺序）
+guides:
+  - title: 快速开始
+    url: /quickstart/
+  - title: 01 部署与启动
+    url: /01-install/
+  - title: 02 项目与分支
+    url: /02-project/
+  - title: 03 结构配置与共享引用
+    url: /03-structure/
+  - title: 04 草稿与发布
+    url: /04-draft/
+  - title: 05 灰度发布
+    url: /05-gray/
+  - title: 06 共享库
+    url: /06-shared/
+  - title: 07 访问令牌与 SDK
+    url: /07-tokens/
+  - title: 08 构建脚本取值（curl）
+    url: /08-curl/
+  - title: 09 管理员与审计
+    url: /09-admin/
