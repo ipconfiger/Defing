@@ -41,8 +41,9 @@
 
 ```
 ProjectTokenRecord {
-  id: String,            // token id（随机 16 hex），集群内唯一
+  id: String,            // token id（= hash 前 16 位 hex），集群内唯一
   name: String,          // 展示名（如 "订单服务 2025-08"），项目内唯一（校验 [A-Za-z0-9._-]{1,64}）
+  project: ProjectId,    // 所属项目（鉴权时校验请求项目 == 记录项目）
   hash: String,          // SHA-256(明文 token) hex —— 落盘/备份/审计永无明文
   created_at: u64,
   created_by: String,    // 创建人（全局管理员标识）
@@ -50,11 +51,12 @@ ProjectTokenRecord {
 }
 ```
 
-- **KV**：`p/{pid}/tok/{token_id}`（keys.rs 新增 `K_PROJECT_TOKEN: "tok/"`，挂项目前缀下）。
+- **KV（扁平，hash 即 key）**：`tok/{hash}` → ProjectTokenRecord（keys.rs 新增 `K_DATA_TOKEN: "tok/"`）。
+  - **数据面鉴权 = 单次 KV 读 O(1)**：请求带明文 token → SHA-256 → 直接 load `tok/{hash}` →
+    校验未吊销且 `project` 匹配（`list_members` 无 project 字段 → 任一未吊销即放行）；
+  - 项目 token 列表 / name 项目内唯一性校验走 `tok/` 前缀扫描（O(全部 token 数)，管理面低频操作，可接受）。
 - **明文 token**：随机 32 hex（复用现有 `new_token()` 模式），**仅在创建响应中出现一次**；
   服务端只存哈希，无法回显明文 → UI 只提供"创建/吊销"，不提供"查看"。
-- **数据面查询索引**：项目 token 集合按 `hash → record` 建内存索引（项目 token 数小，
-  创建/吊销时重建或增量更新）；请求来时对 Bearer 值做一次 SHA-256 查表，O(1) 校验。
 - **命令**（raft wire 兼容：保持现有变体不动，纯新增，旧日志重放安全）：
   - `ProjectTokenCreate { project, name, token_hash, operator, ts }` → 校验项目存在、name 唯一；
   - `ProjectTokenRevoke { project, token_id, operator, ts }` → 幂等（吊销不存在 id 返回 NOT_FOUND）。
