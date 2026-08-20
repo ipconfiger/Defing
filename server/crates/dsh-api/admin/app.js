@@ -571,8 +571,13 @@ function renderDraftEditor(b) {
   // 现有草稿值索引（保存时空值 = 删除该草稿值）
   S.draftValKeys = {};
   for (const g of Object.keys(b.draft || {})) for (const k of Object.keys(b.draft[g] || {})) S.draftValKeys[g + '/' + k] = true;
-  // 引用项索引（只读展示：值来自共享库）
+  // 引用项索引（只读展示：值来自共享库）；每次重渲染重置，避免分支切换残留
+  S.sharedRefs = {};
   for (const r of (b.shared_refs || [])) S.sharedRefs[r.group + '/' + r.key] = r;
+  // 结构草稿中的引用定义（未发布引用：草稿页同样只读展示，避免「结构里设了引用、草稿页却显示可编辑空框」）
+  const draftRefs = {};
+  for (const g of ((S.structDraft && S.structDraft.groups) || []))
+    for (const it of g.items) if (it.shared_ref) draftRefs[g.name + '/' + it.key] = it.shared_ref;
   // 结构驱动：一次性展示已发布结构的全部组/配置项，直接改值保存（草稿不再是「添加配置项」模式）
   const groups = (S.pubStruct && S.pubStruct.groups) || [];
   if (!groups.length) {
@@ -581,11 +586,18 @@ function renderDraftEditor(b) {
     return;
   }
   $('draft-groups').innerHTML = groups.map((g) => {
-    const refCount = g.items.filter((it) => it.shared_ref).length;
+    const refCount = g.items.filter((it) => !!(it.shared_ref || draftRefs[g.name + '/' + it.key])).length;
     const refBadge = refCount ? `<span class="badge acc" title="值由共享库物化，只读">${refCount} 引用共享</span>` : '';
     const rows = g.items.map((it) => {
-      if (it.shared_ref) {
-        const ref = S.sharedRefs[g.name + '/' + it.key] || { group: g.name, key: it.key, shared_key: it.shared_ref, version: '—', value: {} };
+      const refKey = g.name + '/' + it.key;
+      if (it.shared_ref || draftRefs[refKey]) {
+        let ref = S.sharedRefs[refKey];
+        if (!ref) {
+          // 未发布引用（结构草稿已设、结构未发布）：取共享项当前值展示，版本标注「草稿」
+          const sharedKey = it.shared_ref || draftRefs[refKey];
+          const sh = (S.sharedItems || []).find((s) => s.key === sharedKey);
+          ref = { group: g.name, key: it.key, shared_key: sharedKey, version: '草稿', value: sh ? sh.value : {} };
+        }
         return sharedRefRowHtml(ref);
       }
       const dv = (b.draft && b.draft[g.name] && b.draft[g.name][it.key]) ? b.draft[g.name][it.key].value : null;
