@@ -172,11 +172,12 @@ actions.switchView = function (el) {
   if (v === 'audit') loadAudit();
   if (v === 'cluster') loadCluster();
 };
-actions.switchPane = function (el) {
-  S.pane = el.dataset.pane;
+function setPane(pane) {
+  S.pane = pane;
   $$('#pane-seg button').forEach((b) => b.classList.toggle('active', b.dataset.pane === S.pane));
   $$('.pane').forEach((p) => p.classList.toggle('hidden', p.id !== 'pane-' + S.pane));
-};
+}
+actions.switchPane = function (el) { setPane(el.dataset.pane); };
 actions.toggleTheme = function () {
   const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
   localStorage.setItem(LS_THEME, next);
@@ -543,7 +544,7 @@ function fmtVal(v) {
   return JSON.stringify(v);
 }
 
-actions.manageGroups = function () { switchPane('structure'); };
+actions.manageGroups = function () { setPane('structure'); };
 
 function buildValue(ty, raw) {
   // 非法数值显式报错，不静默置 0
@@ -709,24 +710,33 @@ function renderValueAddForm() {
   }
 }
 
+// key 可填写（datalist 提供结构内建议；未知 key 提交时由服务端按已发布结构校验）
 function populateKeySel() {
   const g = S.defs.groups.find((x) => x.name === $('new-item-group').value);
   const ks = $('new-item-key');
   const prevK = ks.value;
+  const list = $('new-item-key-list');
   if (!g || !g.items.length) {
-    ks.innerHTML = '<option value="">（该组暂无配置项）</option>';
+    if (list) list.innerHTML = '';
     setAddValueType('string');
     return;
   }
   const draftKeys = S.draftValKeys || {};
-  ks.innerHTML = g.items.map((it) => {
+  if (list) list.innerHTML = g.items.map((it) => {
     const has = draftKeys[g.name + '/' + it.key] ? ' · 已有草稿值' : '';
-    const refTag = it.shared_ref ? ' · 引用共享项' : '';
-    return `<option value="${esc(it.key)}"${it.shared_ref ? ' disabled title="引用共享项 ' + esc(it.shared_ref) + '，只读，不可添加本地值"' : ''}>${esc(it.key)} · ${esc(it.type)}${esc(has)}${refTag}</option>`;
+    const refTag = it.shared_ref ? ' · 引用共享项（只读）' : '';
+    return `<option value="${esc(it.key)}">${esc(it.type)}${esc(has)}${refTag}</option>`;
   }).join('');
   if (prevK && g.items.some((it) => it.key === prevK)) ks.value = prevK;
-  const def = g.items.find((it) => it.key === ks.value);
-  setAddItemTypeShow(def ? def.type : g.items[0].type);
+  resolveCascadeKeyType();
+}
+
+// 按当前输入的 key 解析类型：命中结构项取其类型，未命中回退 string（服务端会按已发布结构校验）
+function resolveCascadeKeyType() {
+  const g = S.defs.groups.find((x) => x.name === $('new-item-group').value);
+  const k = $('new-item-key').value;
+  const def = g && g.items.find((it) => it.key === k);
+  setAddItemTypeShow(def ? def.type : 'string');
 }
 
 function setAddItemTypeShow(ty) {
@@ -737,11 +747,7 @@ function setAddItemTypeShow(ty) {
 }
 
 actions.cascadeGroup = function () { populateKeySel(); }; // 仅响应 change
-actions.cascadeKey = function () {
-  const g = S.defs.groups.find((x) => x.name === $('new-item-group').value);
-  const def = g && g.items.find((it) => it.key === $('new-item-key').value);
-  if (def) setAddItemTypeShow(def.type);
-}; // 仅响应 change
+actions.cascadeKey = function () { resolveCascadeKeyType(); }; // 仅响应 change
 actions.addItemType = function (el) { setAddValueType(el.value); }; // 仅响应 change（回退模式类型下拉）
 
 actions.addDraftItem = async function (el) {
@@ -749,10 +755,11 @@ actions.addDraftItem = async function (el) {
   let g, k, ty;
   if (cascading) {
     g = $('new-item-group').value;
-    k = $('new-item-key').value;
-    if (!g || !k) { showErr('add-item-err', '请选择组与配置项'); return; }
+    k = $('new-item-key').value.trim();
+    if (!g || !k) { showErr('add-item-err', '请填写组与 key'); return; }
     const grp = S.defs.groups.find((x) => x.name === g);
     const def = grp && grp.items.find((it) => it.key === k);
+    if (def && def.shared_ref) { showErr('add-item-err', '配置项 ' + k + ' 引用共享项，只读，不可添加本地值'); return; }
     ty = def ? def.type : 'string';
   } else {
     g = $('new-item-group-ft').value.trim();
