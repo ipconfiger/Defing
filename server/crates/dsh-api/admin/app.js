@@ -652,9 +652,9 @@ const VAL_HINTS = {
   secret: '输入明文，由服务端加密存储；留空不修改',
 };
 
-function addValueControlHtml(ty) {
-  const base = 'id="new-item-val" class="in mono"';
-  if (ty === 'bool') return `<label class="check"><input type="checkbox" id="new-item-val"> 启用（true）</label>`;
+function valueControlHtml(ty, id) {
+  const base = `id="${id}" class="in mono"`;
+  if (ty === 'bool') return `<label class="check"><input type="checkbox" id="${id}"> 启用（true）</label>`;
   if (ty === 'int') return `<input type="number" step="1" ${base} placeholder="如 100">`;
   if (ty === 'float') return `<input type="number" step="any" ${base} placeholder="如 0.5">`;
   if (ty === 'json') return `<textarea ${base} rows="3" spellcheck="false" placeholder='{"retries": 3}'></textarea>`;
@@ -662,6 +662,8 @@ function addValueControlHtml(ty) {
   if (ty === 'secret') return `<input type="password" ${base} placeholder="输入明文，由服务端加密存储" autocomplete="new-password">`;
   return `<input ${base} placeholder="字符串值">`;
 }
+
+function addValueControlHtml(ty) { return valueControlHtml(ty, 'new-item-val'); }
 
 function setAddValueType(ty) {
   $('new-item-val-wrap').innerHTML = addValueControlHtml(ty);
@@ -1608,6 +1610,7 @@ actions.doPromote = async function (el) {
 
 /* ---------- 共享库 ---------- */
 async function loadShared() {
+  if ($('sh-value-wrap') && !$('sh-value-wrap').innerHTML) renderSharedValueControl(); // 首次进入/类型变更后初始化
   $('shared-body').innerHTML = '<tr><td colspan="8">' + skeleton(4) + '</td></tr>';
   try {
     const [pub, draft] = await Promise.all([
@@ -1643,16 +1646,30 @@ async function loadShared() {
 }
 actions.refreshShared = function () { loadShared(); };
 
+// 共享项值输入：按类型渲染控件（与配置管理页一致；不再要求手写 Value JSON）
+function renderSharedValueControl() {
+  const ty = $('sh-type') ? $('sh-type').value : 'string';
+  $('sh-value-wrap').innerHTML = valueControlHtml(ty, 'sh-value');
+  const hint = $('sh-value-hint');
+  if (hint) hint.textContent = '类型 ' + ty + ' · ' + (VAL_HINTS[ty] || '');
+}
+actions.shType = function () { renderSharedValueControl(); }; // 仅响应 change
+
 actions.saveShared = async function (el) {
   const key = $('sh-key').value.trim();
   if (!key) { showErr('sh-err', 'key 必填'); return; }
+  const ty = $('sh-type').value;
+  const valEl = $('sh-value');
+  if (!valEl) { showErr('sh-err', '请先填写值'); return; }
+  const raw = (valEl.type === 'checkbox') ? ((valEl.checked) ? 'true' : 'false') : valEl.value;
+  if (ty !== 'bool' && !raw.trim()) { showErr('sh-err', '请填写值'); return; }
   let value;
-  try { value = JSON.parse($('sh-value').value); }
-  catch (e) { showErr('sh-err', '值 JSON 非法：' + e.message); return; }
+  try { value = buildValue(ty, raw); }
+  catch (e) { showErr('sh-err', e.message); return; }
   const desc = $('sh-desc') ? $('sh-desc').value.trim() : '';
   if (desc && desc.length > 200) { showErr('sh-err', '描述超过 200 字节上限'); return; }
   hideErr('sh-err');
-  const body = { key, type: $('sh-type').value, secret: $('sh-secret').checked, required: $('sh-required').checked, description: desc || undefined, value };
+  const body = { key, type: ty, secret: $('sh-secret').checked, required: $('sh-required').checked, description: desc || undefined, value };
   await withBusy(el, async () => {
     try {
       await j('POST', '/api/v1/shared', body);

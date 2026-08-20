@@ -348,7 +348,7 @@
               <div class="grid-2" style="gap:0 16px">
                 <div class="field">
                   <label for="sh-type">类型</label>
-                  <select class="sel" id="sh-type">
+                  <select class="sel" id="sh-type" data-act="shType">
                     <option value="string">string</option><option value="int">int</option>
                     <option value="float">float</option><option value="bool">bool</option>
                     <option value="json">json</option><option value="array">array</option>
@@ -364,9 +364,9 @@
                 </div>
               </div>
               <div class="field">
-                <label for="sh-value">值（JSON）</label>
-                <textarea class="in mono" id="sh-value" rows="3" spellcheck="false" placeholder='{"type":"string","str_value":"info"}'></textarea>
-                <p class="hint">按类型取值字段：string → str_value，int → int_value，float → float_value，bool → bool_value，json → json_value，array → list_value。</p>
+                <label for="sh-value">值</label>
+                <div id="sh-value-wrap"></div>
+                <p class="hint" id="sh-value-hint"></p>
               </div>
               <div id="sh-err" class="field-err hidden"></div>
               <button type="button" class="btn" data-act="saveShared">保存共享草稿</button>
