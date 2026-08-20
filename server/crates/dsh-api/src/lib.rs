@@ -530,10 +530,7 @@ fn pa_allowed(principal: &dsh_core::Principal, method: &str, path: &str) -> bool
     if method == "GET" && path == "/api/v1/audit" {
         return true;
     }
-    // 共享引用只读（handler 内强制覆写 project，N11）
-    if method == "GET" && path == "/api/v1/shared/refs" {
-        return true;
-    }
+
     // 项目本地端点：/api/v1/projects/{p}/... 且 p == 自己项目
     if let Some(p) = project_segment(path) {
         if &p != pid {

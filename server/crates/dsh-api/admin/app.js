@@ -230,9 +230,12 @@ function enterApp() {
   S.role = localStorage.getItem(LS_ROLE) || '';
   S.roleProject = localStorage.getItem(LS_PROJ) || '';
   renderSession();
-  // 「管理员」视图仅全局管理员可见（项目管理员无权访问 /admins 与 set-password）
-  const navAdmins = $('nav-admins');
-  if (navAdmins) navAdmins.classList.toggle('hidden', S.role === 'project_admin');
+  // 导航按角色过滤：项目管理员仅保留「配置管理」「审计日志」（服务端矩阵：共享/集群/管理员对 PA 一律 403）
+  const isPa = S.role === 'project_admin';
+  for (const id of ['nav-shared', 'nav-cluster', 'nav-admins']) {
+    const el = $(id);
+    if (el) el.classList.toggle('hidden', isPa);
+  }
   $('login-view').classList.add('hidden');
   $('app').classList.remove('hidden');
   loadProjects();
