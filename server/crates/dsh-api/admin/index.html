@@ -40,6 +40,7 @@
   <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></symbol>
   <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
   <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></symbol>
+  <symbol id="i-admin" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0 1 16 0v1"/></symbol>
 </svg>
 
 <noscript><p style="padding:24px;text-align:center">Defing 管理控制台需要启用 JavaScript。</p></noscript>
@@ -78,6 +79,7 @@
       <button type="button" class="nav-item" data-act="switchView" data-nav="shared"><svg class="ic"><use href="#i-shared"/></svg><span>共享库</span></button>
       <button type="button" class="nav-item" data-act="switchView" data-nav="audit"><svg class="ic"><use href="#i-audit"/></svg><span>审计日志</span></button>
       <button type="button" class="nav-item" data-act="switchView" data-nav="cluster"><svg class="ic"><use href="#i-cluster"/></svg><span>集群节点</span></button>
+      <button type="button" class="nav-item" id="nav-admins" data-act="switchView" data-nav="admins"><svg class="ic"><use href="#i-admin"/></svg><span>管理员</span></button>
     </nav>
     <div class="sidebar-foot">
       <div class="session">
@@ -390,6 +392,57 @@
           </div>
         </header>
         <div id="cluster-out" class="stack"></div>
+      </section>
+
+      <!-- ===== 管理员（全局管理员专用） ===== -->
+      <section id="view-admins" class="view hidden">
+        <header class="view-head">
+          <h1>管理员</h1>
+          <p class="view-sub">全局管理员密码与项目管理员账号管理（仅全局管理员）</p>
+        </header>
+        <div class="stack">
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-head"><h3>全局管理员密码</h3></div>
+              <div class="field">
+                <label for="g-password">新密码（至少 6 位）</label>
+                <input class="in" id="g-password" type="password" autocomplete="new-password">
+              </div>
+              <div class="field">
+                <label for="g-password2">确认新密码</label>
+                <input class="in" id="g-password2" type="password" autocomplete="new-password">
+              </div>
+              <div id="g-err" class="field-err hidden"></div>
+              <button type="button" class="btn" data-act="setGlobalPassword">修改密码</button>
+              <p class="hint" style="margin:10px 0 0">修改后全部管理员会话将失效，需重新登录。</p>
+            </div>
+            <div class="card">
+              <div class="card-head"><h3>项目管理员</h3></div>
+              <div class="row" style="gap:10px">
+                <select class="sel" id="adm-project" data-act="admSelectProject" aria-label="选择项目"></select>
+                <span class="hint" style="margin:0">账号仅能管理所选项目的配置，不能触碰共享库/全局面。</span>
+              </div>
+              <div class="grid-2" style="gap:0 16px;margin-top:12px">
+                <div class="field">
+                  <label for="adm-username">用户名（[A-Za-z0-9_-]{2,64}，禁用 admin）</label>
+                  <input class="in mono" id="adm-username" placeholder="如 alice">
+                </div>
+                <div class="field">
+                  <label for="adm-password">初始密码（至少 6 位）</label>
+                  <input class="in" id="adm-password" type="password" autocomplete="new-password">
+                </div>
+              </div>
+              <div id="adm-err" class="field-err hidden"></div>
+              <button type="button" class="btn" data-act="createAdmin"><svg class="ic"><use href="#i-plus"/></svg>创建项目管理员</button>
+              <div class="table-wrap" style="margin-top:14px">
+                <table class="table">
+                  <thead><tr><th>用户名</th><th>创建时间</th><th></th><th></th></tr></thead>
+                  <tbody id="adm-body"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
       </section>
 
     </div>

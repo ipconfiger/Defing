@@ -171,6 +171,7 @@ actions.switchView = function (el) {
   if (v === 'shared') loadShared();
   if (v === 'audit') loadAudit();
   if (v === 'cluster') loadCluster();
+  if (v === 'admins') loadAdmins();
 };
 function setPane(pane) {
   S.pane = pane;
@@ -229,6 +230,9 @@ function enterApp() {
   S.role = localStorage.getItem(LS_ROLE) || '';
   S.roleProject = localStorage.getItem(LS_PROJ) || '';
   renderSession();
+  // 「管理员」视图仅全局管理员可见（项目管理员无权访问 /admins 与 set-password）
+  const navAdmins = $('nav-admins');
+  if (navAdmins) navAdmins.classList.toggle('hidden', S.role === 'project_admin');
   $('login-view').classList.add('hidden');
   $('app').classList.remove('hidden');
   loadProjects();
@@ -1700,11 +1704,105 @@ actions.removeNode = function (el) {
   });
 };
 
+/* ---------- 管理员（全局管理员：全局改密 + 项目管理员账号管理） ---------- */
+async function loadAdmins() {
+  const sel = $('adm-project');
+  if (!sel) return;
+  if (!S.projects.length) {
+    try { S.projects = (await j('GET', '/api/v1/projects')) || []; } catch (_) { /* 401 由 j() 统一处理 */ }
+  }
+  sel.innerHTML = S.projects.map((p) => `<option value="${esc(p.id)}">${esc(p.id)}</option>`).join('');
+  if (S.project && S.projects.some((p) => p.id === S.project)) sel.value = S.project;
+  refreshAdmins();
+}
+
+async function refreshAdmins() {
+  const pid = $('adm-project').value;
+  if (!pid) { $('adm-body').innerHTML = '<tr><td colspan="4" class="muted">请选择项目</td></tr>'; return; }
+  const rows = await j('GET', `/api/v1/projects/${encodeURIComponent(pid)}/admins`).catch(() => []);
+  if (!rows.length) {
+    $('adm-body').innerHTML = '<tr><td colspan="4"><div class="empty mini"><svg class="ic"><use href="#i-admin"/></svg><h4>暂无项目管理员</h4><p>在上方表单创建；项目管理员只能管理本项目的配置。</p></div></td></tr>';
+    return;
+  }
+  $('adm-body').innerHTML = rows.map((a) => `<tr>
+    <td class="mono">${esc(a.username)}</td>
+    <td class="muted small">${fmtTime(a.created_at)}</td>
+    <td><button type="button" class="btn sm ghost" data-act="setAdminPw" data-u="${esc(a.username)}">改密</button></td>
+    <td><button type="button" class="btn sm ghost danger" data-act="deleteAdmin" data-u="${esc(a.username)}">删除</button></td>
+  </tr>`).join('');
+}
+actions.admSelectProject = function () { refreshAdmins(); }; // 仅响应 change
+
+actions.createAdmin = async function (el) {
+  const pid = $('adm-project').value;
+  const u = $('adm-username').value.trim();
+  const p = $('adm-password').value;
+  if (!pid || !u || !p) { showErr('adm-err', '项目 / 用户名 / 密码必填'); return; }
+  hideErr('adm-err');
+  await withBusy(el, async () => {
+    try {
+      await j('POST', `/api/v1/projects/${encodeURIComponent(pid)}/admins`, { username: u, password: p });
+      toast('项目管理员已创建');
+      $('adm-username').value = ''; $('adm-password').value = '';
+      refreshAdmins();
+    } catch (e) { if (!e.expired) toast(e.message, 'err'); }
+  });
+};
+
+actions.deleteAdmin = function (el) {
+  const pid = $('adm-project').value;
+  const u = el.dataset.u;
+  openModal({
+    title: '删除管理员 ' + u,
+    message: '确认删除项目管理员「' + u + '」？其全部会话将一并失效。',
+    okText: '删除', danger: true,
+    onOk: async () => {
+      try {
+        await j('DELETE', `/api/v1/projects/${encodeURIComponent(pid)}/admins/${encodeURIComponent(u)}`);
+        toast('已删除');
+        refreshAdmins();
+      } catch (e) { if (!e.expired) toast(e.message, 'err'); }
+    },
+  });
+};
+
+actions.setAdminPw = function (el) {
+  const pid = $('adm-project').value;
+  const u = el.dataset.u;
+  openModal({
+    title: '修改密码 · ' + u,
+    message: '为项目管理员「' + u + '」设置新密码（至少 6 位），其现有会话将失效。',
+    input: true, label: '新密码', placeholder: '至少 6 位',
+    okText: '修改',
+    onOk: async (pw) => {
+      if (!pw || pw.length < 6) { toast('密码至少 6 位', 'err'); return; }
+      try {
+        await j('PUT', `/api/v1/projects/${encodeURIComponent(pid)}/admins/${encodeURIComponent(u)}`, { password: pw });
+        toast('密码已修改');
+      } catch (e) { if (!e.expired) toast(e.message, 'err'); }
+    },
+  });
+};
+
+actions.setGlobalPassword = async function (el) {
+  const p = $('g-password').value;
+  const p2 = $('g-password2').value;
+  if (!p || p.length < 6) { showErr('g-err', '新密码至少 6 位'); return; }
+  if (p !== p2) { showErr('g-err', '两次输入不一致'); return; }
+  hideErr('g-err');
+  await withBusy(el, async () => {
+    try {
+      await j('POST', '/api/v1/admin/set-password', { password: p });
+      toast('全局管理员密码已修改，请重新登录');
+      $('g-password').value = ''; $('g-password2').value = '';
+    } catch (e) { if (!e.expired) toast(e.message, 'err'); }
+  });
+};
 /* ============================================================
    事件绑定与启动
    ============================================================ */
 const CHANGE_ONLY = new Set([
-  'selectBranch', 'cfgFormat', 'cfgReveal',          // 下拉/复选：仅响应 change，避免 click 误触发
+  'selectBranch', 'cfgFormat', 'cfgReveal', 'admSelectProject', // 下拉/复选：仅响应 change，避免 click 误触发
   'structType', 'structSecret', 'renameStructGroup', // 结构编辑器行内控件
 ]);
 
