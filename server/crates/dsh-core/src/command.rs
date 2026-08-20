@@ -289,4 +289,22 @@ pub enum Command {
         #[serde(default)]
         ts: i64,
     },
+
+    // ---------------- 项目访问令牌（project-token，纯新增变体，既有变体不动） ----------------
+    /// 创建项目访问令牌：校验项目存在、name 项目内唯一；只落 SHA-256 hash（明文不落库/不落日志）。
+    ProjectTokenCreate {
+        project: ProjectId,
+        name: String,
+        token_hash: String,
+        #[serde(default)]
+        operator: String,
+        /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）
+        #[serde(default)]
+        ts: i64,
+    },
+    /// 吊销项目访问令牌（软删除：revoked=true；重复吊销幂等）。
+    ProjectTokenRevoke {
+        project: ProjectId,
+        token_id: String,
+    },
 }

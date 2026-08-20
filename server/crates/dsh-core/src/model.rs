@@ -451,6 +451,25 @@ pub struct ProjectAdminAccount {
     pub created_at: i64,
 }
 
+/// 项目访问令牌（机器凭据）：数据面鉴权用；明文仅在创建响应出现一次，
+/// 落盘只存 SHA-256（token_hash）。key = tok/{hash}（扁平，鉴权单次 KV 读）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectTokenRecord {
+    /// token id（= hash 前 16 位 hex），集群内唯一。
+    pub id: String,
+    /// 展示名（如 "订单服务 2025-08"），项目内唯一（校验 [A-Za-z0-9._-]{1,64}）。
+    pub name: String,
+    /// 所属项目（鉴权时校验请求项目 == 记录项目）。
+    pub project: ProjectId,
+    /// SHA-256(明文 token) hex —— 落盘/备份/审计永无明文。
+    pub hash: String,
+    pub created_at: u64,
+    /// 创建人（principal_op 输出："admin" / "pa:{username}"）。
+    pub created_by: String,
+    /// 软删除标记（数据面鉴权过滤；保留记录供审计追溯）。
+    pub revoked: bool,
+}
+
 /// 管理员会话（每主体单会话；状态机内只存 token 哈希，明文令牌不落库/不落日志）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdminSession {

@@ -20,6 +20,12 @@ pub const K_AUDIT_SEQ: &str = "audit/seq";
 pub const K_IDX_PNAME: &str = "idx/pname/";
 /// 项目管理员账号前缀：adm/pa/{username} → ProjectAdminAccount。
 pub const K_PA_ACCOUNT: &str = "adm/pa/";
+/// 项目访问令牌键：tok/{hash}（扁平；数据面鉴权单次 KV 读）。
+pub const K_DATA_TOKEN: &str = "tok/";
+
+pub fn data_token_key(hash: &str) -> String {
+    format!("{K_DATA_TOKEN}{hash}")
+}
 /// 项目管理员会话前缀：sess/pa/{username} → AdminSession（每账号单会话）。
 pub const K_PA_SESSION: &str = "sess/pa/";
 
@@ -143,6 +149,7 @@ mod tests {
             gray_snap_key(&id, &b, 12),
             "p/order-service/b/prod/gray-snap/12"
         );
+        assert_eq!(data_token_key("ab12"), "tok/ab12");
         assert_eq!(shared_key("timeout"), "sh/timeout");
         assert_eq!(shared_draft_key("timeout"), "sh-draft/timeout");
         assert_eq!(idx_pname("order-service"), "idx/pname/order-service");

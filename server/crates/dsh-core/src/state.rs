@@ -1198,6 +1198,22 @@ impl StateMachine {
                 Self::eff_ts(ts, now_ms),
                 operator,
             ),
+            Command::ProjectTokenCreate {
+                project,
+                name,
+                token_hash,
+                operator,
+                ts,
+            } => self.apply_project_token_create(
+                project,
+                name,
+                token_hash,
+                operator,
+                Self::eff_ts(ts, now_ms),
+            ),
+            Command::ProjectTokenRevoke { project, token_id } => {
+                self.apply_project_token_revoke(project, token_id)
+            }
         }
     }
 
@@ -1247,6 +1263,14 @@ impl StateMachine {
         for acct in self.list_project_admins(&id.0)? {
             self.delete_all_pa_sessions(&acct.username)?;
             self.delete_pending(project_admin_key(&acct.username).as_bytes())?;
+        }
+        // 级联删除该项目全部访问令牌（扁平 tok/ 前缀过滤项目，不在 p/{pid} 下，必须显式清理）
+        for (k, raw) in self.get_prefix_merged(K_DATA_TOKEN.as_bytes())? {
+            if let Ok(rec) = serde_json::from_slice::<ProjectTokenRecord>(&raw) {
+                if rec.project == *id {
+                    self.delete_pending(&k)?;
+                }
+            }
         }
         // 共享引用已内嵌项目结构（随项目前缀一并删除），无需清理独立引用索引。
         Ok(vec![])
@@ -2425,6 +2449,111 @@ impl StateMachine {
         // 改密即时收回全部会话（权限立即生效；旧+新格式双删）
         self.delete_all_pa_sessions(username)?;
         Ok(vec![])
+    }
+
+    /// token 名称字符集：[A-Za-z0-9._-]{1,64}。
+    fn valid_token_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    }
+
+    fn apply_project_token_create(
+        &mut self,
+        project: &ProjectId,
+        name: &str,
+        token_hash: &str,
+        operator: &str,
+        now_ms: i64,
+    ) -> ApplyOutcome {
+        if !Self::valid_token_name(name) {
+            return Err(Error::new(
+                ErrorKind::Validation,
+                "token 名称须为 1-64 位 [A-Za-z0-9._-]",
+            ));
+        }
+        if load::<Project>(&*self.store, &project_key(project))?.is_none() {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                format!("项目 {project} 不存在"),
+            ));
+        }
+        // 幂等：同 hash（同一明文 token）已存在 → no-op（重试/重放安全）
+        if load::<ProjectTokenRecord>(&*self.store, &data_token_key(token_hash))?.is_some() {
+            return Ok(vec![]);
+        }
+        // name 项目内唯一（扫 tok/ 前缀过滤项目，O(全部 token 数)，创建低频可接受）
+        for (_, raw) in self.get_prefix_merged(K_DATA_TOKEN.as_bytes())? {
+            if let Ok(rec) = serde_json::from_slice::<ProjectTokenRecord>(&raw) {
+                if rec.project == *project && rec.name == name {
+                    return Err(Error::new(ErrorKind::Conflict, "该项目下 token 名称已存在"));
+                }
+            }
+        }
+        // operator 空串（旧日志）按 command.rs 约定归一为 "admin"
+        let created_by = if operator.is_empty() { "admin" } else { operator };
+        let id: String = token_hash.chars().take(16).collect();
+        let rec = ProjectTokenRecord {
+            id,
+            name: name.to_string(),
+            project: project.clone(),
+            hash: token_hash.to_string(),
+            created_at: now_ms.max(0) as u64,
+            created_by: created_by.to_string(),
+            revoked: false,
+        };
+        self.save_pending(&data_token_key(token_hash), &rec)?;
+        Ok(vec![])
+    }
+
+    fn apply_project_token_revoke(&mut self, project: &ProjectId, token_id: &str) -> ApplyOutcome {
+        // 按项目 + id 定位（扫 tok/ 前缀；吊销低频可接受）
+        let mut target: Option<Vec<u8>> = None;
+        for (k, raw) in self.get_prefix_merged(K_DATA_TOKEN.as_bytes())? {
+            if let Ok(rec) = serde_json::from_slice::<ProjectTokenRecord>(&raw) {
+                if rec.project == *project && rec.id == token_id {
+                    target = Some(k);
+                    break;
+                }
+            }
+        }
+        let Some(key) = target else {
+            return Err(Error::new(ErrorKind::NotFound, "token 不存在"));
+        };
+        let key_str = String::from_utf8_lossy(&key).to_string();
+        let Some(mut rec) = load::<ProjectTokenRecord>(&*self.store, &key_str)? else {
+            return Err(Error::new(ErrorKind::NotFound, "token 不存在"));
+        };
+        if rec.revoked {
+            return Ok(vec![]); // 幂等
+        }
+        rec.revoked = true;
+        self.save_pending(&key_str, &rec)?;
+        Ok(vec![])
+    }
+
+    /// 数据面鉴权：按 hash 读 token 记录（O(1) 单次 KV 读）。
+    pub fn get_data_token(&self, hash: &str) -> Result<Option<ProjectTokenRecord>, Error> {
+        self.load_merged(&data_token_key(hash))
+    }
+
+    /// 管理面列表：某项目全部 token（含已吊销；按创建时间升序）。
+    pub fn list_project_tokens(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Vec<ProjectTokenRecord>, Error> {
+        let mut out = vec![];
+        for (_, raw) in self.get_prefix_merged(K_DATA_TOKEN.as_bytes())? {
+            if let Ok(rec) = serde_json::from_slice::<ProjectTokenRecord>(&raw) {
+                if rec.project == *project {
+                    out.push(rec);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(out)
     }
 
     fn apply_pa_session_login(
