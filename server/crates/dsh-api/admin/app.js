@@ -178,8 +178,85 @@ function setPane(pane) {
   $$('#pane-seg button').forEach((b) => b.classList.toggle('active', b.dataset.pane === S.pane));
   $$('.pane').forEach((p) => p.classList.toggle('hidden', p.id !== 'pane-' + S.pane));
   if (pane === 'structure') loadSharedItems(); // 进入结构页刷新共享引用下拉数据源
+  if (pane === 'tokens') loadTokens();          // 进入访问令牌页拉取列表
 }
 actions.switchPane = function (el) { setPane(el.dataset.pane); };
+
+/* ---------- 项目访问令牌 ---------- */
+async function loadTokens() {
+  if (!S.project) return;
+  const tbody = $('tokens-body');
+  if (!tbody) return;
+  try {
+    const list = (await j('GET', '/api/v1/projects/' + encodeURIComponent(S.project) + '/tokens')) || [];
+    renderTokens(list);
+  } catch (e) {
+    if (e.status === 403) tbody.innerHTML = '<tr><td colspan="6" class="muted">仅全局管理员可查看访问令牌</td></tr>';
+    else toast('加载令牌失败：' + e.message);
+  }
+}
+
+function renderTokens(list) {
+  const tbody = $('tokens-body');
+  if (!tbody) return;
+  if (!list.length) { tbody.innerHTML = '<tr><td colspan="6" class="muted">该项目暂无访问令牌</td></tr>'; return; }
+  tbody.innerHTML = list.map((t) => `
+    <tr>
+      <td>${esc(t.name)}</td>
+      <td class="mono small">${esc(t.id)}</td>
+      <td>${esc(t.created_by || '')}</td>
+      <td>${fmtTime(t.created_at)}</td>
+      <td>${t.revoked ? '<span class="badge warn">已吊销</span>' : '<span class="badge">有效</span>'}</td>
+      <td class="nowrap">${t.revoked ? '' : `<button type="button" class="btn sm danger" data-act="revokeToken" data-id="${esc(t.id)}" data-name="${esc(t.name)}">吊销</button>`}</td>
+    </tr>`).join('');
+}
+
+actions.createToken = async function () {
+  if (!S.project) return;
+  openModal({
+    title: '创建访问令牌',
+    message: '为项目 ' + S.project + ' 创建数据面访问令牌（项目级只读）。',
+    input: true,
+    label: '令牌名称（如 订单服务-2025）',
+    okText: '创建',
+    onOk: async (name) => {
+      name = (name || '').trim();
+      if (!name) { toast('令牌名称不能为空'); return; }
+      try {
+        const r = await j('POST', '/api/v1/projects/' + encodeURIComponent(S.project) + '/tokens', { name });
+        $('token-plaintext').textContent = r.token || '';
+        $('token-overlay').classList.remove('hidden');
+        toast('令牌已创建（明文仅展示一次）');
+        loadTokens();
+      } catch (e) { toast('创建失败：' + e.message); }
+    },
+  });
+};
+
+actions.revokeToken = function (el) {
+  const id = el.dataset.id, name = el.dataset.name;
+  openModal({
+    title: '吊销访问令牌',
+    message: '确定吊销令牌「' + name + '」？使用该令牌的 SDK 将立即 401，需重建并重新分发。',
+    danger: true,
+    okText: '吊销',
+    onOk: async () => {
+      try {
+        await j('DELETE', '/api/v1/projects/' + encodeURIComponent(S.project) + '/tokens/' + encodeURIComponent(id));
+        toast('已吊销');
+        loadTokens();
+      } catch (e) { toast('吊销失败：' + e.message); }
+    },
+  });
+};
+
+actions.copyToken = function () {
+  const txt = $('token-plaintext').textContent || '';
+  if (!txt) return;
+  navigator.clipboard.writeText(txt).then(() => toast('已复制')).catch(() => toast('复制失败，请手动选择复制'));
+};
+
+actions.closeTokenModal = function () { $('token-overlay').classList.add('hidden'); };
 actions.toggleTheme = function () {
   const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
   localStorage.setItem(LS_THEME, next);
@@ -232,7 +309,7 @@ function enterApp() {
   renderSession();
   // 导航按角色过滤：项目管理员仅保留「配置管理」「审计日志」（服务端矩阵：共享/集群/管理员对 PA 一律 403）
   const isPa = S.role === 'project_admin';
-  for (const id of ['nav-shared', 'nav-admins']) {
+  for (const id of ['nav-shared', 'nav-admins', 'tab-tokens']) {
     const el = $(id);
     if (el) el.classList.toggle('hidden', isPa);
   }
@@ -1844,12 +1921,14 @@ function bindEvents() {
     if (e.key === 'Enter') { e.preventDefault(); $('modal-ok').click(); }
   });
   $('cfg-overlay').addEventListener('mousedown', (e) => { if (e.target === $('cfg-overlay')) actions.closeCfg(); });
+  $('token-overlay').addEventListener('mousedown', (e) => { if (e.target === $('token-overlay')) actions.closeTokenModal(); });
 
   // Esc 关闭弹窗
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     if (!$('modal-overlay').classList.contains('hidden')) closeModal(false);
     else if (!$('cfg-overlay').classList.contains('hidden')) actions.closeCfg();
+    else if (!$('token-overlay').classList.contains('hidden')) actions.closeTokenModal();
   });
 
   // 审计过滤（Enter）

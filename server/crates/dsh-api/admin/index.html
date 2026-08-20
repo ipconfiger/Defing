@@ -157,6 +157,7 @@
               <button type="button" data-act="switchPane" data-pane="versions">版本历史</button>
               <button type="button" data-act="switchPane" data-pane="structure">结构</button>
               <button type="button" data-act="switchPane" data-pane="diff">对比与提升</button>
+              <button type="button" data-act="switchPane" data-pane="tokens" class="hidden" id="tab-tokens">访问令牌</button>
             </div>
           </div>
 
@@ -279,6 +280,25 @@
                 <button type="button" class="btn primary" data-act="doPromote"><svg class="ic"><use href="#i-up"/></svg>提升</button>
               </div>
               <p class="hint">将源分支活动版本的值写入目标分支草稿（不自动发布）。目标分支已有草稿修改的项默认跳过，勾选 force 后覆盖。</p>
+            </div>
+          </div>
+
+          <!-- 访问令牌 -->
+          <div id="pane-tokens" class="pane hidden">
+            <div class="card">
+              <div class="card-head">
+                <h3>访问令牌</h3>
+                <div class="card-actions">
+                  <button type="button" class="btn primary" data-act="createToken"><svg class="ic"><use href="#i-plus"/></svg>创建令牌</button>
+                </div>
+              </div>
+              <p class="hint" style="margin:0 0 10px">数据面 SDK 凭据（项目级只读）：仅全局管理员可管理；令牌仅创建时展示一次，泄露即吊销重建。</p>
+              <div class="table-wrap">
+                <table class="table">
+                  <thead><tr><th>名称</th><th>ID</th><th>创建人</th><th>创建时间</th><th>状态</th><th></th></tr></thead>
+                  <tbody id="tokens-body"></tbody>
+                </table>
+              </div>
             </div>
           </div>
 
@@ -484,6 +504,24 @@
       <button type="button" class="icon-btn" data-act="copyCfg" title="复制" aria-label="复制"><svg class="ic"><use href="#i-copy"/></svg></button>
     </div>
     <pre id="cfg-out" class="codeblock"></pre>
+  </div>
+</div>
+
+<!-- ========== 令牌创建成功（明文仅此一次） ========== -->
+<div id="token-overlay" class="overlay hidden">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="tok-title">
+    <div class="modal-head-row">
+      <h3 id="tok-title">令牌已创建</h3>
+      <button type="button" class="icon-btn" data-act="closeTokenModal" title="关闭" aria-label="关闭"><svg class="ic"><use href="#i-x"/></svg></button>
+    </div>
+    <p class="hint">以下明文<b>仅展示这一次</b>，关闭后无法再次查看；请立即复制并安全保存。</p>
+    <div class="row" style="margin:10px 0">
+      <code id="token-plaintext" class="codeblock mono" style="flex:1;padding:8px 10px;word-break:break-all"></code>
+      <button type="button" class="btn primary" data-act="copyToken"><svg class="ic"><use href="#i-copy"/></svg>复制</button>
+    </div>
+    <div class="modal-foot">
+      <button type="button" class="btn" data-act="closeTokenModal">关闭</button>
+    </div>
   </div>
 </div>
 
