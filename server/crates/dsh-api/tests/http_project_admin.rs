@@ -288,12 +288,15 @@ async fn pa_authorization_matrix() {
         ("POST", "/api/v1/admin/force-logout"),
         ("POST", "/api/v1/admin/snapshot"),
         ("POST", "/api/v1/admin/rotate-master-key"),
-        ("GET", "/api/v1/cluster/members"),
         ("GET", "/api/v1/admin/retention-status"),
     ] {
         let (c, b) = req(&s.base, m, p, Some(&pa), Some(serde_json::json!({}))).await;
         assert_eq!(c, 403, "{m} {p}: {b}");
     }
+
+    // ✅ 集群成员端点只读放行（PA 配置 SDK 连接用）：dev-single 无 raft 路由 → 404 而非 403
+    let (c, _) = req(&s.base, "GET", "/api/v1/cluster/members", Some(&pa), None).await;
+    assert_ne!(c, 403, "PA 应可读集群成员端点列表（集群模式 200 / dev-single 404）");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

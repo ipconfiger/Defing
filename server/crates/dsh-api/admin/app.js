@@ -232,7 +232,7 @@ function enterApp() {
   renderSession();
   // 导航按角色过滤：项目管理员仅保留「配置管理」「审计日志」（服务端矩阵：共享/集群/管理员对 PA 一律 403）
   const isPa = S.role === 'project_admin';
-  for (const id of ['nav-shared', 'nav-cluster', 'nav-admins']) {
+  for (const id of ['nav-shared', 'nav-admins']) {
     const el = $(id);
     if (el) el.classList.toggle('hidden', isPa);
   }
@@ -1657,9 +1657,11 @@ async function loadCluster() {
           <td class="mono">${esc(x.http_addr || '—')}</td>
           <td class="mono">${esc(x.grpc_addr || '—')}</td>
           <td>${x.is_voter ? '<span class="badge acc">voter</span>' : '<span class="badge">learner</span>'}${x.is_leader ? ' <span class="badge ok">leader</span>' : ''}</td>
-          <td class="nowrap">${x.is_voter
-            ? `<button type="button" class="btn sm ghost danger" data-act="removeNode" data-node="${esc(x.node_id)}" data-http="${esc(x.http_addr || '')}" data-raft="${esc(x.raft_addr || '')}">移除</button>`
-            : `<button type="button" class="btn sm" data-act="promoteNode" data-node="${esc(x.node_id)}" data-http="${esc(x.http_addr || '')}" data-raft="${esc(x.raft_addr || '')}"><svg class="ic ic-xs"><use href="#i-up"/></svg>提升为 voter</button>`}</td>
+          <td class="nowrap">${S.role === 'project_admin'
+            ? '<span class="muted small">只读</span>'
+            : (x.is_voter
+              ? `<button type="button" class="btn sm ghost danger" data-act="removeNode" data-node="${esc(x.node_id)}" data-http="${esc(x.http_addr || '')}" data-raft="${esc(x.raft_addr || '')}">移除</button>`
+              : `<button type="button" class="btn sm" data-act="promoteNode" data-node="${esc(x.node_id)}" data-http="${esc(x.http_addr || '')}" data-raft="${esc(x.raft_addr || '')}"><svg class="ic ic-xs"><use href="#i-up"/></svg>提升为 voter</button>`)}</td>
         </tr>`).join('')}
       </tbody></table></div></div>`;
     } else {
@@ -1670,7 +1672,7 @@ async function loadCluster() {
     if (e.expired) return;
     box.innerHTML = e.message.includes('404')
       ? '<div class="card empty"><svg class="ic"><use href="#i-cluster"/></svg><h4>单节点模式</h4><p>dev-single 模式没有集群管理；以集群模式启动后可在此查看成员、提升与移除节点。</p></div>'
-      : `<div class="card empty"><svg class="ic"><use href="#i-alert"/></svg><h4>无法加载集群信息</h4><p>${esc(e.message)}（项目管理员无集群权限）</p></div>`;
+      : `<div class="card empty"><svg class="ic"><use href="#i-alert"/></svg><h4>无法加载集群信息</h4><p>${esc(e.message)}</p></div>`;
   }
 }
 actions.refreshCluster = function () { loadCluster(); };

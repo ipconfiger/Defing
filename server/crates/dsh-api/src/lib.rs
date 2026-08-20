@@ -530,6 +530,10 @@ fn pa_allowed(principal: &dsh_core::Principal, method: &str, path: &str) -> bool
     if method == "GET" && path == "/api/v1/audit" {
         return true;
     }
+    // 集群成员只读（PA 需端点列表配置 SDK 连接；join/promote/remove 仍拒绝）
+    if method == "GET" && path == "/api/v1/cluster/members" {
+        return true;
+    }
 
     // 项目本地端点：/api/v1/projects/{p}/... 且 p == 自己项目
     if let Some(p) = project_segment(path) {
@@ -3957,6 +3961,55 @@ mod join_token_tests {
     }
 }
 
+
+// ---------------- PA 授权矩阵单元测试（N11：默认拒绝、显式放行） ----------------
+
+#[cfg(test)]
+mod pa_matrix_tests {
+    use super::pa_allowed;
+
+    fn pa(project: &str) -> dsh_core::Principal {
+        dsh_core::Principal::ProjectAdmin {
+            username: "u".into(),
+            project: dsh_core::ProjectId(project.into()),
+        }
+    }
+
+    #[test]
+    fn pa_can_read_cluster_members_but_not_manage() {
+        let p = pa("order-service");
+        // 只读：集群成员端点列表（SDK 连接配置）
+        assert!(pa_allowed(&p, "GET", "/api/v1/cluster/members"));
+        // 管理操作一律拒绝
+        assert!(!pa_allowed(&p, "POST", "/api/v1/cluster/join"));
+        assert!(!pa_allowed(&p, "POST", "/api/v1/cluster/promote"));
+        assert!(!pa_allowed(&p, "POST", "/api/v1/cluster/remove"));
+    }
+
+    #[test]
+    fn pa_denied_shared_and_admin_surface() {
+        let p = pa("order-service");
+        // 共享库全拒（含 GET）
+        assert!(!pa_allowed(&p, "GET", "/api/v1/shared"));
+        assert!(!pa_allowed(&p, "GET", "/api/v1/shared-draft"));
+        assert!(!pa_allowed(&p, "POST", "/api/v1/shared"));
+        assert!(!pa_allowed(&p, "POST", "/api/v1/shared/publish"));
+        // 全局管理员面
+        assert!(!pa_allowed(&p, "POST", "/api/v1/admin/set-password"));
+        assert!(!pa_allowed(&p, "GET", "/api/v1/admin/snapshot"));
+        // 本项目内 admins 也拒绝
+        assert!(!pa_allowed(&p, "GET", "/api/v1/projects/order-service/admins"));
+    }
+
+    #[test]
+    fn pa_own_project_allowed_cross_project_denied() {
+        let p = pa("order-service");
+        assert!(pa_allowed(&p, "GET", "/api/v1/projects/order-service/branches"));
+        assert!(pa_allowed(&p, "PUT", "/api/v1/projects/order-service/branches/dev/draft"));
+        assert!(!pa_allowed(&p, "GET", "/api/v1/projects/other-svc/branches"));
+        assert!(!pa_allowed(&p, "DELETE", "/api/v1/projects/order-service"));
+    }
+}
 // ---------------- 安全加固单元测试（S6 节流 / argon2 密码哈希） ----------------
 
 #[cfg(test)]
