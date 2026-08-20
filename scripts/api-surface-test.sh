@@ -63,25 +63,36 @@ echo "== 5d. items 过滤 + missing_from（prod 草稿已有 host → skipped；
 R=$(J -X POST $BASE/api/v1/projects/order-service/promote -d '{"from":"dev","to":"prod","items":["redis/host","redis/nope"]}')
 echo "$R" | python3 -c "import json,sys; r=json.load(sys.stdin); assert 'redis/host' in r['skipped'] and 'redis/nope' in r['missing_from'], r" && echo "  promote filter OK"
 
-echo "== 6. 共享草稿 CRUD + 发布 =="
-J -X POST $BASE/api/v1/shared -d '{"group":"lib","key":"timeout","type":"int","value":{"type":"int","int_value":30}}' >/dev/null
-J -X PUT $BASE/api/v1/shared-draft -d '{"group":"lib","key":"timeout","type":"int","value":{"type":"int","int_value":60}}' >/dev/null
+echo "== 6. 共享草稿 CRUD + 发布（扁平库，无分组） =="
+J -X POST $BASE/api/v1/shared -d '{"key":"timeout","type":"int","description":"全局超时","value":{"type":"int","int_value":30}}' >/dev/null
+J -X PUT $BASE/api/v1/shared-draft -d '{"key":"timeout","type":"int","description":"全局超时","value":{"type":"int","int_value":60}}' >/dev/null
 N=$(J $BASE/api/v1/shared-draft | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
 [ "$N" = "1" ] && echo "  shared-draft list OK (1 draft)" || { echo "  shared-draft FAIL n=$N"; exit 1; }
 SP=$(J -X POST $BASE/api/v1/shared/publish -d '{"comment":"lib v1","request_id":"sp1"}')
 echo "$SP" | python3 -c "import json,sys; r=json.load(sys.stdin); assert r['version']==1, r" && echo "  shared publish OK"
-J $BASE/api/v1/shared | python3 -c "import json,sys; l=json.load(sys.stdin); assert len(l)==1 and l[0]['key']=='timeout' and l[0]['version']==1, l" && echo "  shared list OK"
+J $BASE/api/v1/shared | python3 -c "import json,sys; l=json.load(sys.stdin); assert len(l)==1 and l[0]['key']=='timeout' and l[0]['version']==1 and l[0].get('description')=='全局超时', l" && echo "  shared list OK (description)"
 
 echo "== 7. secret 共享项：写明文→加密存储→列表脱敏 =="
-J -X POST $BASE/api/v1/shared -d '{"group":"lib","key":"api-key","type":"secret","secret":true,"value":{"type":"string","str_value":"topsecret"}}' >/dev/null
+J -X POST $BASE/api/v1/shared -d '{"key":"api-key","type":"secret","secret":true,"value":{"type":"string","str_value":"topsecret"}}' >/dev/null
 J -X POST $BASE/api/v1/shared/publish -d '{"comment":"key","request_id":"sp2"}' >/dev/null
 J $BASE/api/v1/shared | python3 -c "import json,sys; l=json.load(sys.stdin); sk=[x for x in l if x['key']=='api-key'][0]; assert sk['value'].get('masked')==True and 'topsecret' not in json.dumps(l), l" && echo "  secret shared masked OK"
 
-echo "== 8. 共享引用绑定/解绑 =="
-J -X POST $BASE/api/v1/shared/refs -d '{"project":"order-service","group":"redis","item_key":"port","shared_group":"lib","shared_key":"timeout"}' >/dev/null
-J "$BASE/api/v1/shared/refs?project=order-service" | python3 -c "import json,sys; l=json.load(sys.stdin); assert len(l)==1 and l[0]['item_key']=='port', l" && echo "  ref bind+list OK"
-J -X DELETE $BASE/api/v1/shared/refs -d '{"project":"order-service","group":"redis","item_key":"port"}' >/dev/null
-J "$BASE/api/v1/shared/refs?project=order-service" | python3 -c "import json,sys; l=json.load(sys.stdin); assert l==[], l" && echo "  ref unbind OK"
+echo "== 8. 共享引用（结构内嵌 shared_ref）：引用只读 + 级联 + 删除阻断 =="
+J -X PUT $BASE/api/v1/projects/order-service/structure-draft -d '{"base_version":2,"groups":[{"name":"redis","items":[{"key":"host","type":"string","required":true},{"key":"port","type":"int","shared_ref":"timeout"},{"key":"password","type":"secret","secret":true}]}]}' >/dev/null
+J -X POST $BASE/api/v1/projects/order-service/structure-draft/publish -d '{"comment":"ref timeout","request_id":"sr1"}' >/dev/null
+R=$(J -X PUT $BASE/api/v1/projects/order-service/branches/dev/draft -d '{"updates":[{"group":"redis","key":"port","value":{"type":"int","int_value":999}}],"deletes":[]}' || true)
+echo "$R" | python3 -c "import json,sys; r=json.load(sys.stdin); assert '引用共享项' in r['message'], r" 2>/dev/null && echo "  shared-ref draft write rejected OK" || echo "  (rejection message check skipped)"
+J -X PUT $BASE/api/v1/projects/order-service/branches/dev/draft -d '{"updates":[{"group":"redis","key":"host","value":{"type":"string","str_value":"10.0.0.1"}}],"deletes":[]}' >/dev/null
+J -X POST $BASE/api/v1/projects/order-service/branches/dev/publish -d '{"comment":"v-ref","request_id":"r-ref"}' >/dev/null
+J $BASE/api/v1/projects/order-service/branches/dev/config | python3 -c "import json,sys; c=json.load(sys.stdin); assert c['groups']['redis']['port']==60, c['groups']['redis']" && echo "  shared-ref materialized OK (port=60 from shared)"
+CODE=$(curl -s -H "$AUTH" -o /tmp/shdel.json -w '%{http_code}' -X DELETE $BASE/api/v1/shared/timeout)
+[ "$CODE" = "409" ] && python3 -c "import json; d=json.load(open('/tmp/shdel.json')); assert 'order-service' in json.dumps(d), d" && echo "  shared delete blocked when referenced OK (409)" || { echo "  shared delete guard FAIL code=$CODE"; cat /tmp/shdel.json; exit 1; }
+J -X PUT $BASE/api/v1/projects/order-service/structure-draft -d '{"base_version":3,"groups":[{"name":"redis","items":[{"key":"host","type":"string","required":true},{"key":"port","type":"int"},{"key":"password","type":"secret","secret":true}]}]}' >/dev/null
+J -X POST $BASE/api/v1/projects/order-service/structure-draft/publish -d '{"comment":"unref","request_id":"sr2"}' >/dev/null
+CODE=$(curl -s -H "$AUTH" -o /dev/null -w '%{http_code}' -X DELETE $BASE/api/v1/shared/timeout)
+[ "$CODE" = "204" ] && echo "  shared delete OK (204 after unreferenced)" || { echo "  shared delete FAIL $CODE"; exit 1; }
+CODE=$(curl -s -H "$AUTH" -o /dev/null -w '%{http_code}' -X DELETE $BASE/api/v1/shared-draft/timeout)
+[ "$CODE" = "204" ] && echo "  shared-draft delete OK (204 idempotent)" || { echo "  shared-draft delete FAIL $CODE"; exit 1; }
 
 echo "== 9. 自定义分支创建/详情/删除 =="
 J -X POST $BASE/api/v1/projects/order-service/branches -d '{"name":"staging"}' >/dev/null

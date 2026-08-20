@@ -16,7 +16,7 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use dsh_core::command::{Command, DraftUpdateItem};
 use dsh_core::model::{
-    BranchName, GrayRule, GroupDef, ProjectId, RefBinding, SharedItem, Value, ValueType,
+    BranchName, GrayRule, GroupDef, ProjectId, SharedItem, Value, ValueType,
 };
 use dsh_core::wire::masked_value;
 use dsh_core::{ErrorKind, StateMachine};
@@ -1235,12 +1235,32 @@ async fn branch_detail(
             (g.clone(), serde_json::Value::Object(m))
         })
         .collect();
+    // 引用项只读展示：结构 items.shared_ref → 共享项解析值（secret 掩码，与共享库列表一致）
+    let mut shared_refs = Vec::new();
+    if let Some(structure) = sm.get_structure(&id).map_err(ApiError::from)? {
+        for g in &structure.groups {
+            for item in &g.items {
+                if let Some(rk) = &item.shared_ref {
+                    if let Some(shared) = sm.get_shared(rk).map_err(ApiError::from)? {
+                        shared_refs.push(serde_json::json!({
+                            "group": g.name,
+                            "key": item.key,
+                            "shared_key": rk,
+                            "version": shared.version,
+                            "value": masked_shared_value(&shared),
+                        }));
+                    }
+                }
+            }
+        }
+    }
     Ok(Json(serde_json::json!({
         "name": branch,
         "active_version": st.active_version,
         "structure_version": st.structure_version,
         "draft_rev": st.draft_rev,
         "draft": drafts,
+        "shared_refs": shared_refs,
     })))
 }
 
@@ -1368,6 +1388,22 @@ async fn promote(
             .get_branch_state(&pid_obj, &to_b)
             .map_err(ApiError::from)?
             .ok_or_else(|| ApiError(dsh_core::Error::not_found("target branch")))?;
+        // 目标结构中的引用项只读：跳过（值由共享库物化，写入本地草稿会被拒）
+        let ref_keys: std::collections::HashSet<(String, String)> = sm
+            .get_structure(&pid_obj)
+            .map_err(ApiError::from)?
+            .map(|st| {
+                st.groups
+                    .iter()
+                    .flat_map(|g| {
+                        g.items
+                            .iter()
+                            .filter(|i| i.shared_ref.is_some())
+                            .map(move |i| (g.name.clone(), i.key.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut updates = Vec::new();
         let mut applied = Vec::new();
         let mut skipped = Vec::new();
@@ -1380,6 +1416,10 @@ async fn promote(
                     }
                 }
                 let key = format!("{g}/{k}");
+                if ref_keys.contains(&(g.clone(), k.clone())) {
+                    skipped.push(key);
+                    continue;
+                }
                 let draft_modified = dst.value_draft.get(g).is_some_and(|m| m.contains_key(k));
                 if draft_modified && !req.force {
                     skipped.push(key);
@@ -1443,13 +1483,14 @@ async fn promote(
 /// 共享项请求（对齐 openapi SharedItem；version 由状态机分配）。
 #[derive(Deserialize)]
 struct SharedItemReq {
-    group: String,
     key: String,
     r#type: ValueType,
     #[serde(default)]
     secret: bool,
     #[serde(default)]
     required: bool,
+    #[serde(default)]
+    description: Option<String>,
     value: Value,
 }
 
@@ -1461,16 +1502,33 @@ fn masked_shared_value(item: &SharedItem) -> serde_json::Value {
     }
 }
 
-fn shared_item_json(item: &SharedItem) -> serde_json::Value {
-    serde_json::json!({
-        "group": item.group,
+fn shared_item_json(
+    item: &SharedItem,
+    refs: Option<&[(ProjectId, String, String)]>,
+) -> serde_json::Value {
+    let mut obj = serde_json::json!({
         "key": item.key,
         "type": item.ty,
         "secret": item.secret,
         "required": item.required,
         "value": masked_shared_value(item),
         "version": item.version,
-    })
+    });
+    if let Some(d) = &item.description {
+        obj["description"] = serde_json::Value::String(d.clone());
+    }
+    if let Some(r) = refs {
+        obj["refs"] = serde_json::json!(
+            r.iter()
+                .map(|(p, g, k)| serde_json::json!({
+                    "project": p.as_str(),
+                    "group": g,
+                    "item_key": k,
+                }))
+                .collect::<Vec<_>>()
+        );
+    }
+    obj
 }
 
 /// 写共享草稿（secret 项提交前加密，I8）。
@@ -1512,14 +1570,22 @@ async fn write_shared_draft(
         ))
         .into());
     }
+    if let Some(d) = &req.description {
+        if d.len() > dsh_core::limits::MAX_DESC_BYTES {
+            return Err(ApiError(dsh_core::Error::validation(
+                "描述超过上限（200 字节）",
+            ))
+            .into());
+        }
+    }
     let item = SharedItem {
-        group: req.group.clone(),
         key: req.key.clone(),
         ty: req.r#type,
         secret: req.secret,
         required: req.required,
         value,
         version: 0,
+        description: req.description.clone(),
     };
     app.write(
         &Command::SharedDraftUpdate {
@@ -1537,13 +1603,12 @@ async fn write_shared_draft(
             None,
             None,
             None,
-            serde_json::json!({ "group": req.group, "key": req.key }),
+            serde_json::json!({ "key": req.key }),
             "admin",
         )
         .await;
     Ok(serde_json::json!({
         "saved": true,
-        "group": req.group,
         "key": req.key,
     }))
 }
@@ -1570,11 +1635,15 @@ async fn list_shared(State(app): State<ApiState>) -> ApiResult<serde_json::Value
     let sm = app.sm.read().map_err(lock_err)?;
     let items = sm
         .list_shared_published()
-        .map_err(ApiError::from)?
+        .map_err(ApiError::from)?;
+    let out = items
         .iter()
-        .map(shared_item_json)
+        .map(|item| {
+            let refs = sm.shared_usage(&item.key).ok();
+            shared_item_json(item, refs.as_deref())
+        })
         .collect::<Vec<_>>();
-    Ok(Json(serde_json::json!(items)))
+    Ok(Json(serde_json::json!(out)))
 }
 
 async fn list_shared_drafts(State(app): State<ApiState>) -> ApiResult<serde_json::Value> {
@@ -1583,7 +1652,7 @@ async fn list_shared_drafts(State(app): State<ApiState>) -> ApiResult<serde_json
         .list_shared_drafts()
         .map_err(ApiError::from)?
         .iter()
-        .map(shared_item_json)
+        .map(|item| shared_item_json(item, None))
         .collect::<Vec<_>>();
     Ok(Json(serde_json::json!(items)))
 }
@@ -1651,42 +1720,16 @@ async fn publish_shared(
     })))
 }
 
-// ---------------- 共享引用绑定（core RefBind/RefUnbind 补 HTTP 面） ----------------
+// ---------------- 共享项删除（补全 CRUD 的 D） ----------------
 
-#[derive(Deserialize)]
-struct RefBindReq {
-    project: String,
-    group: String,
-    #[serde(default)]
-    item_key: Option<String>,
-    shared_group: String,
-    shared_key: String,
-}
-
-#[derive(Deserialize)]
-struct RefUnbindReq {
-    project: String,
-    group: String,
-    #[serde(default)]
-    item_key: Option<String>,
-}
-
-async fn ref_bind(
+async fn delete_shared(
     principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
-    Json(req): Json<RefBindReq>,
-) -> ApiResult<serde_json::Value> {
-    let binding = RefBinding {
-        group: req.group.clone(),
-        item_key: req.item_key.clone(),
-        shared_group: req.shared_group.clone(),
-        shared_key: req.shared_key.clone(),
-    };
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ApiErrorBody>)> {
     app.write(
-        &Command::RefBind {
-            project: ProjectId(req.project.clone()),
-            binding,
-
+        &Command::SharedDelete {
+            key: key.clone(),
             operator: principal_op(&principal),
         },
         now_ms(),
@@ -1694,31 +1737,26 @@ async fn ref_bind(
     .await?;
     app.audit
         .append(
-            "ref_bind",
-            Some(req.project.clone()),
+            "shared_delete",
             None,
             None,
             None,
-            serde_json::json!({ "group": req.group, "item_key": req.item_key, "shared": format!("{}/{}", req.shared_group, req.shared_key) }),
+            None,
+            serde_json::json!({ "key": key }),
             &principal_op(&principal),
         )
         .await;
-    Ok(Json(
-        serde_json::json!({ "bound": true, "project": req.project }),
-    ))
+    Ok(StatusCode::NO_CONTENT)
 }
 
-async fn ref_unbind(
+async fn delete_shared_draft(
     principal: axum::Extension<dsh_core::Principal>,
     State(app): State<ApiState>,
-    Json(req): Json<RefUnbindReq>,
-) -> ApiResult<serde_json::Value> {
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ApiErrorBody>)> {
     app.write(
-        &Command::RefUnbind {
-            project: ProjectId(req.project.clone()),
-            group: req.group.clone(),
-            item_key: req.item_key.clone(),
-
+        &Command::SharedDelete {
+            key: key.clone(),
             operator: principal_op(&principal),
         },
         now_ms(),
@@ -1726,39 +1764,16 @@ async fn ref_unbind(
     .await?;
     app.audit
         .append(
-            "ref_unbind",
-            Some(req.project.clone()),
+            "shared_delete",
             None,
             None,
             None,
-            serde_json::json!({ "group": req.group, "item_key": req.item_key }),
+            None,
+            serde_json::json!({ "key": key, "draft": true }),
             &principal_op(&principal),
         )
         .await;
-    Ok(Json(
-        serde_json::json!({ "unbound": true, "project": req.project }),
-    ))
-}
-
-#[derive(Deserialize)]
-struct RefsQuery {
-    project: String,
-}
-
-async fn list_refs(
-    State(app): State<ApiState>,
-    principal: axum::Extension<dsh_core::Principal>,
-    axum::extract::Query(mut q): axum::extract::Query<RefsQuery>,
-) -> ApiResult<serde_json::Value> {
-    // N11：PA 强制覆写 project 为自己项目（防跨项目绑定元数据读取）
-    if let dsh_core::Principal::ProjectAdmin { project, .. } = principal.0 {
-        q.project = project.0;
-    }
-    let sm = app.sm.read().map_err(lock_err)?;
-    let refs = sm
-        .list_refs(&ProjectId(q.project))
-        .map_err(ApiError::from)?;
-    Ok(Json(serde_json::json!(refs)))
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// secret 值处理策略（§7.6）：reveal=false 一律掩码；reveal=true 解密（需会话 + 审计）。
@@ -3813,10 +3828,8 @@ pub fn build_router(app: ApiState) -> Router {
             get(list_shared_drafts).put(update_shared_draft),
         )
         .route("/api/v1/shared/publish", post(publish_shared))
-        .route(
-            "/api/v1/shared/refs",
-            get(list_refs).post(ref_bind).delete(ref_unbind),
-        )
+        .route("/api/v1/shared/{key}", delete(delete_shared))
+        .route("/api/v1/shared-draft/{key}", delete(delete_shared_draft))
         .route(
             "/api/v1/projects/{p}/structure-draft",
             get(get_structure_draft).put(set_structure_draft),

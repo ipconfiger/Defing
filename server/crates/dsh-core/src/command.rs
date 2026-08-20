@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{BranchName, GroupDef, ProjectId, RefBinding, SharedItem, Value};
+use crate::model::{BranchName, GroupDef, ProjectId, SharedItem, Value};
 
 /// 值草稿更新条目。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -14,7 +14,7 @@ pub struct DraftUpdateItem {
     pub value: Value,
 }
 
-/// 状态机写命令（M1 子集；M2 追加 Rollback/SharedPublish/RefBind/Promote/会话命令）。
+/// 状态机写命令（M1 子集；M2 追加 Rollback/SharedPublish/Promote/会话命令；共享引用内嵌 ItemDef.shared_ref）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Command {
     ProjectCreate {
@@ -138,18 +138,9 @@ pub enum Command {
         #[serde(default)]
         policy: crate::model::PublishPolicy,
     },
-    /// 绑定项目 item → 共享项。
-    RefBind {
-        project: ProjectId,
-        binding: RefBinding,
-        #[serde(default)]
-        operator: String,
-    },
-    /// 解绑。
-    RefUnbind {
-        project: ProjectId,
-        group: String,
-        item_key: Option<String>,
+    /// 删除共享项（草稿 + 已发布；被项目结构引用 → 拒绝）。
+    SharedDelete {
+        key: String,
         #[serde(default)]
         operator: String,
     },

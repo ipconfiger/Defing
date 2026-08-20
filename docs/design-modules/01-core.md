@@ -62,7 +62,7 @@ pub enum Command {
                     comment: String, request_id: String },
     SharedDraftUpdate { item: SharedItem },
     SharedPublish { comment: String, request_id: String },
-    RefBind       { project: ProjectId, binding: RefBinding },
+    SharedDelete  { key: String },           // 删除共享项（被项目结构引用 → 拒绝）；引用已内嵌 ItemDef.shared_ref
     RefUnbind     { project: ProjectId, group: String, item_key: Option<String> },
     Promote       { project: ProjectId, from: BranchName, to: BranchName,
                     items: Option<Vec<(String, String)>>, force: bool },
@@ -97,7 +97,7 @@ pub const K_IDX_REF: &str = "idx/ref/";      // sh/{g}/{k} → 引用方列表�
 |------|------|
 | item 值 | 类型匹配；string ≤64KB；validate 规则（正则/范围） |
 | 结构 | 分组/item 名唯一；key 合法标识符；TOML 表达力约束（design-v2 §8.2） |
-| 引用 | RefBinding 目标存在；idx/ref 图 DFS 判环 → ERR_CYCLE_REF |
+| 引用 | ItemDef.shared_ref 目标存在且类型一致（结构保存/发布双校验）；级联走结构扫描（无独立索引） |
 | 发布 | required 未填 → 阻断（policy=block）→ ERR_PUBLISH_BLOCKED |
 | 限额 | design-v2 §3.4 限额表 → ERR_LIMIT_EXCEEDED |
 

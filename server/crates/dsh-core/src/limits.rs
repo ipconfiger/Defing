@@ -13,6 +13,7 @@ pub const MAX_ARRAY_ELEMENT_BYTES: usize = 8 * 1024;
 pub const MAX_DIFF_BYTES: usize = 1024 * 1024;
 pub const MAX_COMMENT_BYTES: usize = 500;
 pub const MAX_KEY_BYTES: usize = 128;
+pub const MAX_DESC_BYTES: usize = 200; // 描述字段（ItemDef/SharedItem 助记，不渲染）
 pub const MAX_GROUP_NAME_BYTES: usize = 128;
 pub const MAX_PROJECT_NAME_BYTES: usize = 128;
 pub const CHECKPOINT_INTERVAL: u64 = 100; // 每 100 版写全量快照（D3）

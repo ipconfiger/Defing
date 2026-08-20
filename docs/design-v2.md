@@ -152,7 +152,7 @@ Project { id, name, created_at }                       // name 全局唯一
   │          value_draft: (group,key)→草稿值, versions: Version[] }
   │            Version { no, structure_version, created_at, operator, comment,
   │                      rollback_of?, kind: full|diff, snapshot_ref?, diff_ref? }
-  └─ RefBinding { group, item_key?, shared_group, shared_key }
+  └─ （引用已内嵌 ItemDef.shared_ref，无独立 RefBinding 实体）
 SharedLibrary
   ├─ SharedDraft { group, key, type, secret, required, value }
   ├─ SharedItem { group, key, type, secret, required, value, version }
@@ -215,7 +215,7 @@ AuditLog { seq, ts, operator, action, target, version?, request_id, detail }
 - 新建分支：继承当前已发布结构 + 活动版本值（物化为初始值草稿）。
 
 ### 3.6 版本物化（materialization）
-发布时把 RefBinding 解析后的共享值**写入版本快照**（版本自包含、不可变）；
+发布时把 ItemDef.shared_ref 解析后的共享值**写入版本快照**（版本自包含、不可变）；
 共享库后续变更不影响历史版本；编辑/预览阶段才保持"活引用"。
 
 ## 4. 版本与发布引擎
@@ -455,7 +455,7 @@ item 存储 JSON：
 - 文件名：`{project}-{branch}-v{version}.{yaml|toml|json}`；打包 `{…}-all.zip`。
 
 ### 8.3 引用解析与等价性
-- 渲染/发布时解析 RefBinding；失败阻断；循环引用 DFS 判环。
+- 渲染/发布时解析 ItemDef.shared_ref；悬空引用阻断（结构保存/发布已前置校验）。
 - 等价性测试：随机 IR → 三格式 → 解析 → 规范化比较（§14）。
 
 ## 9. Admin UI

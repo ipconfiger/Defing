@@ -323,6 +323,15 @@ function renderBranchSelects() {
   fillBranchOptions($('promote-to'), S.branches, true);
 }
 
+// 已发布共享项缓存（结构编辑器「共享引用」下拉数据源）
+async function loadSharedItems() {
+  try {
+    S.sharedItems = (await j('GET', '/api/v1/shared')) || [];
+  } catch (_) {
+    S.sharedItems = []; // 端点暂态失败 → 下拉为空（保存时服务端双校验兜底）
+  }
+}
+
 async function loadProject() {
   if (!S.project) return;
   try {
@@ -330,6 +339,7 @@ async function loadProject() {
       j('GET', `/api/v1/projects/${S.project}/branches`),
       j('GET', `/api/v1/projects/${S.project}/structure-draft`),
       loadPublishedStruct(),          // 已发布结构（级联首选源 + 无草稿时的权威基线）
+      loadSharedItems(),             // 共享引用下拉数据源
     ]);
     S.branches = bs || [];
     renderBranchSelects();
@@ -480,14 +490,60 @@ function renderDraftEditor(b) {
       '<div class="empty mini"><svg class="ic"><use href="#i-inbox"/></svg><h4>暂无草稿项</h4><p>在下方选择组与配置项添加值；配置项需先在「结构」页定义并发布。</p></div>';
     return;
   }
-  $('draft-groups').innerHTML = groups.map((g) => {
+  // 引用项索引（只读展示：值来自共享库）
+  const refsByGroup = {};
+  for (const r of (b.shared_refs || [])) {
+    S.sharedRefs[r.group + '/' + r.key] = r;
+    (refsByGroup[r.group] = refsByGroup[r.group] || []).push(r);
+  }
+  // 组集合 = 草稿组 ∪ 引用组（引用项无草稿值，需独立展示）
+  const allGroups = new Set(groups);
+  for (const g of Object.keys(refsByGroup)) allGroups.add(g);
+  if (!allGroups.size) {
+    $('draft-groups').innerHTML =
+      '<div class="empty mini"><svg class="ic"><use href="#i-inbox"/></svg><h4>暂无草稿项</h4><p>在下方选择组与配置项添加值；配置项需先在「结构」页定义并发布。</p></div>';
+    return;
+  }
+  $('draft-groups').innerHTML = Array.from(allGroups).map((g) => {
     const items = Object.entries(b.draft[g] || {});
+    const refs = refsByGroup[g] || [];
+    const refBadge = refs.length ? `<span class="badge acc" title="值由共享库物化，只读">${refs.length} 引用共享</span>` : '';
     return `<div class="card gcard">
-      <div class="gcard-head"><code class="gname">${esc(g)}</code><span class="muted small">${items.length} 项</span></div>
-      <div class="grows">${items.map(([k, dv]) => draftRowHtml(g, k, dv.value)).join('')}</div>
+      <div class="gcard-head"><code class="gname">${esc(g)}</code><span class="muted small">${items.length + refs.length} 项</span>${refBadge}
+        <span class="spacer"></span>
+        <button type="button" class="btn sm ghost" data-act="manageGroups" data-g="${esc(g)}" title="分组管理（结构页）"><svg class="ic ic-xs"><use href="#i-config"/></svg>管理分组</button>
+      </div>
+      <div class="grows">${items.map(([k, dv]) => draftRowHtml(g, k, dv.value)).join('')}${refs.map(sharedRefRowHtml).join('')}</div>
     </div>`;
   }).join('');
 }
+
+// 引用项只读行（草稿页）：徽标 + 共享值（secret 已掩码）
+function sharedRefRowHtml(r) {
+  const v = r.value || {};
+  const icon = v.masked ? '<svg class="ic ic-xs"><use href="#i-lock"/></svg>' : '';
+  const txt = fmtVal(v);
+  return `<div class="grow ref-grow">
+    <div class="gkey"><span class="mono">${esc(r.key)}</span></div>
+    <div class="gtype"><span class="badge acc">引用共享项 ${esc(r.shared_key)} · v${esc(r.version)}</span></div>
+    <div class="gctl"><span class="mono muted">${icon}${esc(txt)}</span></div>
+    <div class="gdel"><span class="hint" style="margin:0">只读</span></div>
+  </div>`;
+}
+
+function fmtVal(v) {
+  if (!v || typeof v !== 'object') return '';
+  if (v.masked) return '***（已加密）';
+  if (v.str_value !== undefined) return String(v.str_value);
+  if (v.int_value !== undefined) return String(v.int_value);
+  if (v.float_value !== undefined) return String(v.float_value);
+  if (v.bool_value !== undefined) return String(v.bool_value);
+  if (v.json_value !== undefined) return v.json_value;
+  if (Array.isArray(v.list_value)) return v.list_value.join(', ');
+  return JSON.stringify(v);
+}
+
+actions.manageGroups = function () { switchPane('structure'); };
 
 function buildValue(ty, raw) {
   // 非法数值显式报错，不静默置 0
@@ -528,12 +584,12 @@ function structBaseline() {
 
 function cloneGroups(gs) { return normalizeGroups(gs); }
 
-// 服务端 ItemDef 仅 key/type/required/secret（+可选 validate 等）；未知字段原样保留，JSON 往返不丢数据
+// 服务端 ItemDef 未知字段（validate 等）原样保留，JSON 往返不丢数据；description/shared_ref 显式建模
 function extraItemFields(it) {
   if (!it || typeof it !== 'object') return {};
   const out = {};
   for (const [k, v] of Object.entries(it)) {
-    if (k !== 'key' && k !== 'type' && k !== 'required' && k !== 'secret' && v !== undefined && v !== null) out[k] = v;
+    if (k !== 'key' && k !== 'type' && k !== 'required' && k !== 'secret' && k !== 'description' && k !== 'shared_ref' && v !== undefined && v !== null) out[k] = v;
   }
   return out;
 }
@@ -546,6 +602,8 @@ function normalizeGroups(gs) {
       type: TYPES.includes(it && it.type) ? it.type : 'string',
       required: !!(it && it.required),
       secret: !!(it && it.secret),
+      description: (it && it.description) || '',
+      shared_ref: (it && it.shared_ref) || '',
       __extra: extraItemFields(it),
     })),
   }));
@@ -554,7 +612,12 @@ function normalizeGroups(gs) {
 function serializeGroups(gs) {
   return gs.map((g) => ({
     name: g.name,
-    items: g.items.map((it) => ({ ...it.__extra, key: it.key, type: it.type, required: it.required, secret: it.secret })),
+    items: g.items.map((it) => {
+      const o = { ...it.__extra, key: it.key, type: it.type, required: it.required, secret: it.secret };
+      if (it.description) o.description = it.description;
+      if (it.shared_ref) o.shared_ref = it.shared_ref;
+      return o;
+    }),
   }));
 }
 
@@ -656,7 +719,8 @@ function populateKeySel() {
   const draftKeys = S.draftValKeys || {};
   ks.innerHTML = g.items.map((it) => {
     const has = draftKeys[g.name + '/' + it.key] ? ' · 已有草稿值' : '';
-    return `<option value="${esc(it.key)}">${esc(it.key)} · ${esc(it.type)}${esc(has)}</option>`;
+    const refTag = it.shared_ref ? ' · 引用共享项' : '';
+    return `<option value="${esc(it.key)}"${it.shared_ref ? ' disabled title="引用共享项 ' + esc(it.shared_ref) + '，只读，不可添加本地值"' : ''}>${esc(it.key)} · ${esc(it.type)}${esc(has)}${refTag}</option>`;
   }).join('');
   if (prevK && g.items.some((it) => it.key === prevK)) ks.value = prevK;
   const def = g.items.find((it) => it.key === ks.value);
@@ -1069,6 +1133,7 @@ function syncStructJsonTextarea() {
 function renderStructEditor() {
   const d = S.structDraft;
   if (!d) return;
+  if (!S.sharedItems.length) loadSharedItems(); // 下拉数据兜底（异步刷新，下次渲染生效）
   $('struct-base').textContent = 'sv' + d.base_version;
   // 滞后判定：与 structBaseline()（已发布结构版本为权威，分支 sv 交叉校验）比较
   const stale = d.base_version !== structBaseline();
@@ -1103,14 +1168,64 @@ function structGroupHtml(g, gi) {
 
 function structItemRowHtml(it, gi, ii) {
   const tyOpts = TYPES.map((t) => `<option value="${t}"${t === it.type ? ' selected' : ''}>${t}</option>`).join('');
-  return `<div class="srow">
-    <input class="in mono" data-sf="ikey" value="${esc(it.key)}" placeholder="key（字母 / 数字 / . _ -）" spellcheck="false">
-    <select class="sel" data-act="structType" title="值类型">${tyOpts}</select>
-    <label class="check" title="发布前必须有值"><input type="checkbox" data-sf="ireq" ${it.required ? 'checked' : ''}></label>
-    <label class="check" title="敏感值（类型须为 secret）"><input type="checkbox" data-sf="isec" data-act="structSecret" ${it.secret ? 'checked' : ''}></label>
-    <button type="button" class="icon-btn danger" data-act="delStructItem" data-gi="${gi}" data-ii="${ii}" title="删除配置项" aria-label="删除配置项"><svg class="ic"><use href="#i-trash"/></svg></button>
+  const isRef = !!it.shared_ref;
+  // 共享引用下拉：选项 = 已发布共享项（带类型与描述 title）
+  const shOpts = '<option value="">— 不引用 —</option>' + (S.sharedItems || []).map((s) =>
+    `<option value="${esc(s.key)}"${s.key === it.shared_ref ? ' selected' : ''} title="${esc(s.description || '')}">${esc(s.key)}（${esc(s.type || '')}）${s.description ? ' · ' + esc(s.description) : ''}</option>`).join('');
+  const hint = isRef ? '引用项只读：type/required/secret 继承共享项' : '';
+  const refBadge = isRef ? `<span class="badge acc">引用共享项 ${esc(it.shared_ref)}</span>` : '';
+  return `<div class="struct-item"${isRef ? ' data-ref="1"' : ''}>
+    <div class="srow">
+      <input class="in mono" data-sf="ikey" value="${esc(it.key)}" placeholder="key（字母 / 数字 / . _ -）" spellcheck="false">
+      <select class="sel" data-act="structType" title="值类型" ${isRef ? 'disabled' : ''}>${tyOpts}</select>
+      <label class="check" title="发布前必须有值"><input type="checkbox" data-sf="ireq" ${it.required ? 'checked' : ''} ${isRef ? 'disabled' : ''}></label>
+      <label class="check" title="敏感值（类型须为 secret）"><input type="checkbox" data-sf="isec" data-act="structSecret" ${it.secret ? 'checked' : ''} ${isRef ? 'disabled' : ''}></label>
+      <button type="button" class="icon-btn danger" data-act="delStructItem" data-gi="${gi}" data-ii="${ii}" title="删除配置项" aria-label="删除配置项"><svg class="ic"><use href="#i-trash"/></svg></button>
+    </div>
+    <div class="srow-sub">
+      <span class="muted small" style="width:34px">描述</span>
+      <input class="in mono" data-sf="idesc" value="${esc(it.description || '')}" placeholder="助记（≤200 字节，不渲染进配置文件）" spellcheck="false">
+      <span class="muted small" style="width:56px">共享引用</span>
+      <select class="sel" data-sf="ishref" data-act="structSharedRef" title="引用共享库项（只读，值由共享库物化）">${shOpts}</select>
+      <span class="badge acc" data-role="shref-badge"${isRef ? '' : ' style="display:none"'}>${refBadge}</span>
+      <span class="hint" data-role="shref-hint" style="margin:0">${hint}</span>
+    </div>
   </div>`;
 }
+
+// 共享引用选择联动：选中 → type/required/secret 继承共享项并置只读；取消 → 恢复可编辑
+actions.structSharedRef = function (el) {
+  const item = el.closest('.struct-item');
+  const isRef = !!el.value;
+  if (item) {
+    item.setAttribute('data-ref', isRef ? '1' : '');
+    const sel = item.querySelector('select[data-act="structType"]');
+    const req = item.querySelector('[data-sf="ireq"]');
+    const sec = item.querySelector('[data-sf="isec"]');
+    const badge = item.querySelector('[data-role="shref-badge"]');
+    const hint = item.querySelector('[data-role="shref-hint"]');
+    if (isRef) {
+      const sh = (S.sharedItems || []).find((s) => s.key === el.value);
+      if (sh) {
+        if (sel && TYPES.includes(sh.type)) sel.value = sh.type;
+        if (req) req.checked = !!sh.required;
+        if (sec) sec.checked = !!sh.secret;
+      }
+      if (sel) sel.disabled = true;
+      if (req) req.disabled = true;
+      if (sec) sec.disabled = true;
+      if (badge) { badge.style.display = ''; badge.innerHTML = '引用共享项 ' + esc(el.value); }
+      if (hint) hint.textContent = '引用项只读：type/required/secret 继承共享项';
+    } else {
+      if (sel) sel.disabled = false;
+      if (req) req.disabled = false;
+      if (sec) sec.disabled = false;
+      if (badge) badge.style.display = 'none';
+      if (hint) hint.textContent = '';
+    }
+  }
+  markStructDirty();
+}; // 仅响应 change
 
 // 纯校验（镜像服务端 validate_structure：字符集 / 长度 / 重名 / secret 依赖类型 / 限额）
 function validateGroups(groups) {
@@ -1137,6 +1252,8 @@ function validateGroups(groups) {
       else if (seen.has(it.key)) errs.push((g.name || '未命名组') + '/' + it.key + '：key 重复');
       seen.add(it.key);
       if (it.secret && it.type !== 'secret') errs.push(where + '：勾选 secret 需将类型设为 secret');
+      if (it.description && it.description.length > 200) errs.push(where + '：描述超过 200 字节上限');
+      if (it.shared_ref && !NAME_RE.test(it.shared_ref)) errs.push(where + '：共享引用 key「' + it.shared_ref + '」仅允许字母、数字与 . _ -');
     }
     total += g.items.length;
   }
@@ -1151,15 +1268,20 @@ function collectStructDraft() {
     const nameIn = card.querySelector('[data-sf="gname"]');
     const items = [];
     for (const row of card.querySelectorAll('.srow:not(.srow-head)')) {
+      const itemEl = row.closest('.struct-item') || row;
       const keyIn = row.querySelector('[data-sf="ikey"]');
       const sel = row.querySelector('select[data-act="structType"]');
       const req = row.querySelector('[data-sf="ireq"]');
       const sec = row.querySelector('[data-sf="isec"]');
+      const descIn = itemEl.querySelector('[data-sf="idesc"]');
+      const shIn = itemEl.querySelector('[data-sf="ishref"]');
       items.push({
         key: keyIn ? keyIn.value.trim() : '',
         type: sel && TYPES.includes(sel.value) ? sel.value : 'string',
         required: !!(req && req.checked),
         secret: !!(sec && sec.checked),
+        description: descIn ? descIn.value.trim() : '',
+        shared_ref: shIn ? shIn.value : '',
         __extra: {},
       });
     }
@@ -1486,7 +1608,7 @@ actions.doPromote = async function (el) {
 
 /* ---------- 共享库 ---------- */
 async function loadShared() {
-  $('shared-body').innerHTML = '<tr><td colspan="6">' + skeleton(4) + '</td></tr>';
+  $('shared-body').innerHTML = '<tr><td colspan="8">' + skeleton(4) + '</td></tr>';
   try {
     const [pub, draft] = await Promise.all([
       j('GET', '/api/v1/shared').catch(() => []),
@@ -1495,17 +1617,26 @@ async function loadShared() {
     const rows = (draft || []).map((x) => ({ ...x, __draft: true }))
       .concat((pub || []).map((x) => ({ ...x, __draft: false })));
     if (!rows.length) {
-      $('shared-body').innerHTML = '<tr><td colspan="6"><div class="empty mini"><svg class="ic"><use href="#i-shared"/></svg><h4>暂无共享项</h4><p>在上方表单创建共享草稿，发布后自动级联引用它的项目分支。</p></div></td></tr>';
+      $('shared-body').innerHTML = '<tr><td colspan="8"><div class="empty mini"><svg class="ic"><use href="#i-shared"/></svg><h4>暂无共享项</h4><p>在上方表单创建共享草稿，发布后各项目可在结构页引用。</p></div></td></tr>';
       return;
     }
-    $('shared-body').innerHTML = rows.map((x) => `<tr>
-      <td class="mono">${esc(x.group)}</td>
+    $('shared-body').innerHTML = rows.map((x) => {
+      const refs = x.refs || [];
+      const refTxt = refs.length ? refs.map((r) => r.project + '/' + r.group + '/' + r.item_key).join('<br>') : '—';
+      const delBtn = x.__draft
+        ? `<button type="button" class="icon-btn danger" data-act="deleteSharedDraftItem" data-key="${esc(x.key)}" title="删除草稿" aria-label="删除草稿"><svg class="ic"><use href="#i-trash"/></svg></button>`
+        : `<button type="button" class="icon-btn danger" data-act="deleteSharedItem" data-key="${esc(x.key)}" data-refs="${esc(refs.map((r) => r.project + '/' + r.group + '/' + r.item_key).join(', '))}" title="删除共享项" aria-label="删除共享项"><svg class="ic"><use href="#i-trash"/></svg></button>`;
+      return `<tr>
       <td class="mono">${esc(x.key)}</td>
       <td class="mono muted">${esc(x.ty || x.type || '')}</td>
       <td>${x.__draft ? '<span class="badge warn">草稿</span>' : `<span class="badge ok">v${x.version}</span>`}</td>
       <td class="mono brk">${esc(JSON.stringify(x.value))}</td>
+      <td class="mono muted">${esc(x.description || '')}</td>
+      <td class="small" title="被项目结构引用">${refs.length ? `<span class="badge acc" title="${esc(refTxt)}">${refs.length} 处</span>` : '<span class="muted">—</span>'}</td>
       <td>${x.secret ? '<span class="badge err"><svg class="ic ic-xs"><use href="#i-lock"/></svg>secret</span>' : ''}</td>
-    </tr>`).join('');
+      <td>${delBtn}</td>
+    </tr>`;
+    }).join('');
   } catch (e) {
     if (!e.expired) { $('shared-body').innerHTML = ''; toast(e.message, 'err'); }
   }
@@ -1513,14 +1644,15 @@ async function loadShared() {
 actions.refreshShared = function () { loadShared(); };
 
 actions.saveShared = async function (el) {
-  const group = $('sh-group').value.trim();
   const key = $('sh-key').value.trim();
-  if (!group || !key) { showErr('sh-err', '组与 key 必填'); return; }
+  if (!key) { showErr('sh-err', 'key 必填'); return; }
   let value;
   try { value = JSON.parse($('sh-value').value); }
   catch (e) { showErr('sh-err', '值 JSON 非法：' + e.message); return; }
+  const desc = $('sh-desc') ? $('sh-desc').value.trim() : '';
+  if (desc && desc.length > 200) { showErr('sh-err', '描述超过 200 字节上限'); return; }
   hideErr('sh-err');
-  const body = { group, key, type: $('sh-type').value, secret: $('sh-secret').checked, required: $('sh-required').checked, value };
+  const body = { key, type: $('sh-type').value, secret: $('sh-secret').checked, required: $('sh-required').checked, description: desc || undefined, value };
   await withBusy(el, async () => {
     try {
       await j('POST', '/api/v1/shared', body);
@@ -1540,28 +1672,37 @@ actions.publishShared = function () {
       try {
         const r = await j('POST', '/api/v1/shared/publish', { comment, request_id: rid() });
         toast(`共享已发布 v${r.version}，级联 ${ (r.affected || []).length } 个分支`);
-        loadShared();
+        loadShared(); loadSharedItems();
       } catch (e) { if (!e.expired) toast(e.message, 'err'); }
     },
   });
 };
 
-actions.bindRef = async function (el) {
-  const body = {
-    project: $('ref-project').value.trim(),
-    group: $('ref-group').value.trim(),
-    item_key: $('ref-item').value.trim() || null,
-    shared_group: $('ref-sg').value.trim(),
-    shared_key: $('ref-sk').value.trim(),
-  };
-  if (!body.project || !body.group || !body.shared_group || !body.shared_key) { showErr('ref-err', '项目 / 结构组 / 共享组 / 共享 key 必填'); return; }
-  hideErr('ref-err');
-  await withBusy(el, async () => {
-    try {
-      await j('POST', '/api/v1/shared/refs', body);
-      toast('引用已绑定');
-    } catch (e) { if (!e.expired) toast(e.message, 'err'); }
+// 删除共享项（草稿 / 已发布）；被引用时服务端 409，toast 展示引用方
+actions.deleteSharedItem = async function (el) {
+  const key = el.dataset.key;
+  const refs = el.dataset.refs || '';
+  openModal({
+    title: '删除共享项 ' + key,
+    message: (refs ? '该项目当前被引用：' + refs + '。删除将被拒绝，请先在项目结构中移除引用。' : '删除已发布共享项（连同草稿）。已发布版本快照不受影响；被项目结构引用时将拒绝删除。') + ' 确认删除？',
+    okText: '删除', danger: true,
+    onOk: async () => {
+      try {
+        await j('DELETE', '/api/v1/shared/' + encodeURIComponent(key));
+        toast('共享项已删除');
+        loadShared(); loadSharedItems();
+      } catch (e) { if (!e.expired) toast(e.message, 'err'); }
+    },
   });
+};
+
+actions.deleteSharedDraftItem = async function (el) {
+  const key = el.dataset.key;
+  try {
+    await j('DELETE', '/api/v1/shared-draft/' + encodeURIComponent(key));
+    toast('共享草稿已删除');
+    loadShared();
+  } catch (e) { if (!e.expired) toast(e.message, 'err'); }
 };
 
 /* ---------- 审计 ---------- */

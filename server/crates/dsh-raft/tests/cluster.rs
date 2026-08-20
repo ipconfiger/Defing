@@ -163,6 +163,8 @@ async fn three_node_bootstrap_join_failover() {
                 required: true,
                 secret: false,
                 validate: None,
+                description: None,
+                shared_ref: None,
             },
             ItemDef {
                 key: "port".into(),
@@ -170,6 +172,8 @@ async fn three_node_bootstrap_join_failover() {
                 required: false,
                 secret: false,
                 validate: None,
+                description: None,
+                shared_ref: None,
             },
         ],
     }];
@@ -453,6 +457,8 @@ async fn cluster_watch_events_reach_subscribers() {
             required: true,
             secret: false,
             validate: None,
+                description: None,
+                shared_ref: None,
         }],
     }];
     client_write(
@@ -602,6 +608,8 @@ async fn gray_percentage_consistent_across_nodes() {
                     required: true,
                     secret: false,
                     validate: None,
+                description: None,
+                shared_ref: None,
                 }],
             }],
             operator: String::new(),

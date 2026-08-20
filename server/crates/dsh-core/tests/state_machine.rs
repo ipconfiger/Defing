@@ -19,6 +19,8 @@ fn redis_structure() -> Vec<GroupDef> {
                 required: true,
                 secret: false,
                 validate: None,
+                description: None,
+                shared_ref: None,
             },
             ItemDef {
                 key: "port".into(),
@@ -26,6 +28,8 @@ fn redis_structure() -> Vec<GroupDef> {
                 required: false,
                 secret: false,
                 validate: None,
+                description: None,
+                shared_ref: None,
             },
             ItemDef {
                 key: "password".into(),
@@ -33,6 +37,8 @@ fn redis_structure() -> Vec<GroupDef> {
                 required: false,
                 secret: true,
                 validate: None,
+                description: None,
+                shared_ref: None,
             },
         ],
     }]
@@ -553,21 +559,20 @@ fn rollback_invalid_version_rejected() {
     assert_eq!(err.kind, ErrorKind::Validation); // 超出活动版本范围
 }
 
-// ---------------- M2：共享库 + 引用 + 级联（R6） ----------------
+// ---------------- M2：共享库 + 引用（结构内嵌 shared_ref）+ 级联 ----------------
 
-fn publish_shared(s: &mut StateMachine, group: &str, key: &str, value: Value, request_id: &str) {
+fn publish_shared(s: &mut StateMachine, key: &str, value: Value, request_id: &str) {
     s.apply(
         &Command::SharedDraftUpdate {
             item: SharedItem {
-                group: group.into(),
                 key: key.into(),
                 ty: value.value_type(),
                 secret: false,
                 required: false,
                 value,
                 version: 0,
+                description: None,
             },
-
             operator: String::new(),
         },
         10,
@@ -577,7 +582,6 @@ fn publish_shared(s: &mut StateMachine, group: &str, key: &str, value: Value, re
         &Command::SharedPublish {
             comment: "shared".into(),
             request_id: request_id.into(),
-
             operator: String::new(),
             ts: 0,
             cascade: SharedCascadeMode::Auto,
@@ -588,64 +592,36 @@ fn publish_shared(s: &mut StateMachine, group: &str, key: &str, value: Value, re
     .unwrap();
 }
 
-#[test]
-fn shared_cascade_updates_referencing_branches() {
-    let mut s = sm();
-    // 先发布共享项
-    publish_shared(
-        &mut s,
-        "infra",
-        "db_host",
-        Value::String("db.internal".into()),
-        "sp1",
-    );
+/// redis 组（setup 结构）+ db 组（db/host 引用共享项 db_host）。
+fn struct_with_shared_ref() -> Vec<GroupDef> {
+    let mut groups = redis_structure();
+    groups.push(GroupDef {
+        name: "db".into(),
+        items: vec![ItemDef {
+            key: "host".into(),
+            ty: ValueType::String,
+            required: false,
+            secret: false,
+            validate: None,
+            description: Some("数据库地址（共享）".into()),
+            shared_ref: Some("db_host".into()),
+        }],
+    });
+    groups
+}
 
-    // 项目结构含 db/pwd item，绑定引用
-    let (pid, _) = setup(&mut s); // setup 发布结构 v2（redis 组）
-                                  // 再发布结构：加 db 组
+#[test]
+fn shared_ref_materializes_and_cascades() {
+    let mut s = sm();
+    publish_shared(&mut s, "db_host", Value::String("db.internal".into()), "sp1");
+
+    let (pid, _) = setup(&mut s); // 结构 v1（redis 组）
+    // 结构 v2：加 db 组（db/host 引用共享项 db_host）
     s.apply(
         &Command::StructureDraftSet {
             project: pid.clone(),
             base_version: 2,
-            groups: vec![
-                dsh_core::model::GroupDef {
-                    name: "redis".into(),
-                    items: vec![
-                        ItemDef {
-                            key: "host".into(),
-                            ty: ValueType::String,
-                            required: true,
-                            secret: false,
-                            validate: None,
-                        },
-                        ItemDef {
-                            key: "port".into(),
-                            ty: ValueType::Int,
-                            required: false,
-                            secret: false,
-                            validate: None,
-                        },
-                        ItemDef {
-                            key: "password".into(),
-                            ty: ValueType::Secret,
-                            required: false,
-                            secret: true,
-                            validate: None,
-                        },
-                    ],
-                },
-                dsh_core::model::GroupDef {
-                    name: "db".into(),
-                    items: vec![ItemDef {
-                        key: "host".into(),
-                        ty: ValueType::String,
-                        required: false,
-                        secret: false,
-                        validate: None,
-                    }],
-                },
-            ],
-
+            groups: struct_with_shared_ref(),
             operator: String::new(),
         },
         12,
@@ -656,29 +632,11 @@ fn shared_cascade_updates_referencing_branches() {
             project: pid.clone(),
             comment: "add db".into(),
             request_id: "s2".into(),
-
             operator: String::new(),
             ts: 0,
             policy: PublishPolicy::Block,
         },
         13,
-    )
-    .unwrap();
-
-    // RefBind：db/host → infra/db_host
-    s.apply(
-        &Command::RefBind {
-            project: pid.clone(),
-            binding: RefBinding {
-                group: "db".into(),
-                item_key: Some("host".into()),
-                shared_group: "infra".into(),
-                shared_key: "db_host".into(),
-            },
-
-            operator: String::new(),
-        },
-        14,
     )
     .unwrap();
 
@@ -693,7 +651,6 @@ fn shared_cascade_updates_referencing_branches() {
                 value: Value::String("127.0.0.1".into()),
             }],
             deletes: vec![],
-
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -701,18 +658,12 @@ fn shared_cascade_updates_referencing_branches() {
         15,
     )
     .unwrap();
-    let before = s
-        .get_branch_state(&pid, &BranchName("dev".into()))
-        .unwrap()
-        .unwrap()
-        .active_version;
     s.apply(
         &Command::Publish {
             project: pid.clone(),
             branch: BranchName("dev".into()),
             comment: "dev".into(),
             request_id: "r1".into(),
-
             operator: String::new(),
             ts: 0,
             policy: PublishPolicy::Block,
@@ -726,20 +677,8 @@ fn shared_cascade_updates_referencing_branches() {
         Value::String("db.internal".into())
     );
 
-    // 共享项变更 → 级联：dev 分支版本推进，值更新
-    let after_publish_ver = s
-        .get_branch_state(&pid, &BranchName("dev".into()))
-        .unwrap()
-        .unwrap()
-        .active_version;
-    assert!(after_publish_ver > before);
-    publish_shared(
-        &mut s,
-        "infra",
-        "db_host",
-        Value::String("db.internal.2".into()),
-        "sp2",
-    );
+    // 共享项变更 → 级联：dev 分支版本推进，值更新（shared_usage 扫描结构命中）
+    publish_shared(&mut s, "db_host", Value::String("db.internal.2".into()), "sp2");
     let dev_after = s.get_config(&pid, &BranchName("dev".into()), 0).unwrap();
     assert_eq!(
         dev_after.groups["db"]["host"],
@@ -751,19 +690,175 @@ fn shared_cascade_updates_referencing_branches() {
 }
 
 #[test]
-fn ref_requires_published_shared() {
+fn shared_ref_rejects_local_draft_value() {
     let mut s = sm();
+    publish_shared(&mut s, "db_host", Value::String("sh".into()), "sp1");
     let (pid, _) = setup(&mut s);
+    s.apply(
+        &Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: 2,
+            groups: struct_with_shared_ref(),
+            operator: String::new(),
+        },
+        12,
+    )
+    .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "s".into(),
+            request_id: "s2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        13,
+    )
+    .unwrap();
+    // 引用项只读：分支草稿写本地值 → Validation 拒绝
     let err = s
         .apply(
-            &Command::RefBind {
+            &Command::DraftUpdate {
                 project: pid.clone(),
-                binding: RefBinding {
-                    group: "redis".into(),
-                    item_key: Some("host".into()),
-                    shared_group: "infra".into(),
-                    shared_key: "nope".into(),
-                },
+                branch: BranchName("dev".into()),
+                updates: vec![DraftUpdateItem {
+                    group: "db".into(),
+                    key: "host".into(),
+                    value: Value::String("local".into()),
+                }],
+                deletes: vec![],
+                operator: String::new(),
+                ts: 0,
+                expected_draft_rev: None,
+            },
+            15,
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Validation);
+}
+
+#[test]
+fn structure_publish_cleans_draft_of_shared_ref_items() {
+    let mut s = sm();
+    publish_shared(&mut s, "db_host", Value::String("sh".into()), "sp1");
+    let (pid, _) = setup(&mut s); // v1 redis 组
+    // v2：db/host 为本地项 → dev 草稿写本地值
+    let mut g2 = redis_structure();
+    g2.push(GroupDef {
+        name: "db".into(),
+        items: vec![ItemDef {
+            key: "host".into(),
+            ty: ValueType::String,
+            required: false,
+            secret: false,
+            validate: None,
+            description: None,
+            shared_ref: None,
+        }],
+    });
+    s.apply(
+        &Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: 2,
+            groups: g2,
+            operator: String::new(),
+        },
+        12,
+    )
+    .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "s".into(),
+            request_id: "s2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        13,
+    )
+    .unwrap();
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: BranchName("dev".into()),
+            updates: vec![DraftUpdateItem {
+                group: "db".into(),
+                key: "host".into(),
+                value: Value::String("local".into()),
+            }],
+            deletes: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        15,
+    )
+    .unwrap();
+    assert!(s
+        .get_branch_state(&pid, &BranchName("dev".into()))
+        .unwrap()
+        .unwrap()
+        .value_draft["db"]
+        .contains_key("host"));
+    // v3：db/host 改为共享引用 → 发布后清理其草稿值
+    s.apply(
+        &Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: 3,
+            groups: struct_with_shared_ref(),
+            operator: String::new(),
+        },
+        16,
+    )
+    .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "s".into(),
+            request_id: "s3".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        17,
+    )
+    .unwrap();
+    let st = s
+        .get_branch_state(&pid, &BranchName("dev".into()))
+        .unwrap()
+        .unwrap();
+    assert!(!st
+        .value_draft
+        .get("db")
+        .is_some_and(|m| m.contains_key("host")));
+}
+
+#[test]
+fn dangling_shared_ref_rejected_at_structure_draft() {
+    let mut s = sm();
+    let (pid, _) = setup(&mut s);
+    // 引用未发布的共享项 → 结构草稿保存即拒（替代旧 ref_requires_published_shared）
+    let mut groups = redis_structure();
+    groups.push(GroupDef {
+        name: "db".into(),
+        items: vec![ItemDef {
+            key: "host".into(),
+            ty: ValueType::String,
+            required: false,
+            secret: false,
+            validate: None,
+            description: None,
+            shared_ref: Some("nope".into()),
+        }],
+    });
+    let err = s
+        .apply(
+            &Command::StructureDraftSet {
+                project: pid.clone(),
+                base_version: 2,
+                groups,
                 operator: String::new(),
             },
             12,
@@ -772,6 +867,149 @@ fn ref_requires_published_shared() {
     assert_eq!(err.kind, ErrorKind::Validation);
 }
 
+#[test]
+fn shared_ref_type_mismatch_rejected() {
+    let mut s = sm();
+    publish_shared(&mut s, "db_port", Value::Int(5432), "sp1");
+    let (pid, _) = setup(&mut s);
+    let mut groups = redis_structure();
+    groups.push(GroupDef {
+        name: "db".into(),
+        items: vec![ItemDef {
+            key: "port".into(),
+            ty: ValueType::String, // 与共享项 int 不一致
+            required: false,
+            secret: false,
+            validate: None,
+            description: None,
+            shared_ref: Some("db_port".into()),
+        }],
+    });
+    let err = s
+        .apply(
+            &Command::StructureDraftSet {
+                project: pid.clone(),
+                base_version: 2,
+                groups,
+                operator: String::new(),
+            },
+            12,
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Validation);
+}
+
+#[test]
+fn shared_delete_blocks_when_referenced() {
+    let mut s = sm();
+    publish_shared(&mut s, "db_host", Value::String("sh".into()), "sp1");
+    let (pid, _) = setup(&mut s);
+    s.apply(
+        &Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: 2,
+            groups: struct_with_shared_ref(),
+            operator: String::new(),
+        },
+        12,
+    )
+    .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "s".into(),
+            request_id: "s2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        13,
+    )
+    .unwrap();
+    // 被项目结构引用 → Conflict（列出引用方）
+    let err = s
+        .apply(
+            &Command::SharedDelete {
+                key: "db_host".into(),
+                operator: String::new(),
+            },
+            15,
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Conflict);
+    assert!(s.get_shared("db_host").unwrap().is_some());
+}
+
+#[test]
+fn shared_delete_unreferenced_succeeds_idempotent() {
+    let mut s = sm();
+    publish_shared(&mut s, "db_host", Value::String("sh".into()), "sp1");
+    // 未引用 → 删除已发布项；幂等：再删成功
+    s.apply(
+        &Command::SharedDelete {
+            key: "db_host".into(),
+            operator: String::new(),
+        },
+        12,
+    )
+    .unwrap();
+    assert!(s.get_shared("db_host").unwrap().is_none());
+    assert!(s
+        .apply(
+            &Command::SharedDelete {
+                key: "db_host".into(),
+                operator: String::new(),
+            },
+            13,
+        )
+        .is_ok());
+    // 草稿路径：发布前删除草稿项
+    publish_shared(&mut s, "db_host", Value::String("sh".into()), "sp2");
+    s.apply(
+        &Command::SharedDelete {
+            key: "db_host".into(),
+            operator: String::new(),
+        },
+        14,
+    )
+    .unwrap();
+    assert!(s.list_shared_drafts().unwrap().is_empty());
+}
+
+#[test]
+fn shared_usage_reverse_mapping() {
+    let mut s = sm();
+    publish_shared(&mut s, "db_host", Value::String("sh".into()), "sp1");
+    let (pid, _) = setup(&mut s);
+    assert!(s.shared_usage("db_host").unwrap().is_empty());
+    s.apply(
+        &Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: 2,
+            groups: struct_with_shared_ref(),
+            operator: String::new(),
+        },
+        12,
+    )
+    .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "s".into(),
+            request_id: "s2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        13,
+    )
+    .unwrap();
+    let usage = s.shared_usage("db_host").unwrap();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].0, pid);
+    assert_eq!(usage[0].1, "db");
+    assert_eq!(usage[0].2, "host");
+}
 // ---------------- 会话（I7 单管理员） ----------------
 
 #[test]
@@ -917,223 +1155,6 @@ fn audit_seq_counter_survives_restore() {
     assert_eq!(all[0].seq, 2);
 }
 
-// ---------------- B3：组级引用（item_key=None 整组绑定共享组） ----------------
-
-/// 建项目（结构 redis 组：host/port）+ 发布共享组 infra（host/port）。
-fn group_ref_setup(s: &mut StateMachine) -> ProjectId {
-    let (pid, _) = setup(s); // redis 组：host 必填 / port / password(secret)
-    publish_shared(
-        s,
-        "infra",
-        "host",
-        Value::String("sh-host.old".into()),
-        "gh1",
-    );
-    publish_shared(s, "infra", "port", Value::Int(6000), "gh2");
-    pid
-}
-
-#[test]
-fn group_ref_bind_requires_matching_shared_item() {
-    let mut s = sm();
-    let (pid, _) = setup(&mut s);
-    // 共享组 infra 没有任何已发布项 → 组级绑定被拒
-    let err = s
-        .apply(
-            &Command::RefBind {
-                project: pid,
-                binding: RefBinding {
-                    group: "redis".into(),
-                    item_key: None,
-                    shared_group: "infra".into(),
-                    shared_key: "redis".into(),
-                },
-                operator: String::new(),
-            },
-            20,
-        )
-        .unwrap_err();
-    assert_eq!(err.kind, ErrorKind::Validation);
-}
-
-#[test]
-fn group_ref_materializes_matching_items_at_publish() {
-    let mut s = sm();
-    let pid = group_ref_setup(&mut s);
-    // 组级绑定：整组 redis ← 共享组 infra
-    s.apply(
-        &Command::RefBind {
-            project: pid.clone(),
-            binding: RefBinding {
-                group: "redis".into(),
-                item_key: None,
-                shared_group: "infra".into(),
-                shared_key: "redis".into(),
-            },
-
-            operator: String::new(),
-        },
-        30,
-    )
-    .unwrap();
-    // 草稿只显式设置 host → 发布后 host=草稿值，port=共享值（整组按结构 item key 匹配）
-    s.apply(
-        &Command::DraftUpdate {
-            project: pid.clone(),
-            branch: BranchName("dev".into()),
-            updates: vec![DraftUpdateItem {
-                group: "redis".into(),
-                key: "host".into(),
-                value: Value::String("local-host".into()),
-            }],
-            deletes: vec![],
-
-            operator: String::new(),
-            ts: 0,
-            expected_draft_rev: None,
-        },
-        31,
-    )
-    .unwrap();
-    s.apply(
-        &Command::Publish {
-            project: pid.clone(),
-            branch: BranchName("dev".into()),
-            comment: "g1".into(),
-            request_id: "gr1".into(),
-
-            operator: String::new(),
-            ts: 0,
-            policy: PublishPolicy::Block,
-        },
-        32,
-    )
-    .unwrap();
-    let cfg = s.get_config(&pid, &BranchName("dev".into()), 0).unwrap();
-    let redis = cfg.groups.get("redis").unwrap();
-    assert_eq!(
-        redis.get("host").unwrap(),
-        &Value::String("local-host".into()),
-        "草稿显式值优先"
-    );
-    assert_eq!(
-        redis.get("port").unwrap(),
-        &Value::Int(6000),
-        "未显式 item 由组级共享物化"
-    );
-    // password 不在共享组 infra → 不物化（结构 item 但无匹配共享项）
-    assert!(!redis.contains_key("password"));
-}
-
-#[test]
-fn group_ref_cascade_on_shared_publish() {
-    let mut s = sm();
-    let pid = group_ref_setup(&mut s);
-    s.apply(
-        &Command::RefBind {
-            project: pid.clone(),
-            binding: RefBinding {
-                group: "redis".into(),
-                item_key: None,
-                shared_group: "infra".into(),
-                shared_key: "redis".into(),
-            },
-
-            operator: String::new(),
-        },
-        40,
-    )
-    .unwrap();
-    // 共享发布 infra/port 新值 → 组级级联：引用项目的分支版本推进
-    publish_shared(&mut s, "infra", "port", Value::Int(7000), "gh3");
-    let cfg = s.get_config(&pid, &BranchName("dev".into()), 0).unwrap();
-    assert_eq!(
-        cfg.version, 2,
-        "共享发布后活动版本推进（结构 v1 + 级联 v2）"
-    );
-    assert_eq!(
-        cfg.groups.get("redis").unwrap().get("port").unwrap(),
-        &Value::Int(7000),
-        "组级级联更新匹配 item"
-    );
-    // 其他分支（test/prod）同样级联
-    let t = s.get_config(&pid, &BranchName("test".into()), 0).unwrap();
-    assert_eq!(
-        t.groups.get("redis").unwrap().get("port").unwrap(),
-        &Value::Int(7000)
-    );
-}
-
-#[test]
-fn group_ref_unbind_stops_materialization() {
-    let mut s = sm();
-    let pid = group_ref_setup(&mut s);
-    s.apply(
-        &Command::RefBind {
-            project: pid.clone(),
-            binding: RefBinding {
-                group: "redis".into(),
-                item_key: None,
-                shared_group: "infra".into(),
-                shared_key: "redis".into(),
-            },
-
-            operator: String::new(),
-        },
-        50,
-    )
-    .unwrap();
-    s.apply(
-        &Command::RefUnbind {
-            project: pid.clone(),
-            group: "redis".into(),
-            item_key: None,
-
-            operator: String::new(),
-        },
-        51,
-    )
-    .unwrap();
-    // 发布（草稿只设 host）→ port 不再物化（但 required host 已设，可发布）
-    s.apply(
-        &Command::DraftUpdate {
-            project: pid.clone(),
-            branch: BranchName("dev".into()),
-            updates: vec![DraftUpdateItem {
-                group: "redis".into(),
-                key: "host".into(),
-                value: Value::String("h".into()),
-            }],
-            deletes: vec![],
-
-            operator: String::new(),
-            ts: 0,
-            expected_draft_rev: None,
-        },
-        52,
-    )
-    .unwrap();
-    s.apply(
-        &Command::Publish {
-            project: pid.clone(),
-            branch: BranchName("dev".into()),
-            comment: "g2".into(),
-            request_id: "gr2".into(),
-
-            operator: String::new(),
-            ts: 0,
-            policy: PublishPolicy::Block,
-        },
-        53,
-    )
-    .unwrap();
-    let cfg = s.get_config(&pid, &BranchName("dev".into()), 0).unwrap();
-    assert!(
-        !cfg.groups.get("redis").unwrap().contains_key("port"),
-        "解绑后不再物化共享值"
-    );
-}
-
 // ---------------- B6：DEK 重包（rewrap_deks） ----------------
 
 fn fake_ct(dek_v: u64) -> Value {
@@ -1156,13 +1177,13 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
     s.apply(
         &Command::SharedDraftUpdate {
             item: SharedItem {
-                group: "infra".into(),
                 key: "token".into(),
                 ty: ValueType::Secret,
                 secret: true,
                 required: false,
                 value: fake_ct(1),
                 version: 0,
+                description: None,
             },
 
             operator: String::new(),
@@ -1249,7 +1270,7 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
     let rows = s.dump_all().unwrap();
     let sh_row = rows
         .iter()
-        .find(|(k, _)| String::from_utf8_lossy(k) == "sh/infra/token")
+        .find(|(k, _)| String::from_utf8_lossy(k) == "sh/token")
         .expect("shared item row");
     let shared: SharedItem = serde_json::from_slice(&sh_row.1).unwrap();
     match shared.value {
@@ -1307,13 +1328,13 @@ fn shared_item_over_limit_rejected() {
     let mut s = sm();
     let big = "x".repeat(dsh_core::limits::MAX_VALUE_BYTES + 1);
     let item = dsh_core::model::SharedItem {
-        group: "g".into(),
         key: "k".into(),
         ty: dsh_core::model::ValueType::String,
         secret: false,
         required: false,
         value: dsh_core::model::Value::String(big),
         version: 0,
+        description: None,
     };
     let err = s
         .apply(
@@ -3264,13 +3285,13 @@ fn g1_manual_cascade_shared_publish() {
     s.apply(
         &Command::SharedDraftUpdate {
             item: SharedItem {
-                group: "lib".into(),
                 key: "timeout".into(),
                 ty: ValueType::Int,
                 secret: false,
                 required: false,
                 value: Value::Int(30),
                 version: 0,
+                description: None,
             },
             operator: String::new(),
         },
@@ -3289,21 +3310,36 @@ fn g1_manual_cascade_shared_publish() {
         11,
     )
     .unwrap();
-    // 绑定引用：dev.redis.port ← lib.timeout；发布 dev（物化 30）→ active=2
+    // 结构 v2：redis.port 引用共享项 timeout
+    let mut groups = redis_structure();
+    for g in &mut groups {
+        for item in &mut g.items {
+            if item.key == "port" { item.shared_ref = Some("timeout".into()); }
+        }
+    }
     s.apply(
-        &Command::RefBind {
+        &Command::StructureDraftSet {
             project: pid.clone(),
-            binding: RefBinding {
-                group: "redis".into(),
-                item_key: Some("port".into()),
-                shared_group: "lib".into(),
-                shared_key: "timeout".into(),
-            },
+            base_version: 2,
+            groups,
             operator: String::new(),
         },
         12,
     )
     .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "ref port".into(),
+            request_id: "s2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        13,
+    )
+    .unwrap();
+    // 发布 dev（草稿只填 host）→ port 由共享物化 30
     s.apply(
         &Command::DraftUpdate {
             project: pid.clone(),
@@ -3318,7 +3354,7 @@ fn g1_manual_cascade_shared_publish() {
             ts: 0,
             expected_draft_rev: None,
         },
-        13,
+        14,
     )
     .unwrap();
     s.apply(
@@ -3331,7 +3367,7 @@ fn g1_manual_cascade_shared_publish() {
             ts: 0,
             policy: PublishPolicy::Block,
         },
-        14,
+        15,
     )
     .unwrap();
     let cfg = s.get_config(&pid, &dev, 0).unwrap();
@@ -3343,17 +3379,17 @@ fn g1_manual_cascade_shared_publish() {
     s.apply(
         &Command::SharedDraftUpdate {
             item: SharedItem {
-                group: "lib".into(),
                 key: "timeout".into(),
                 ty: ValueType::Int,
                 secret: false,
                 required: false,
                 value: Value::Int(60),
                 version: 1,
+                description: None,
             },
             operator: String::new(),
         },
-        15,
+        16,
     )
     .unwrap();
     let events = s
@@ -3366,7 +3402,7 @@ fn g1_manual_cascade_shared_publish() {
                 cascade: SharedCascadeMode::Manual,
                 policy: PublishPolicy::Block,
             },
-            16,
+            17,
         )
         .unwrap();
     assert!(events.is_empty(), "manual 不级联 → 无分支事件");
@@ -3376,7 +3412,7 @@ fn g1_manual_cascade_shared_publish() {
         "manual：引用分支版本不推进"
     );
     // 共享版本已更新
-    assert_eq!(s.get_shared("lib", "timeout").unwrap().unwrap().version, 2);
+    assert_eq!(s.get_shared("timeout").unwrap().unwrap().version, 2);
     // 引用分支下次发布 → 物化新共享值 60
     s.apply(
         &Command::DraftUpdate {
@@ -3392,7 +3428,7 @@ fn g1_manual_cascade_shared_publish() {
             ts: 0,
             expected_draft_rev: None,
         },
-        17,
+        18,
     )
     .unwrap();
     s.apply(
@@ -3405,7 +3441,7 @@ fn g1_manual_cascade_shared_publish() {
             ts: 0,
             policy: PublishPolicy::Block,
         },
-        18,
+        19,
     )
     .unwrap();
     let cfg = s.get_config(&pid, &dev, 0).unwrap();

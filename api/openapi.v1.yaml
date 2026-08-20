@@ -483,38 +483,23 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/SharedPublishResult' }
         '422': { $ref: '#/components/responses/PublishBlocked' }
-  /api/v1/shared/refs:
-    get:
-      summary: 项目共享引用绑定列表
-      parameters:
-        - { name: project, in: query, required: true, schema: { type: string } }
-      responses:
-        '200':
-          description: 成功
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/RefBinding' }
-    post:
-      summary: 绑定项目 item/组 → 共享项（发布时物化；共享发布自动级联）
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/RefBindingReq' }
-      responses:
-        '200': { description: 已绑定 }
-        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /api/v1/shared/{key}:
     delete:
-      summary: 解绑
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/RefUnbindReq' }
+      summary: 删除已发布共享项（连同草稿）；被项目结构引用 → 409 Conflict
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
       responses:
-        '200': { description: 已解绑 }
+        '204': { description: 已删除 }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+  /api/v1/shared-draft/{key}:
+    delete:
+      summary: 删除共享草稿（幂等）
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: 已删除 }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
   /api/v1/audit:
     get:
       summary: 审计查询
@@ -896,6 +881,18 @@ components:
         active_version: { type: integer, format: int64 }
         structure_version: { type: integer, format: int64 }
         created_at: { type: string, format: date-time }
+        draft_rev: { type: integer, format: int64, description: 草稿修订号（乐观锁） }
+        shared_refs:
+          type: array
+          description: 引用项解析（值来自共享库；secret 已掩码），供草稿页只读展示
+          items:
+            type: object
+            properties:
+              group: { type: string }
+              key: { type: string }
+              shared_key: { type: string }
+              version: { type: integer, format: int64 }
+              value: { $ref: '#/components/schemas/Value' }
     ConfigSnapshot:
       type: object
       required: [project, branch, version]
@@ -1108,15 +1105,24 @@ components:
           items: { type: string }
     SharedItem:
       type: object
-      required: [group, key, type]
+      required: [key, type]
       properties:
-        group: { type: string }
-        key: { type: string }
+        key: { type: string, description: 共享项 key（全局唯一，无分组） }
         type: { type: string, enum: [string, int, float, bool, json, array, secret] }
         secret: { type: boolean, default: false }
         required: { type: boolean, default: false }
         value: { $ref: '#/components/schemas/Value' }
         version: { type: integer, format: int64 }
+        description: { type: string, description: 助记描述（≤200 字节，不渲染） }
+        refs:
+          type: array
+          description: 引用该共享项的项目结构位置（仅 GET /api/v1/shared 返回）
+          items:
+            type: object
+            properties:
+              project: { type: string }
+              group: { type: string }
+              item_key: { type: string }
     SharedPublishResult:
       type: object
       properties:
@@ -1129,29 +1135,6 @@ components:
               project: { type: string }
               branch: { type: string }
               new_version: { type: integer, format: int64 }
-    RefBinding:
-      type: object
-      properties:
-        group: { type: string }
-        item_key: { type: string, nullable: true, description: null=整组引用 }
-        shared_group: { type: string }
-        shared_key: { type: string }
-    RefBindingReq:
-      type: object
-      required: [project, group, shared_group, shared_key]
-      properties:
-        project: { type: string }
-        group: { type: string }
-        item_key: { type: string, description: 缺省=整组绑定共享组 }
-        shared_group: { type: string }
-        shared_key: { type: string }
-    RefUnbindReq:
-      type: object
-      required: [project, group]
-      properties:
-        project: { type: string }
-        group: { type: string }
-        item_key: { type: string, description: 缺省=整组解绑 }
     AuditEntry:
       type: object
       properties:

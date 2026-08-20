@@ -18,6 +18,8 @@ pub fn demo_structure() -> Vec<GroupDef> {
                 required: true,
                 secret: false,
                 validate: None,
+                description: None,
+                shared_ref: None,
             },
             ItemDef {
                 key: "port".into(),
@@ -25,6 +27,8 @@ pub fn demo_structure() -> Vec<GroupDef> {
                 required: false,
                 secret: false,
                 validate: None,
+                description: None,
+                shared_ref: None,
             },
             ItemDef {
                 key: "pass".into(),
@@ -32,6 +36,8 @@ pub fn demo_structure() -> Vec<GroupDef> {
                 required: false,
                 secret: true,
                 validate: None,
+                description: None,
+                shared_ref: None,
             },
         ],
     }]

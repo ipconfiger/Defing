@@ -191,6 +191,13 @@ pub struct ItemDef {
     pub secret: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validate: Option<String>,
+    /// 助记描述（自由文本 ≤200 字节；不进入渲染输出）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// 引用共享项（共享库扁平化后的共享项 key；None = 本地项，值来自分支草稿）。
+    /// 非 None 时本项只读：值完全来自共享项，type/required/secret 继承共享项定义。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_ref: Option<String>,
 }
 
 /// 分组定义。
@@ -398,10 +405,9 @@ pub enum ReadMode {
     Linear,
 }
 
-/// 跨项目共享项（集群级）。
+/// 跨项目共享项（集群级；扁平库：无分组，key 全局唯一）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SharedItem {
-    pub group: String,
     pub key: String,
     pub ty: ValueType,
     #[serde(default)]
@@ -410,16 +416,9 @@ pub struct SharedItem {
     pub required: bool,
     pub value: Value,
     pub version: u64,
-}
-
-/// 项目分组 → 共享库 引用绑定。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RefBinding {
-    pub group: String,
+    /// 助记描述（自由文本 ≤200 字节；不进入渲染输出）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub item_key: Option<String>, // None = 整组引用
-    pub shared_group: String,
-    pub shared_key: String,
+    pub description: Option<String>,
 }
 
 /// 会话主体（区分全局管理员与项目管理员；旧数据无此字段 → Admin）。

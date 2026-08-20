@@ -20,7 +20,7 @@ pub use error::{Error, ErrorKind};
 pub use model::{
     AdminSession, AuditEntry, BranchName, BranchState, ChangeKind, Ciphertext, DiffEntry,
     DraftValue, EventType, GrayRule, GroupDef, ItemDef, LabelSelector, Principal, Project,
-    ProjectAdminAccount, ProjectId, PublishEvent, RefBinding, SharedItem, SnapshotMap, Structure,
+    ProjectAdminAccount, ProjectId, PublishEvent, SharedItem, SnapshotMap, Structure,
     StructureDraft, Value, ValueType, VersionKind, VersionRecord,
 };
 pub use state::{

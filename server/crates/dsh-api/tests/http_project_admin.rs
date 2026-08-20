@@ -267,8 +267,8 @@ async fn pa_authorization_matrix() {
         ("POST", "/api/v1/shared/publish"),
         ("GET", "/api/v1/shared"),
         ("GET", "/api/v1/shared-draft"),
-        ("POST", "/api/v1/shared/refs"),
-        ("DELETE", "/api/v1/shared/refs"),
+        ("DELETE", "/api/v1/shared/any-key"),
+        ("DELETE", "/api/v1/shared-draft/any-key"),
     ] {
         let (c, b) = req(&s.base, m, p, Some(&pa), Some(serde_json::json!({}))).await;
         assert_eq!(c, 403, "{m} {p}: {b}");
@@ -276,16 +276,6 @@ async fn pa_authorization_matrix() {
             assert_eq!(b["code"], "ERR_FORBIDDEN");
         }
     }
-    // ✅ GET /shared/refs 只读放行
-    let (c, _) = req(
-        &s.base,
-        "GET",
-        "/api/v1/shared/refs?project=p1",
-        Some(&pa),
-        None,
-    )
-    .await;
-    assert_eq!(c, 200);
 
     // ❌ 项目面/账号/集群/全局
     for (m, p) in [

@@ -310,6 +310,8 @@ mod tests {
                         required: true,
                         secret: false,
                         validate: None,
+                description: None,
+                shared_ref: None,
                     }],
                 }],
 
@@ -338,7 +340,7 @@ mod tests {
                     project: "p".into(),
                     branch: BranchName("dev".into()),
                     updates: vec![DraftUpdateItem {
-                        group: "g".into(),
+                    group: "g".into(),
                         key: "k".into(),
                         value: dsh_core::model::Value::String(format!("v{i}")),
                     }],
@@ -391,7 +393,7 @@ mod tests {
                     project: "p".into(),
                     branch: BranchName("dev".into()),
                     updates: vec![DraftUpdateItem {
-                        group: "g".into(),
+                    group: "g".into(),
                         key: "k".into(),
                         value: dsh_core::model::Value::String(format!("x{i}")),
                     }],
@@ -507,6 +509,8 @@ mod rewrap_tests {
                             required: true,
                             secret: false,
                             validate: None,
+                description: None,
+                shared_ref: None,
                         },
                         ItemDef {
                             key: "pass".into(),
@@ -514,6 +518,8 @@ mod rewrap_tests {
                             required: false,
                             secret: true,
                             validate: None,
+                description: None,
+                shared_ref: None,
                         },
                     ],
                 }],
@@ -543,12 +549,12 @@ mod rewrap_tests {
                 branch: BranchName("dev".into()),
                 updates: vec![
                     DraftUpdateItem {
-                        group: "g".into(),
+                    group: "g".into(),
                         key: "host".into(),
                         value: Value::String("h".into()),
                     },
                     DraftUpdateItem {
-                        group: "g".into(),
+                    group: "g".into(),
                         key: "pass".into(),
                         value: Value::Secret(ct),
                     },
@@ -580,13 +586,13 @@ mod rewrap_tests {
         sm.apply(
             &Command::SharedDraftUpdate {
                 item: SharedItem {
-                    group: "g".into(),
                     key: "tok".into(),
                     ty: ValueType::Secret,
                     secret: true,
                     required: false,
                     value: Value::Secret(cipher.encrypt_secret(b"shared-job").unwrap()),
                     version: 0,
+                    description: None,
                 },
 
                 operator: String::new(),
@@ -675,6 +681,8 @@ mod auto_rollback_tests {
                         required: true,
                         secret: false,
                         validate: None,
+                description: None,
+                shared_ref: None,
                     }],
                 }],
                 operator: String::new(),

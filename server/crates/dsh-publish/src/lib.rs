@@ -395,6 +395,8 @@ mod tests {
                             required: true,
                             secret: false,
                             validate: None,
+                description: None,
+                shared_ref: None,
                         },
                         ItemDef {
                             key: "pass".into(),
@@ -402,6 +404,8 @@ mod tests {
                             required: false,
                             secret: true,
                             validate: None,
+                description: None,
+                shared_ref: None,
                         },
                     ],
                 }],

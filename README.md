@@ -62,7 +62,7 @@ gRPC 契约测试：`bash scripts/sdk-grpc-contract-test.sh`（依赖：npm inst
 - **集群**：Raft 强一致、静态成员表建群（--bootstrap-peers，全员 voter 无需 promote）、
   join/promote 动态扩容、leader 击杀容错、节点重启自动恢复
 - **配置模型**：项目→分支→分组→item；结构强一致（仅值按分支）
-- **发布闭环**：草稿 → 版本（不可变）→ 发布 → 通知；回滚；共享配置项与级联
+- **发布闭环**：草稿 → 版本（不可变）→ 发布 → 通知；回滚；共享配置项（扁平库，含描述字段）与级联——引用关系由项目结构页的「共享引用」决定（引用项只读，值由共享库物化）
 - **安全**：secret 项 AES-256-GCM 信封加密（主密钥 env/文件）、多会话并存（每会话独立管理 + 草稿乐观锁防并发编辑冲突）、审计、CSP、
   join/raft 集群令牌（--join-token/--raft-token 集群模式强制）、HTTP 数据面令牌（--data-plane-token）
 - **多格式**：YAML / TOML / JSON 渲染

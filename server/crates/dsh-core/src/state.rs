@@ -1058,17 +1058,7 @@ impl StateMachine {
                 *cascade,
                 *policy,
             ),
-            Command::RefBind {
-                project,
-                binding,
-                operator,
-            } => self.apply_ref_bind(project, binding, operator),
-            Command::RefUnbind {
-                project,
-                group,
-                item_key,
-                operator,
-            } => self.apply_ref_unbind(project, group, item_key.as_deref(), operator),
+            Command::SharedDelete { key, operator } => self.apply_shared_delete(key, operator),
             Command::SessionLogin {
                 token_hash,
                 issued_at,
@@ -1258,28 +1248,7 @@ impl StateMachine {
             self.delete_all_pa_sessions(&acct.username)?;
             self.delete_pending(project_admin_key(&acct.username).as_bytes())?;
         }
-        // N1：清理孤儿全局引用索引（共享项发布级联扫描会命中已删项目，索引脏数据需一并清除）。
-        // 共享 group/key 与项目名/组名均受 valid_key_name 字符集约束（无 `/`），按 `/` 切分可靠。
-        // idx/ref/{sg}/{sk}/{project}/{group}/{item_key} → 第 3 段（index 2）为 project
-        for (k, _) in self.get_prefix_merged(K_IDX_REF.as_bytes())? {
-            let ks = String::from_utf8_lossy(&k);
-            if let Some(rest) = ks.strip_prefix(K_IDX_REF) {
-                let parts: Vec<&str> = rest.split('/').collect();
-                if parts.len() == 5 && parts[2] == id.as_str() {
-                    self.delete_pending(&k)?;
-                }
-            }
-        }
-        // idx/refg/{sg}/{project}/{group} → 第 2 段（index 1）为 project
-        for (k, _) in self.get_prefix_merged(K_IDX_REFG.as_bytes())? {
-            let ks = String::from_utf8_lossy(&k);
-            if let Some(rest) = ks.strip_prefix(K_IDX_REFG) {
-                let parts: Vec<&str> = rest.split('/').collect();
-                if parts.len() == 3 && parts[1] == id.as_str() {
-                    self.delete_pending(&k)?;
-                }
-            }
-        }
+        // 共享引用已内嵌项目结构（随项目前缀一并删除），无需清理独立引用索引。
         Ok(vec![])
     }
 
@@ -1388,6 +1357,8 @@ impl StateMachine {
                 serde_json::json!({ "errors": errs }),
             ));
         }
+        // 引用校验：shared_ref 必须指向已发布共享项且类型一致
+        self.check_shared_refs(&draft_structure)?;
         let draft = StructureDraft {
             base_version,
             groups: groups.to_vec(),
@@ -1425,6 +1396,8 @@ impl StateMachine {
                 serde_json::json!({ "errors": errs }),
             ));
         }
+        // 引用校验：shared_ref 必须指向已发布共享项且类型一致（草稿期已校验，双保险）
+        self.check_shared_refs(&draft_structure)?;
         let new_structure = Structure {
             version: structure.version + 1,
             groups: draft.groups.clone(),
@@ -1488,6 +1461,16 @@ impl StateMachine {
                     !items.is_empty()
                 }
             });
+            // D14 扩展：引用项只读——清理 shared_ref 项的既有草稿值（值由共享库物化）
+            for g in &new_structure.groups {
+                for item in &g.items {
+                    if item.shared_ref.is_some() {
+                        if let Some(m) = st.value_draft.get_mut(&g.name) {
+                            m.remove(&item.key);
+                        }
+                    }
+                }
+            }
             self.save_pending(&branch_state_key(id, branch), &st)?;
             events.push(PublishEvent {
                 project: id.clone(),
@@ -1551,6 +1534,13 @@ impl StateMachine {
                 .get(&u.group)
                 .and_then(|m| m.get(&u.key))
                 .ok_or_else(|| Error::validation(format!("unknown item {}/{}", u.group, u.key)))?;
+            // 引用项只读：值由共享库物化，禁止分支草稿设置本地值
+            if def.shared_ref.is_some() {
+                return Err(Error::validation(format!(
+                    "item {}/{} 引用共享项，不可设置本地值",
+                    u.group, u.key
+                )));
+            }
             let errs = validator::validate_value(def, &u.value);
             if !errs.is_empty() {
                 return Err(Error::validation(errs.join("; ")));
@@ -1597,21 +1587,21 @@ impl StateMachine {
     /// 返回 (快照, 校验告警列表——Warn 模式下非空)。
     fn materialize_resolved(
         &self,
-        id: &ProjectId,
+        _id: &ProjectId,
         st: &BranchState,
         structure: &Structure,
         policy: PublishPolicy,
     ) -> Result<(SnapshotMap, Vec<String>), Error> {
         // 完整性校验（G1/D35：策略编码进命令——确定性由日志序保证）
         let draft_map: BTreeMap<String, BTreeMap<String, DraftValue>> = st.value_draft.clone();
-        let errs = validator::validate_publish(&draft_map, structure);
+        let mut errs = validator::validate_publish(&draft_map, structure);
         if !errs.is_empty() && policy == PublishPolicy::Block {
             return Err(Error::publish_blocked(
                 serde_json::json!({ "errors": errs }),
             ));
         }
 
-        // 物化：草稿值 + 共享库引用（草稿无值时取共享值）
+        // 物化：草稿值 + 共享引用（引用项只读：值来自共享库，忽略草稿中该 item 的值）
         let mut resolved: SnapshotMap = draft_map
             .into_iter()
             .map(|(g, items)| {
@@ -1619,40 +1609,20 @@ impl StateMachine {
                 (g, m)
             })
             .collect();
-        for binding in self.read_refs_of_project(id)? {
-            match binding.item_key.as_deref() {
-                Some(key) => {
-                    if resolved
-                        .get(&binding.group)
-                        .is_none_or(|m| !m.contains_key(key))
-                    {
-                        if let Some(shared) =
-                            self.get_shared(&binding.shared_group, &binding.shared_key)?
-                        {
+        for g in &structure.groups {
+            for item in &g.items {
+                if let Some(rk) = &item.shared_ref {
+                    match self.get_shared(rk)? {
+                        Some(shared) => {
                             resolved
-                                .entry(binding.group.clone())
+                                .entry(g.name.clone())
                                 .or_default()
-                                .insert(key.to_string(), shared.value.clone());
+                                .insert(item.key.clone(), shared.value.clone());
                         }
-                    }
-                }
-                // 组级引用（B3）：整组绑定共享组 SG —— 结构组内 item 按 key 取共享项
-                None => {
-                    let struct_group = structure.groups.iter().find(|g| g.name == binding.group);
-                    if let Some(sg) = struct_group {
-                        for item in &sg.items {
-                            let entry = resolved.get(&binding.group);
-                            if entry.is_none_or(|m| !m.contains_key(&item.key)) {
-                                if let Some(shared) =
-                                    self.get_shared(&binding.shared_group, &item.key)?
-                                {
-                                    resolved
-                                        .entry(binding.group.clone())
-                                        .or_default()
-                                        .insert(item.key.clone(), shared.value.clone());
-                                }
-                            }
-                        }
+                        None => errs.push(format!(
+                            "{}/{}: shared item {} 缺失（悬空引用）",
+                            g.name, item.key, rk
+                        )),
                     }
                 }
             }
@@ -1977,12 +1947,9 @@ impl StateMachine {
     // ---------------- 共享库（R6） ----------------
 
     fn apply_shared_draft_update(&mut self, item: &SharedItem, _operator: &str) -> ApplyOutcome {
-        if item.group.is_empty() || item.key.is_empty() {
-            return Err(Error::validation("shared item group/key required"));
-        }
-        if !validator::valid_key_name(&item.group) || !validator::valid_key_name(&item.key) {
+        if item.key.is_empty() || !validator::valid_key_name(&item.key) {
             return Err(Error::validation(
-                "shared group/key 须为 1-128 位 [A-Za-z0-9._-]",
+                "shared key 须为 1-128 位 [A-Za-z0-9._-]",
             ));
         }
         // F9（状态机兜底，防绕过 API 层校验）：secret 标志与类型一致性——
@@ -2001,7 +1968,7 @@ impl StateMachine {
         if size > MAX_VALUE_BYTES {
             return Err(Error::limit_exceeded("shared item too large"));
         }
-        self.save_pending(&shared_draft_key(&item.group, &item.key), item)?;
+        self.save_pending(&shared_draft_key(&item.key), item)?;
         Ok(vec![])
     }
 
@@ -2014,9 +1981,7 @@ impl StateMachine {
                 out.push(item);
             }
         }
-        out.sort_by(|a, b| {
-            (a.group.as_str(), a.key.as_str()).cmp(&(b.group.as_str(), b.key.as_str()))
-        });
+        out.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(out)
     }
 
@@ -2029,33 +1994,12 @@ impl StateMachine {
                 out.push(item);
             }
         }
-        out.sort_by(|a, b| {
-            (a.group.as_str(), a.key.as_str()).cmp(&(b.group.as_str(), b.key.as_str()))
-        });
+        out.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(out)
     }
 
-    /// 管理面访问器：项目引用绑定列表（GET /api/v1/shared/refs?project=）。
-    pub fn list_refs(&self, project: &ProjectId) -> Result<Vec<RefBinding>, Error> {
-        self.read_refs_of_project(project)
-    }
-
-    pub fn get_shared(&self, group: &str, key: &str) -> Result<Option<SharedItem>, Error> {
-        self.load_merged(&shared_key(group, key))
-    }
-
-    /// 引用索引：idx/ref/{shared_group}/{shared_key}/{project}/{group}/{item_key} → "1"
-    fn ref_index_key(
-        shared_group: &str,
-        shared_key: &str,
-        project: &ProjectId,
-        group: &str,
-        item_key: &str,
-    ) -> String {
-        format!(
-            "{K_IDX_REF}{shared_group}/{shared_key}/{}/{group}/{item_key}",
-            project.as_str()
-        )
+    pub fn get_shared(&self, key: &str) -> Result<Option<SharedItem>, Error> {
+        self.load_merged(&shared_key(key))
     }
 
     fn apply_shared_publish(
@@ -2073,38 +2017,27 @@ impl StateMachine {
         }
         let mut events = Vec::new();
         for item in &drafts {
-            let prev = self.get_shared(&item.group, &item.key)?;
+            let prev = self.get_shared(&item.key)?;
             let version = prev.as_ref().map(|p| p.version).unwrap_or(0) + 1;
             let published = SharedItem {
-                group: item.group.clone(),
                 key: item.key.clone(),
                 ty: item.ty,
                 secret: item.secret,
                 required: item.required,
                 value: item.value.clone(),
                 version,
+                description: item.description.clone(),
             };
-            self.save_pending(&shared_key(&item.group, &item.key), &published)?;
-            self.store
-                .delete(shared_draft_key(&item.group, &item.key).as_bytes())?;
+            self.save_pending(&shared_key(&item.key), &published)?;
+            self.store.delete(shared_draft_key(&item.key).as_bytes())?;
 
-            // 级联（G1/D36）：Auto = 引用该共享项的 (项目, 分支) 版本推进（现状，原子 D15）；
+            // 级联（G1/D36）：Auto = 引用该共享项的 (项目, 分支) 版本推进（原子 D15）；
             // Manual = 只更共享版本，引用分支下次发布时经 materialize_resolved 物化新值。
             if cascade == SharedCascadeMode::Manual {
                 continue;
             }
-            let prefix = format!("{K_IDX_REF}{}/{}", item.group, item.key);
-            let rows = self.get_prefix_merged(prefix.as_bytes())?;
-            for (k, _) in rows {
-                let ks = String::from_utf8_lossy(&k);
-                let rest = &ks[prefix.len() + 1..]; // {project}/{group}/{item_key}
-                let parts: Vec<&str> = rest.split('/').collect();
-                if parts.len() != 3 {
-                    continue;
-                }
-                let project = ProjectId(parts[0].to_string());
-                let group = parts[1].to_string();
-                let key = parts[2].to_string();
+            // 引用已内嵌项目结构：扫描全项目已发布结构，收集 shared_ref == 本 key 的 (project, group, item_key)
+            for (project, group, key) in self.shared_usage(&item.key)? {
                 self.cascade_to_project(
                     &project,
                     &group,
@@ -2115,40 +2048,6 @@ impl StateMachine {
                     now_ms,
                     &mut events,
                 )?;
-            }
-            // 组级引用级联（B3）：idx/refg/{shared_group}/{project}/{group} —— 结构组内含该 key 则推进
-            let gprefix = format!("{K_IDX_REFG}{}", item.group);
-            let grows = self.get_prefix_merged(gprefix.as_bytes())?;
-            for (gk, _) in grows {
-                let gks = String::from_utf8_lossy(&gk);
-                let grest = &gks[gprefix.len() + 1..]; // {project}/{group}
-                let gparts: Vec<&str> = grest.split('/').collect();
-                if gparts.len() != 2 {
-                    continue;
-                }
-                let project = ProjectId(gparts[0].to_string());
-                let group = gparts[1].to_string();
-                // 仅当项目结构组包含该共享 key 时级联（整组共享按结构组 item 集合匹配）
-                let structure = self.get_structure(&project)?.unwrap_or(Structure {
-                    version: 0,
-                    groups: vec![],
-                });
-                let has_key = structure
-                    .groups
-                    .iter()
-                    .any(|g| g.name == group && g.items.iter().any(|i| i.key == item.key));
-                if has_key {
-                    self.cascade_to_project(
-                        &project,
-                        &group,
-                        &item.key,
-                        &item.value,
-                        comment,
-                        request_id,
-                        now_ms,
-                        &mut events,
-                    )?;
-                }
             }
         }
         Ok(events)
@@ -2214,139 +2113,69 @@ impl StateMachine {
         Ok(())
     }
 
-    fn apply_ref_bind(
-        &mut self,
-        project: &ProjectId,
-        binding: &RefBinding,
-        _operator: &str,
-    ) -> ApplyOutcome {
-        if !validator::valid_key_name(&binding.shared_group)
-            || !validator::valid_key_name(&binding.shared_key)
-        {
-            return Err(Error::validation(
-                "shared group/key 须为 1-128 位 [A-Za-z0-9._-]",
-            ));
+    /// 删除共享项（草稿 + 已发布，幂等）：已发布项被项目结构引用 → 拒绝。
+    fn apply_shared_delete(&mut self, key: &str, _operator: &str) -> ApplyOutcome {
+        if !validator::valid_key_name(key) {
+            return Err(Error::validation("shared key 须为 1-128 位 [A-Za-z0-9._-]"));
         }
-        let structure = self
-            .get_structure(project)?
-            .ok_or_else(|| Error::not_found(format!("project {project}")))?;
-        let group_def = structure
-            .groups
-            .iter()
-            .find(|g| g.name == binding.group)
-            .ok_or_else(|| {
-                Error::validation(format!("group {} not in project structure", binding.group))
-            })?;
-        match binding.item_key.as_deref() {
-            Some(item_key) => {
-                // 校验：结构内存在该 item
-                let found = group_def.items.iter().any(|i| i.key == item_key);
-                if !found {
-                    return Err(Error::validation(format!(
-                        "item {}/{} not in project structure",
-                        binding.group, item_key
-                    )));
-                }
-                // 校验：共享项已发布存在
-                if self
-                    .get_shared(&binding.shared_group, &binding.shared_key)?
-                    .is_none()
-                {
-                    return Err(Error::validation(format!(
-                        "shared item {}/{} not published",
-                        binding.shared_group, binding.shared_key
-                    )));
-                }
-                self.save_pending(&ref_key(project, &binding.group, Some(item_key)), binding)?;
-                self.save_pending(
-                    &Self::ref_index_key(
-                        &binding.shared_group,
-                        &binding.shared_key,
-                        project,
-                        &binding.group,
-                        item_key,
-                    ),
-                    &"1",
-                )?;
+        if self.get_shared(key)?.is_some() {
+            let refs = self.shared_usage(key)?;
+            if !refs.is_empty() {
+                let detail = refs
+                    .iter()
+                    .map(|(p, g, k)| format!("{}/{}/{}", p.as_str(), g, k))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(Error::conflict(format!(
+                    "shared item {key} 被 {} 处项目配置引用：{detail}；请先移除引用",
+                    refs.len()
+                )));
             }
-            None => {
-                // 组级引用（B3）：整组绑定共享组 SG —— 结构组内 item 按 key 匹配已发布共享项（≥1 个）
-                let struct_keys: std::collections::HashSet<&str> =
-                    group_def.items.iter().map(|i| i.key.as_str()).collect();
-                let rows = self
-                    .store
-                    .get_prefix(shared_prefix(&binding.shared_group).as_bytes())?;
-                let mut matched = 0usize;
-                for (_, v) in rows {
-                    if let Ok(item) = serde_json::from_slice::<SharedItem>(&v) {
-                        if item.group == binding.shared_group
-                            && struct_keys.contains(item.key.as_str())
-                        {
-                            matched += 1;
+            self.delete_pending(shared_key(key).as_bytes())?;
+        }
+        // 草稿一并删除（幂等：无草稿也成功）
+        self.delete_pending(shared_draft_key(key).as_bytes())?;
+        Ok(vec![])
+    }
+
+    /// 反向引用：扫描全项目已发布结构，收集 shared_ref == key 的 (project, group, item_key)。
+    pub fn shared_usage(&self, key: &str) -> Result<Vec<(ProjectId, String, String)>, Error> {
+        let mut out = Vec::new();
+        for p in self.list_projects()? {
+            if let Some(st) = self.get_structure(&p.id)? {
+                for g in &st.groups {
+                    for item in &g.items {
+                        if item.shared_ref.as_deref() == Some(key) {
+                            out.push((p.id.clone(), g.name.clone(), item.key.clone()));
                         }
                     }
                 }
-                if matched == 0 {
-                    return Err(Error::validation(format!(
-                        "shared group {} has no published item matching structure group {}",
-                        binding.shared_group, binding.group
-                    )));
-                }
-                self.save_pending(&ref_key(project, &binding.group, None), binding)?;
-                self.save_pending(
-                    &group_ref_index_key(&binding.shared_group, project, &binding.group),
-                    &"1",
-                )?;
-            }
-        }
-        Ok(vec![])
-    }
-
-    fn apply_ref_unbind(
-        &mut self,
-        project: &ProjectId,
-        group: &str,
-        item_key: Option<&str>,
-        _operator: &str,
-    ) -> ApplyOutcome {
-        match item_key {
-            Some(key) => {
-                let binding: Option<RefBinding> =
-                    self.load_merged(&ref_key(project, group, Some(key)))?;
-                if let Some(b) = binding {
-                    self.delete_pending(ref_key(project, group, Some(key)).as_bytes())?;
-                    self.delete_pending(
-                        Self::ref_index_key(&b.shared_group, &b.shared_key, project, group, key)
-                            .as_bytes(),
-                    )?;
-                }
-            }
-            None => {
-                // 组级解绑
-                let binding: Option<RefBinding> =
-                    self.load_merged(&ref_key(project, group, None))?;
-                if let Some(b) = binding {
-                    self.delete_pending(ref_key(project, group, None).as_bytes())?;
-                    self.delete_pending(
-                        group_ref_index_key(&b.shared_group, project, group).as_bytes(),
-                    )?;
-                }
-            }
-        }
-        Ok(vec![])
-    }
-
-    /// 读取项目全部 item 级引用。
-    fn read_refs_of_project(&self, project: &ProjectId) -> Result<Vec<RefBinding>, Error> {
-        let prefix = format!("{K_PROJECT}{}{K_REF}", project.as_str());
-        let rows = self.get_prefix_merged(prefix.as_bytes())?;
-        let mut out = Vec::new();
-        for (_, v) in rows {
-            if let Ok(b) = serde_json::from_slice::<RefBinding>(&v) {
-                out.push(b);
             }
         }
         Ok(out)
+    }
+
+    /// 结构引用校验：shared_ref 必须指向已发布共享项且类型一致（保存草稿/发布结构均调用）。
+    fn check_shared_refs(&self, structure: &Structure) -> Result<(), Error> {
+        for g in &structure.groups {
+            for item in &g.items {
+                if let Some(rk) = &item.shared_ref {
+                    let shared = self.get_shared(rk)?.ok_or_else(|| {
+                        Error::validation(format!(
+                            "shared item {rk} 未发布（{}/{} 引用）",
+                            g.name, item.key
+                        ))
+                    })?;
+                    if shared.ty != item.ty {
+                        return Err(Error::validation(format!(
+                            "{}/{}: type {:?} 与共享项 {rk} 的 {:?} 不一致",
+                            g.name, item.key, item.ty, shared.ty
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     // ---------------- 会话（I7 单管理员；状态机内强制） ----------------
@@ -2742,40 +2571,36 @@ mod tests {
         StateMachine::new(Box::new(InMemoryStore::new()))
     }
 
-    fn shared_item(group: &str, key: &str) -> SharedItem {
+    fn shared_item(key: &str) -> SharedItem {
         SharedItem {
-            group: group.into(),
             key: key.into(),
             ty: ValueType::String,
             secret: false,
             required: false,
             value: Value::String("v".into()),
             version: 0,
+            description: None,
         }
     }
 
     #[test]
     fn shared_draft_rejects_dangerous_names() {
         let mut s = sm();
-        // `/` 会破坏 sh/{group}/{key} 与 idx/ref 索引分隔 → 级联静默跳过（C3）
+        // `/` 会破坏 sh/{key} 键分隔
         assert!(s
-            .apply_shared_draft_update(&shared_item("a/b", "k"), "")
-            .is_err());
-        assert!(s
-            .apply_shared_draft_update(&shared_item("g", "k/x"), "")
+            .apply_shared_draft_update(&shared_item("k/x"), "")
             .is_err());
         // HTML/XSS 载荷（S1）、非 ASCII、空白、引号
-        for (g, k) in [
-            ("<img onerror=alert(1)>", "k"),
-            ("g", "<img>"),
-            ("配置", "k"),
-            ("g", "a b"),
-            ("g", "a'b"),
-            ("g", "a&b"),
+        for k in [
+            "<img>",
+            "配置",
+            "a b",
+            "a'b",
+            "a&b",
         ] {
             assert!(
-                s.apply_shared_draft_update(&shared_item(g, k), "").is_err(),
-                "{g:?}/{k:?} must be rejected"
+                s.apply_shared_draft_update(&shared_item(k), "").is_err(),
+                "{k:?} must be rejected"
             );
         }
     }
@@ -2783,61 +2608,29 @@ mod tests {
     #[test]
     fn shared_draft_accepts_safe_names() {
         let mut s = sm();
-        for (g, k) in [
-            ("infra.db", "host_name-1"),
-            ("redis", "max_conns"),
-            ("g", "k"),
-        ] {
+        for k in ["host_name-1", "max_conns", "k", "db.host"] {
             assert!(
-                s.apply_shared_draft_update(&shared_item(g, k), "").is_ok(),
-                "{g:?}/{k:?} must be accepted"
+                s.apply_shared_draft_update(&shared_item(k), "").is_ok(),
+                "{k:?} must be accepted"
             );
         }
     }
 
     #[test]
-    fn ref_bind_rejects_dangerous_shared_names() {
+    fn shared_delete_rejects_dangerous_key() {
         let mut s = sm();
-        // 校验发生在项目结构查询之前，无需先建项目
-        for (sg, sk) in [
-            ("infra/..", "k"),
-            ("infra", "<img>"),
-            ("配置", "k"),
-            ("infra", "a b"),
-        ] {
-            let b = RefBinding {
-                group: "redis".into(),
-                item_key: Some("host".into()),
-                shared_group: sg.into(),
-                shared_key: sk.into(),
-            };
+        for k in ["a/b", "<img>", "配置", "a b"] {
             let e = s
-                .apply_ref_bind(&ProjectId("p".into()), &b, "")
+                .apply_shared_delete(k, "")
                 .expect_err("must reject");
-            assert_eq!(e.kind, ErrorKind::Validation, "{sg:?}/{sk:?}: {e:?}");
+            assert_eq!(e.kind, ErrorKind::Validation, "{k:?}: {e:?}");
         }
     }
 
+    /// N1 回归（引用内嵌结构后）：删除项目即删除其结构中的 shared_ref，
+    /// shared_usage 反向扫描不再命中已删项目（替代旧孤儿引用索引清理）。
     #[test]
-    fn ref_bind_accepts_safe_shared_names() {
-        let mut s = sm();
-        let b = RefBinding {
-            group: "redis".into(),
-            item_key: Some("host".into()),
-            shared_group: "infra.db".into(),
-            shared_key: "host-1".into(),
-        };
-        // 通过字符集校验后走到项目结构查找（项目不存在 → NotFound，而非 Validation）
-        let e = s
-            .apply_ref_bind(&ProjectId("p".into()), &b, "")
-            .expect_err("project missing");
-        assert_eq!(e.kind, ErrorKind::NotFound, "{e:?}");
-    }
-
-    /// N1 回归：删除项目须清理全局引用索引（idx/ref、idx/refg）中的孤儿条目，
-    /// 否则共享项发布级联扫描会永久命中已删项目（脏数据残留）。
-    #[test]
-    fn project_delete_cleans_orphan_ref_indexes() {
+    fn project_delete_removes_structure_shared_refs() {
         let mut s = sm();
         let proj = "order-service";
         s.apply(
@@ -2849,52 +2642,71 @@ mod tests {
             1,
         )
         .unwrap();
-
-        // 直接构造 RefBind 已写入的全局引用索引键（item 级 5 段 + 组级 3 段），
-        // 模拟删除项目后遗留的孤儿条目。
-        let item_idx = format!("{K_IDX_REF}infra/host/{proj}/redis/host");
-        let group_idx = format!("{K_IDX_REFG}infra/{proj}/redis");
-        s.store.put(item_idx.as_bytes(), b"1").unwrap();
-        s.store.put(group_idx.as_bytes(), b"1").unwrap();
-        // 对照组：其他项目的索引必须保留。
-        let other_item = format!("{K_IDX_REF}infra/host/other-svc/redis/host");
-        let other_group = format!("{K_IDX_REFG}infra/other-svc/redis");
-        s.store.put(other_item.as_bytes(), b"1").unwrap();
-        s.store.put(other_group.as_bytes(), b"1").unwrap();
+        // 发布共享项，结构引用它（经 Command 提交，保证 pending 落库）
+        s.apply(
+            &Command::SharedDraftUpdate {
+                item: shared_item("db_host"),
+                operator: String::new(),
+            },
+            2,
+        )
+        .unwrap();
+        s.apply(
+            &Command::SharedPublish {
+                comment: "s".into(),
+                request_id: "sp1".into(),
+                operator: String::new(),
+                ts: 0,
+                cascade: SharedCascadeMode::Auto,
+                policy: PublishPolicy::Block,
+            },
+            2,
+        )
+        .unwrap();
+        s.apply(
+            &Command::StructureDraftSet {
+                project: proj.into(),
+                base_version: 1,
+                groups: vec![GroupDef {
+                    name: "redis".into(),
+                    items: vec![ItemDef {
+                        key: "host".into(),
+                        ty: ValueType::String,
+                        required: false,
+                        secret: false,
+                        validate: None,
+                        description: None,
+                        shared_ref: Some("db_host".into()),
+                    }],
+                }],
+                operator: String::new(),
+            },
+            3,
+        )
+        .unwrap();
+        s.apply(
+            &Command::PublishStructure {
+                project: proj.into(),
+                comment: "s".into(),
+                request_id: "s1".into(),
+                operator: String::new(),
+                ts: 0,
+                policy: PublishPolicy::Block,
+            },
+            4,
+        )
+        .unwrap();
+        assert_eq!(s.shared_usage("db_host").unwrap().len(), 1);
 
         s.apply(
             &Command::ProjectDelete {
                 id: ProjectId(proj.into()),
                 operator: String::new(),
             },
-            2,
+            5,
         )
         .unwrap();
-
-        // 断言：idx/ref/ 与 idx/refg/ 前缀下不存在含该项目 id 的键（与清理逻辑同构的精确匹配）。
-        for (k, _) in s.store.get_prefix(K_IDX_REF.as_bytes()).unwrap() {
-            let ks = String::from_utf8_lossy(&k);
-            if let Some(rest) = ks.strip_prefix(K_IDX_REF) {
-                let parts: Vec<&str> = rest.split('/').collect();
-                assert!(
-                    !(parts.len() == 5 && parts[2] == proj),
-                    "orphan idx/ref key survives: {ks}"
-                );
-            }
-        }
-        for (k, _) in s.store.get_prefix(K_IDX_REFG.as_bytes()).unwrap() {
-            let ks = String::from_utf8_lossy(&k);
-            if let Some(rest) = ks.strip_prefix(K_IDX_REFG) {
-                let parts: Vec<&str> = rest.split('/').collect();
-                assert!(
-                    !(parts.len() == 3 && parts[1] == proj),
-                    "orphan idx/refg key survives: {ks}"
-                );
-            }
-        }
-        // 对照组索引不受影响。
-        assert!(s.store.get(other_item.as_bytes()).unwrap().is_some());
-        assert!(s.store.get(other_group.as_bytes()).unwrap().is_some());
+        assert!(s.shared_usage("db_host").unwrap().is_empty());
     }
 
     /// perf 方案① T5：命令内读合并——pending 覆盖/删除对 load/get_prefix 可见（写后读）。
@@ -2959,6 +2771,8 @@ mod tests {
                         required: true,
                         secret: false,
                         validate: None,
+                        description: None,
+                        shared_ref: None,
                     }],
                 }],
                 operator: String::new(),

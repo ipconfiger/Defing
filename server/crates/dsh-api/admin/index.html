@@ -286,7 +286,7 @@
                 </div>
                 <button type="button" class="btn ghost block addgroup-btn" data-act="addStructGroup"><svg class="ic"><use href="#i-plus"/></svg>添加组</button>
               </div>
-              <textarea id="struct-draft" class="in mono hidden" rows="16" spellcheck="false" placeholder='{"base_version":1,"groups":[{"name":"server","items":[{"key":"max_conn","type":"int","required":true,"secret":false}]}]}'></textarea>
+              <textarea id="struct-draft" class="in mono hidden" rows="16" spellcheck="false" placeholder='{"base_version":1,"groups":[{"name":"server","items":[{"key":"max_conn","type":"int","required":true,"secret":false,"description":"","shared_ref":null}]}]}'></textarea>
               <div id="struct-err" class="field-err hidden"></div>
             </div>
           </div>
@@ -324,7 +324,7 @@
         <header class="view-head with-actions">
           <div>
             <h1>共享库</h1>
-            <p class="view-sub">跨项目复用的公共配置项，发布后自动级联引用它的项目分支</p>
+            <p class="view-sub">跨项目复用的公共配置项（无分组）；引用关系由各项目结构页的「共享引用」决定，发布后自动级联</p>
           </div>
           <div class="card-actions">
             <button type="button" class="btn ghost" data-act="refreshShared"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button>
@@ -337,12 +337,12 @@
               <div class="card-head"><h3>新增 / 更新共享项</h3></div>
               <div class="grid-2" style="gap:0 16px">
                 <div class="field">
-                  <label for="sh-group">组</label>
-                  <input class="in mono" id="sh-group" placeholder="如 common">
+                  <label for="sh-key">key（全局唯一）</label>
+                  <input class="in mono" id="sh-key" placeholder="如 log_level">
                 </div>
                 <div class="field">
-                  <label for="sh-key">key</label>
-                  <input class="in mono" id="sh-key" placeholder="如 log_level">
+                  <label for="sh-desc">描述（助记，不渲染）</label>
+                  <input class="in mono" id="sh-desc" placeholder="如 全局日志级别（≤200 字节）">
                 </div>
               </div>
               <div class="grid-2" style="gap:0 16px">
@@ -372,34 +372,8 @@
               <button type="button" class="btn" data-act="saveShared">保存共享草稿</button>
             </div>
             <div class="card">
-              <div class="card-head"><h3>引用绑定</h3></div>
-              <p class="hint" style="margin:-4px 0 12px">把项目结构组（或单个 item）绑定到共享项；发布共享时自动物化到引用分支。</p>
-              <div class="grid-2" style="gap:0 16px">
-                <div class="field">
-                  <label for="ref-project">项目</label>
-                  <input class="in mono" id="ref-project" placeholder="project-id">
-                </div>
-                <div class="field">
-                  <label for="ref-group">结构组</label>
-                  <input class="in mono" id="ref-group" placeholder="group">
-                </div>
-              </div>
-              <div class="grid-2" style="gap:0 16px">
-                <div class="field">
-                  <label for="ref-item">item key（可选）</label>
-                  <input class="in mono" id="ref-item" placeholder="留空 = 整组引用">
-                </div>
-                <div class="field">
-                  <label for="ref-sg">共享组</label>
-                  <input class="in mono" id="ref-sg" placeholder="shared group">
-                </div>
-              </div>
-              <div class="field">
-                <label for="ref-sk">共享 key</label>
-                <input class="in mono" id="ref-sk" placeholder="shared key">
-              </div>
-              <div id="ref-err" class="field-err hidden"></div>
-              <button type="button" class="btn" data-act="bindRef">绑定引用</button>
+              <div class="card-head"><h3>使用说明</h3></div>
+              <p class="hint" style="margin:0">共享库只管共享项的增删改查：发布后，各项目在「配置管理 → 结构」页为自己的配置项选择「共享引用」即可引用本库项（引用项只读，值由共享库物化；被引用的共享项不可删除）。</p>
             </div>
           </div>
           <div class="card">
@@ -409,7 +383,7 @@
             </div>
             <div class="table-wrap">
               <table class="table">
-                <thead><tr><th>组</th><th>key</th><th>类型</th><th>状态</th><th>值</th><th>标记</th></tr></thead>
+                <thead><tr><th>key</th><th>类型</th><th>状态</th><th>值</th><th>描述</th><th>被引用</th><th>标记</th><th></th></tr></thead>
                 <tbody id="shared-body"></tbody>
               </table>
             </div>

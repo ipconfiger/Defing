@@ -44,6 +44,10 @@ pub fn validate_publish(
     let mut errs = Vec::new();
     for g in &structure.groups {
         for item in &g.items {
+            // 引用项只读：值由共享库物化，不参与草稿必填/类型校验
+            if item.shared_ref.is_some() {
+                continue;
+            }
             let has = draft
                 .get(&g.name)
                 .and_then(|m| m.get(&item.key))
@@ -60,12 +64,10 @@ pub fn validate_publish(
     errs
 }
 
-/// 键名/分组名字符集校验（结构定义、共享项 group/key、引用绑定共享地址共用）。
+/// 键名/分组名/共享项 key 字符集校验（结构定义、共享项 key、shared_ref 共用）。
 ///
 /// 规则：非空、`len() <= 128`、全部字符 ∈ `[A-Za-z0-9._-]`。
-/// - 禁止 `/`：`keys.rs` 以 `/` 拼接 `sh/{group}/{key}` 与
-///   `idx/ref/{shared_group}/{shared_key}/{project}/{group}/{item_key}`，`/` 会使索引错位、
-///   发布级联在 `parts.len() != 3` 处静默跳过（无任何报错）；
+/// - 禁止 `/`：`keys.rs` 以 `/` 拼接 `sh/{key}`，`/` 会使键错位；
 /// - 禁止 HTML 特殊字符 `<>&"'`、空白与非 ASCII：Admin UI 渲染安全（XSS 从源头封死）；
 /// - 允许点号：常见于 `db.host` 类配置键。
 pub fn valid_key_name(name: &str) -> bool {
@@ -117,6 +119,14 @@ pub fn validate_structure(structure: &Structure) -> Vec<String> {
                     g.name, item.key
                 ));
             }
+            if let Some(rk) = &item.shared_ref {
+                if !valid_key_name(rk) {
+                    errs.push(format!(
+                        "{}/{}: invalid shared_ref {:?}: only [A-Za-z0-9._-] allowed",
+                        g.name, item.key, rk
+                    ));
+                }
+            }
         }
         total_items += g.items.len();
     }
@@ -138,6 +148,8 @@ mod tests {
             required,
             secret: false,
             validate: None,
+            description: None,
+            shared_ref: None,
         }
     }
 
@@ -156,6 +168,8 @@ mod tests {
             required: false,
             secret: false,
             validate: None,
+            description: None,
+            shared_ref: None,
         };
         assert!(validate_value(&def, &Value::Json("{bad".into())).len() == 1);
         assert!(validate_value(&def, &Value::Json("{\"a\":1}".into())).is_empty());
@@ -223,6 +237,8 @@ mod tests {
                     required: false,
                     secret: true,
                     validate: None,
+                    description: None,
+                    shared_ref: None,
                 }],
             }],
         };

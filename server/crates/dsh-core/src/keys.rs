@@ -8,7 +8,7 @@ pub const K_STRUCT_DRAFT: &str = "/struct-draft";
 pub const K_BRANCH: &str = "/b/";
 pub const K_STATE: &str = "/state";
 pub const K_VERSION: &str = "/v/";
-pub const K_REF: &str = "/refs/";
+/// 共享引用已内嵌结构 ItemDef.shared_ref；不再使用独立 refs 键。
 pub const K_SHARED: &str = "sh/";
 pub const K_SHARED_DRAFT: &str = "sh-draft/";
 pub const K_SESSION: &str = "sess/admin";
@@ -18,9 +18,6 @@ pub const K_AUDIT: &str = "audit/";
 /// 审计 seq 计数键（位于 audit/ 前缀内；get_prefix 扫描时按 20 位数字后缀区分条目）。
 pub const K_AUDIT_SEQ: &str = "audit/seq";
 pub const K_IDX_PNAME: &str = "idx/pname/";
-pub const K_IDX_REF: &str = "idx/ref/";
-/// 组级引用反查索引：idx/refg/{shared_group}/{project}/{group} → "1"
-pub const K_IDX_REFG: &str = "idx/refg/";
 /// 项目管理员账号前缀：adm/pa/{username} → ProjectAdminAccount。
 pub const K_PA_ACCOUNT: &str = "adm/pa/";
 /// 项目管理员会话前缀：sess/pa/{username} → AdminSession（每账号单会话）。
@@ -81,23 +78,13 @@ pub fn gray_snap_key(id: &ProjectId, branch: &BranchName, seq: u64) -> String {
 pub fn branch_prefix(id: &ProjectId, branch: &BranchName) -> String {
     format!("{K_PROJECT}{}{K_BRANCH}{}", id.as_str(), branch.as_str())
 }
-pub fn ref_key(id: &ProjectId, group: &str, item_key: Option<&str>) -> String {
-    match item_key {
-        Some(k) => format!("{K_PROJECT}{}{K_REF}{group}/{k}", id.as_str()),
-        None => format!("{K_PROJECT}{}{K_REF}{group}", id.as_str()),
-    }
+/// 共享项键：sh/{key}（扁平库，无分组）。key 已由 validator::valid_key_name 约束
+/// （1-128 位 [A-Za-z0-9._-]，无 `/` 与 HTML 特殊字符）。
+pub fn shared_key(key: &str) -> String {
+    format!("{K_SHARED}{key}")
 }
-/// 共享项键：sh/{group}/{key}。group/key 已由 validator::valid_key_name 约束
-/// （1-128 位 [A-Za-z0-9._-]，无 `/` 与 HTML 特殊字符），保证索引不会错位。
-pub fn shared_key(group: &str, key: &str) -> String {
-    format!("{K_SHARED}{group}/{key}")
-}
-/// 共享组前缀（组级引用按共享组扫描已发布项）。
-pub fn shared_prefix(group: &str) -> String {
-    format!("{K_SHARED}{group}/")
-}
-pub fn shared_draft_key(group: &str, key: &str) -> String {
-    format!("{K_SHARED_DRAFT}{group}/{key}")
+pub fn shared_draft_key(key: &str) -> String {
+    format!("{K_SHARED_DRAFT}{key}")
 }
 pub fn session_key() -> &'static str {
     K_SESSION
@@ -130,13 +117,6 @@ pub fn audit_key(seq: u64) -> String {
 pub fn idx_pname(name: &str) -> String {
     format!("{K_IDX_PNAME}{name}")
 }
-pub fn idx_ref(shared_group: &str, shared_key: &str) -> String {
-    format!("{K_IDX_REF}{shared_group}/{shared_key}")
-}
-/// 组级引用反查索引（整组绑定共享组 SG）。
-pub fn group_ref_index_key(shared_group: &str, project: &ProjectId, group: &str) -> String {
-    format!("{K_IDX_REFG}{shared_group}/{}/{group}", project.as_str())
-}
 
 #[cfg(test)]
 mod tests {
@@ -163,7 +143,8 @@ mod tests {
             gray_snap_key(&id, &b, 12),
             "p/order-service/b/prod/gray-snap/12"
         );
-        assert_eq!(shared_key("redis", "host"), "sh/redis/host");
+        assert_eq!(shared_key("timeout"), "sh/timeout");
+        assert_eq!(shared_draft_key("timeout"), "sh-draft/timeout");
         assert_eq!(idx_pname("order-service"), "idx/pname/order-service");
         assert_eq!(audit_key(7), "audit/00000000000000000007");
     }

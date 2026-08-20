@@ -965,3 +965,17 @@ pre { margin: 0; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+/* 结构编辑器：配置项行第二行（描述 + 共享引用） */
+.struct-item { padding: 6px 0; border-top: 1px solid var(--border); }
+.struct-item:first-child { border-top: 0; }
+.struct-item .srow { border-top: 0; padding: 0; }
+.srow-sub { display: flex; gap: 8px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
+.srow-sub .in { flex: 1; min-width: 140px; }
+.srow-sub .sel { width: auto; min-width: 170px; }
+.srow-sub .hint { margin: 0; }
+.struct-item[data-ref="1"] .srow { opacity: 0.8; }
+/* 草稿页：引用项只读行 */
+.ref-grow { opacity: 0.9; }
+.ref-grow .gtype { padding-top: 2px; }
+
