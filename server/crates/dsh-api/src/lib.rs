@@ -662,15 +662,36 @@ async fn auth_middleware(
     } else if path.starts_with("/v1/") {
         // 项目访问令牌鉴权：/v1/projects/{p}/... 需该项目有效 token（Bearer 或 ?token=，
         // 后者兼容 SSE EventSource）；dev-single 开发 token 全局有效。无有效 token → 401。
-        // 例外：渲染端点 + reveal=true → 走 handler 内会话鉴权（B2：PA 仅能 reveal 自己项目），
-        // 不经数据面 token（reveal 属管理面能力，见 render_config）。
-        let reveal_render = path.ends_with("/config")
+        // 例外①：渲染端点 + reveal=true → 走 handler 内会话鉴权（B2：PA 仅能 reveal 自己项目）。
+        // 例外②：渲染端点（掩码）→ 管理会话可查看（Admin 全项目 / PA 仅自己项目）——
+        //         Admin UI 配置预览用会话访问（数据面 token 化后回归修复），
+        //         掩码输出与会话可访问的 /api/v1/.../config 掩码 JSON 同级。
+        let is_render = path.ends_with("/config");
+        let reveal_render = is_render
             && req
                 .uri()
                 .query()
                 .map(|q| q.split('&').any(|kv| kv == "reveal=true"))
                 .unwrap_or(false);
-        if !reveal_render && !data_plane_authorized(&app, &req) {
+        let session_allowed = if is_render && !reveal_render {
+            match resolve_principal(
+                &app,
+                req.headers()
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok()),
+            ) {
+                Ok(dsh_core::Principal::Admin) => true,
+                Ok(dsh_core::Principal::ProjectAdmin { project, .. }) => {
+                    data_plane_project_segment(&path)
+                        .map(|p| p == project.0)
+                        .unwrap_or(false)
+                }
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+        if !reveal_render && !session_allowed && !data_plane_authorized(&app, &req) {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 Json(ApiErrorBody {

@@ -240,6 +240,45 @@ async fn revoke_missing_token_404() {
     assert_eq!(code, 404);
 }
 
+/// 数据面 token 化回归：Admin UI 配置预览用管理会话访问 /v1/.../config（掩码渲染）。
+/// 会话豁免：Admin 全项目 200；PA 仅自己项目 200；PA 跨项目 → 401（无项目 token）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_render_session_exemption() {
+    let ts = start().await;
+    let admin = admin_login(&ts.base).await;
+    let pa = pa_login(&ts.base).await;
+    // Admin 会话访问任意项目掩码渲染 → 鉴权通过（非 401；测试项目无 dev 分支 → 404 属内容缺失）
+    let (code, _) = req(
+        &ts.base,
+        "GET",
+        "/v1/projects/p1/branches/dev/config?format=env",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_ne!(code, 401, "admin session can render masked config, got {code}");
+    // PA 会话访问自己项目 → 鉴权通过
+    let (code, _) = req(
+        &ts.base,
+        "GET",
+        "/v1/projects/p1/branches/dev/config?format=yaml",
+        Some(&pa),
+        None,
+    )
+    .await;
+    assert_ne!(code, 401, "PA session can render own project config, got {code}");
+    // PA 会话访问其他项目 → 401（会话豁免拒绝 + 无项目 token）
+    let (code, _) = req(
+        &ts.base,
+        "GET",
+        "/v1/projects/p2/branches/dev/config?format=yaml",
+        Some(&pa),
+        None,
+    )
+    .await;
+    assert_eq!(code, 401, "PA cross-project render denied");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn project_admin_forbidden() {
     let ts = start().await;
