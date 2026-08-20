@@ -1,6 +1,7 @@
 # 开发计划：项目级访问令牌（project-token）
 
 日期: 2026-08-20
+状态: ✅ 已完成（S1-S7 全部落地；cargo test --workspace 196 绿 + api-surface-test 含 token 生命周期 + SDK 契约 TS/Python 通过）
 上游: docs/design/project-token.md（已审核通过）
 执行路线: 单工作区逐 slice 实现，每 slice 后跑对应测试；全部完成后整体验证
 

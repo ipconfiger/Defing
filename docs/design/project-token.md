@@ -1,6 +1,6 @@
 # 设计文档：项目级访问令牌（Project Access Token）
 
-状态: v1（设计评审已通过，待实现）
+状态: v1（已实现并验证：196 工作区测试全绿 + api-surface-test + SDK 契约；实现计划见 docs/aegis/plans/2026-08-20-project-token.md）
 日期: 2026-08-20
 范围: dsh-core / dsh-api / dsh-cli / Admin UI / SDK 文档 / 契约测试
 
