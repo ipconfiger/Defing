@@ -639,8 +639,11 @@ function renderDraftEditor(b) {
         }
         return sharedRefRowHtml(ref);
       }
+      // 值基线：草稿值优先；无草稿时回退活动版本值（发布后草稿清空，显示已发布的值而非空框）
       const dv = (b.draft && b.draft[g.name] && b.draft[g.name][it.key]) ? b.draft[g.name][it.key].value : null;
-      return draftStructRowHtml(g, it, dv);
+      const av = (b.active && b.active[g.name] && b.active[g.name][it.key]) ? b.active[g.name][it.key].value : null;
+      const hasActive = !!(b.active && b.active[g.name] && b.active[g.name][it.key]);
+      return draftStructRowHtml(g, it, dv, av, hasActive);
     }).join('');
     return `<div class="card gcard">
       <div class="gcard-head"><code class="gname">${esc(g.name)}</code><span class="muted small">${g.items.length} 项</span>${refBadge}
@@ -652,30 +655,38 @@ function renderDraftEditor(b) {
   }).join('');
 }
 
-// 结构驱动行：it = 结构定义（key/type/required/secret/description），v = 草稿值或 null
-function draftStructRowHtml(g, it, v) {
+// 结构驱动行：it = 结构定义（key/type/required/secret/description），
+// v = 草稿值优先（dv），无草稿时回退活动版本值（av）；hasActive = 活动版本存在该值。
+// masked（secret 掩码）不填入输入框 —— secret 恒显示「已加密」占位，留空不修改。
+function draftStructRowHtml(g, it, v, av, hasActive) {
   const type = it.type || (v && v.type) || 'string';
+  const val = (v && !v.masked) ? v : (av && !av.masked ? av : null);
   const common = `data-g="${esc(g.name)}" data-k="${esc(it.key)}"`;
   let ctl;
   if (type === 'bool') {
-    ctl = `<label class="check"><input type="checkbox" class="draft-in" ${common} data-ty="bool" ${v && v.bool_value === true ? 'checked' : ''}></label>`;
+    ctl = `<label class="check"><input type="checkbox" class="draft-in" ${common} data-ty="bool" ${val && val.bool_value === true ? 'checked' : ''}></label>`;
   } else if (type === 'int' || type === 'float') {
-    ctl = `<input type="number" step="${type === 'float' ? 'any' : '1'}" class="in mono draft-in" ${common} data-ty="${esc(type)}" value="${esc(v ? (type === 'int' ? v.int_value ?? '' : v.float_value ?? '') : '')}">`;
+    ctl = `<input type="number" step="${type === 'float' ? 'any' : '1'}" class="in mono draft-in" ${common} data-ty="${esc(type)}" value="${esc(val ? (type === 'int' ? val.int_value ?? '' : val.float_value ?? '') : '')}">`;
   } else if (type === 'json') {
-    ctl = `<textarea class="in mono draft-in" rows="3" ${common} data-ty="json" spellcheck="false">${esc(v ? v.json_value ?? '' : '')}</textarea>`;
+    ctl = `<textarea class="in mono draft-in" rows="3" ${common} data-ty="json" spellcheck="false">${esc(val ? val.json_value ?? '' : '')}</textarea>`;
   } else if (type === 'array') {
-    ctl = `<input class="in mono draft-in" ${common} data-ty="array" value="${esc(v ? (v.list_value || []).join(', ') : '')}">`;
+    ctl = `<input class="in mono draft-in" ${common} data-ty="array" value="${esc(val ? (val.list_value || []).join(', ') : '')}">`;
   } else if (type === 'secret') {
-    ctl = `<input type="password" class="in draft-in" ${common} data-ty="secret" placeholder="已加密 · 留空不修改，输入以更新" autocomplete="new-password">`;
+    const ph = (S.draftValKeys[g.name + '/' + it.key] || hasActive)
+      ? '已加密 · 留空不修改，输入以更新' : '输入明文，由服务端加密存储';
+    ctl = `<input type="password" class="in draft-in" ${common} data-ty="secret" placeholder="${ph}" autocomplete="new-password">`;
   } else {
-    ctl = `<input class="in draft-in" ${common} data-ty="string" value="${esc(v ? v.str_value ?? '' : '')}">`;
+    ctl = `<input class="in draft-in" ${common} data-ty="string" value="${esc(val ? val.str_value ?? '' : '')}">`;
   }
   const icon = type === 'secret' ? '<svg class="ic ic-xs"><use href="#i-lock"/></svg>' : '';
   const badges = [];
   if (it.required) badges.push('<span class="badge warn" title="发布前必须有值">required</span>');
   if (it.secret || type === 'secret') badges.push('<span class="badge err" title="敏感值">secret</span>');
   const desc = it.description ? `<div class="hint small" style="margin:2px 0 0">${esc(it.description)}</div>` : '';
-  const hasVal = S.draftValKeys[g.name + '/' + it.key] ? '<span class="hint" style="margin:0">已设值</span>' : '';
+  // 状态标记：草稿有值 > 活动版本有值（发布后草稿清空 → 显示活动版本值）
+  const hasVal = S.draftValKeys[g.name + '/' + it.key]
+    ? '<span class="hint" style="margin:0">草稿已设值</span>'
+    : (hasActive ? '<span class="hint" style="margin:0">活动版本</span>' : '');
   return `<div class="grow">
     <div class="gkey"><span class="mono">${esc(it.key)}</span> ${badges.join(' ')}${desc}</div>
     <div class="gtype"><span class="ty">${icon}${esc(type)}</span></div>
@@ -686,15 +697,16 @@ function draftStructRowHtml(g, it, v) {
 
 // 引用项只读行（草稿页）：徽标 + 共享值（secret 已掩码）。
 // 徽标放 gkey 下方（可换行）——避免 92px 的 gtype 列放不下 nowrap 徽标而溢出盖住值列；
-// gtype 列显示类型，值列独立展示（修复 key/value 重叠）。
+// gtype 列显示类型，值列独立展示。徽标只表示「引用共享」，不展示共享项 key/版本（放 title 提示）。
 function sharedRefRowHtml(r) {
   const v = r.value || {};
   const icon = v.masked ? '<svg class="ic ic-xs"><use href="#i-lock"/></svg>' : '';
   const txt = fmtVal(v);
   const ty = (v && v.type) || '';
+  const tip = '引用共享项 ' + (r.shared_key || '') + (r.version !== undefined && r.version !== '—' ? ' · v' + r.version : '');
   return `<div class="grow ref-grow">
     <div class="gkey"><span class="mono">${esc(r.key)}</span>
-      <div class="ref-badge"><span class="badge acc">引用共享项 ${esc(r.shared_key)} · v${esc(r.version)}</span></div>
+      <div class="ref-badge"><span class="badge acc" title="${esc(tip)}">引用共享</span></div>
     </div>
     <div class="gtype"><span class="ty">${icon}${esc(ty)}</span></div>
     <div class="gctl"><span class="mono muted">${esc(txt)}</span></div>

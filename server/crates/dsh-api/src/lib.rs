@@ -1317,6 +1317,30 @@ async fn branch_detail(
             }
         }
     }
+    // 活动版本的值（草稿基线：发布后草稿清空，UI 显示已发布值；secret 恒掩码，草稿页只显示「已加密」占位）
+    let active: serde_json::Value = match sm
+        .get_config_resolved(&id, &bname, 0, &dsh_core::ClientCtx::default())
+        .map_err(ApiError::from)
+    {
+        Ok(snap) => {
+            let mut gmap = serde_json::Map::new();
+            for (g, items) in &snap.groups {
+                let mut m = serde_json::Map::new();
+                for (k, v) in items {
+                    let vj = match v {
+                        dsh_core::model::Value::Secret(_) => serde_json::json!({
+                            "type": "string", "str_value": "***", "masked": true,
+                        }),
+                        other => serde_json::json!(other),
+                    };
+                    m.insert(k.clone(), serde_json::json!({ "value": vj, "updated_at": 0 }));
+                }
+                gmap.insert(g.clone(), serde_json::Value::Object(m));
+            }
+            serde_json::Value::Object(gmap)
+        }
+        Err(_) => serde_json::json!({}),
+    };
     Ok(Json(serde_json::json!({
         "name": branch,
         "active_version": st.active_version,
@@ -1324,6 +1348,7 @@ async fn branch_detail(
         "draft_rev": st.draft_rev,
         "draft": drafts,
         "shared_refs": shared_refs,
+        "active": active,
     })))
 }
 

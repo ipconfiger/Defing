@@ -41,8 +41,8 @@ echo "== 2. 项目详情 =="
 D=$(J $BASE/api/v1/projects/order-service)
 echo "$D" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['id']=='order-service' and d['name']=='order-service'" && echo "  project_detail OK"
 
-echo "== 3. 分支详情(dev 含草稿信息) =="
-J $BASE/api/v1/projects/order-service/branches/dev | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['active_version']==2 and d['structure_version']>=1" && echo "  branch_detail OK"
+echo "== 3. 分支详情(dev 含草稿信息 + 活动版本基线) =="
+J $BASE/api/v1/projects/order-service/branches/dev | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['active_version']==2 and d['structure_version']>=1; a=d.get('active',{}).get('redis',{}); assert a.get('host',{}).get('value',{}).get('str_value')=='10.0.0.1', a; assert a.get('password',{}).get('value',{}).get('masked')==True, a" && echo "  branch_detail OK (含 active 基线)"
 
 echo "== 4. 分支对比 dev vs test (host 不同 → diff; password 仅 dev → missing) =="
 J "$BASE/api/v1/projects/order-service/diff?branch_a=dev&branch_b=test" > /tmp/diff.json
