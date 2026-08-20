@@ -705,9 +705,7 @@ function sharedRefRowHtml(r) {
   const ty = (v && v.type) || '';
   const tip = '引用共享项 ' + (r.shared_key || '') + (r.version !== undefined && r.version !== '—' ? ' · v' + r.version : '');
   return `<div class="grow ref-grow">
-    <div class="gkey"><span class="mono">${esc(r.key)}</span>
-      <div class="ref-badge"><span class="badge acc" title="${esc(tip)}">引用共享</span></div>
-    </div>
+    <div class="gkey"><span class="mono">${esc(r.key)}</span><span class="badge acc ref-badge" title="${esc(tip)}">引用共享</span></div>
     <div class="gtype"><span class="ty">${icon}${esc(ty)}</span></div>
     <div class="gctl"><span class="mono muted">${esc(txt)}</span></div>
     <div class="gdel"><span class="hint" style="margin:0">只读</span></div>

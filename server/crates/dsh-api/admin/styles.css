@@ -978,13 +978,7 @@ pre { margin: 0; }
 /* 草稿页：引用项只读行 */
 .ref-grow { opacity: 0.9; }
 .ref-grow .gtype { padding-top: 2px; }
-/* 引用徽标放 gkey 下方：允许换行（badge 默认 nowrap，窄列会溢出盖住值列） */
-.ref-grow .gkey .ref-badge { min-width: 0; margin-top: 3px; }
-.ref-grow .gkey .ref-badge .badge {
-  white-space: normal;
-  overflow-wrap: anywhere;
-  height: auto;
-  min-height: 21px;
-  line-height: 1.35;
-}
+/* 引用徽标与 key 同一水平线（flex 排列，空间不足才折行） */
+.ref-grow .gkey { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.ref-grow .gkey .badge.ref-badge { margin: 0; flex-shrink: 0; }
 
