@@ -134,9 +134,6 @@ struct Cli {
     /// 会话 TTL 秒数（0 = 不自动过期；默认 24h）
     #[arg(long, default_value_t = 86400)]
     session_ttl: u64,
-    /// 数据面 gRPC 访问令牌（metadata authorization: Bearer <token>；缺省开放，仅建议集群启用）
-    #[arg(long)]
-    data_plane_token: Option<String>,
     /// 集群 join 引导令牌（/api/v1/cluster/join 需 Bearer 匹配；缺省不校验）
     #[arg(long)]
     join_token: Option<String>,
@@ -793,6 +790,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
         let sm = StateMachine::new(store);
         let admin_password = resolve_admin_password(&cli, "首次启动");
+        // project-token：dev-single 自动生成全局开发数据面 token 并打印（可访问所有项目；
+        // 集群模式无此机制——数据面鉴权一律走每项目访问令牌）
+        let dev_token = new_token();
+        eprintln!("开发数据面 token = {dev_token}（--dev-single 全局有效，可访问所有项目；集群模式无此机制）");
         // hub 将被移入 ApiState，先取 sender 供自动回滚广播（G5/D33）
         let hub_sender = hub.sender().clone();
         let mut app = ApiState::with_retention(
@@ -810,7 +811,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cli.audit_retention,
             cli.join_token.clone().map(Arc::from),
             trusted_proxies.clone(),
-            cli.data_plane_token.clone().map(Arc::from),
+            Some(Arc::from(dev_token.as_str())),
         );
         // G1/D35-37：发布策略/级联/读取模式注入
         app.publish.publish_policy = cli.publish_policy.into();
@@ -1057,7 +1058,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cli.audit_retention,
         Some(Arc::from(join_token.as_str())),
         trusted_proxies,
-        cli.data_plane_token.clone().map(Arc::from),
+        None, // 集群模式无 dev token：数据面鉴权一律走每项目访问令牌
     );
     // G1/D35-37：发布策略/级联/读取模式注入
     app.publish.publish_policy = cli.publish_policy.into();
@@ -1080,9 +1081,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 /// 数据面 gRPC 服务（模块 05）：ConfigService 挂载于 --grpc-addr（默认 :8383）。
 fn spawn_grpc(cli: &Cli, state: ApiState) {
-    let svc = dsh_api::grpc::config_service_server::ConfigServiceServer::with_interceptor(
+    let svc = dsh_api::grpc::config_service_server::ConfigServiceServer::new(
         dsh_api::grpc::ConfigGrpcService { state },
-        dsh_api::grpc::data_plane_interceptor(cli.data_plane_token.clone()),
     );
     let addr: std::net::SocketAddr = match cli.grpc_addr.parse() {
         Ok(a) => a,
