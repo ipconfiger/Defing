@@ -1,5 +1,6 @@
 //! gRPC 数据面（模块 05 / proto config.v1）：GetConfig / GetItem / Watch / ListMembers。
-//! 只读 + watch；鉴权：metadata `authorization: Bearer <api_token>`（静态表，MVP；未配置 token 时开放）。
+//! 只读 + watch；鉴权：metadata `authorization: Bearer <token>`（项目访问令牌，per-handler 校验；
+//! dev-single 开发 token 全局有效；list_members 无 project 字段 → 任一有效项目 token 即放行）。
 
 use std::pin::Pin;
 
@@ -21,24 +22,49 @@ pub struct ConfigGrpcService {
     pub state: ApiState,
 }
 
-/// 数据面鉴权拦截器（metadata `authorization: Bearer <token>`；未配置 token 时放行）。
-pub fn data_plane_interceptor(
-    data_token: Option<String>,
-) -> impl FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, Status> + Clone + Send + 'static {
-    move |req: tonic::Request<()>| {
-        if let Some(token) = &data_token {
-            let ok = req
-                .metadata()
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|a| a.strip_prefix("Bearer "))
-                .map(|t| t == token.as_str())
-                .unwrap_or(false);
-            if !ok {
-                return Err(Status::unauthenticated("invalid data-plane token"));
-            }
+/// 提取 metadata authorization Bearer。
+fn metadata_bearer(meta: &tonic::metadata::MetadataMap) -> Option<String> {
+    meta.get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|a| a.strip_prefix("Bearer "))
+        .map(|t| t.to_string())
+}
+
+/// 数据面鉴权（get_config/get_item/watch）：token 须属于该项目（dev token 全局有效）。
+fn authorize_project(
+    state: &ApiState,
+    meta: &tonic::metadata::MetadataMap,
+    project: &str,
+) -> Result<(), Status> {
+    let Some(raw) = metadata_bearer(meta) else {
+        return Err(Status::unauthenticated("data-plane token required"));
+    };
+    if let Some(dev) = &state.dev_token {
+        if raw == dev.as_ref() {
+            return Ok(());
         }
-        Ok(req)
+    }
+    let sm = state.sm.read().map_err(|_| Status::internal("sm lock"))?;
+    match sm.get_data_token(&dsh_core::token_hash(&raw)) {
+        Ok(Some(rec)) if !rec.revoked && rec.project.0 == project => Ok(()),
+        _ => Err(Status::unauthenticated("invalid data-plane token")),
+    }
+}
+
+/// 数据面鉴权（list_members：无 project 字段；任一有效项目 token 或 dev token 即放行）。
+fn authorize_data_plane(state: &ApiState, meta: &tonic::metadata::MetadataMap) -> Result<(), Status> {
+    let Some(raw) = metadata_bearer(meta) else {
+        return Err(Status::unauthenticated("data-plane token required"));
+    };
+    if let Some(dev) = &state.dev_token {
+        if raw == dev.as_ref() {
+            return Ok(());
+        }
+    }
+    let sm = state.sm.read().map_err(|_| Status::internal("sm lock"))?;
+    match sm.get_data_token(&dsh_core::token_hash(&raw)) {
+        Ok(Some(rec)) if !rec.revoked => Ok(()),
+        _ => Err(Status::unauthenticated("invalid data-plane token")),
     }
 }
 
@@ -141,7 +167,10 @@ impl config_service_server::ConfigService for ConfigGrpcService {
             .map_err(|e| Status::unavailable(format!("linearized read: {}", e.0.message)))?;
         // G3/D26：对端 IP（tonic RemoteAddr 注入；须在 into_inner 前取）
         let peer_ip = req.remote_addr().map(|a| a.ip());
+        // 项目访问令牌鉴权（metadata Bearer；须在 into_inner 前取 metadata）
+        let meta = req.metadata().clone();
         let r = req.into_inner();
+        authorize_project(&self.state, &meta, &r.project)?;
         let ctx = dsh_core::ClientCtx {
             instance_id: r.instance_id.clone(),
             labels: r
@@ -177,7 +206,10 @@ impl config_service_server::ConfigService for ConfigGrpcService {
             .map_err(|e| Status::unavailable(format!("linearized read: {}", e.0.message)))?;
         // G3/D26（Q6）：get_item 必须同样 resolve——单 item 读取按身份分流
         let peer_ip = req.remote_addr().map(|a| a.ip());
+        // 项目访问令牌鉴权（metadata Bearer；须在 into_inner 前取 metadata）
+        let meta = req.metadata().clone();
         let r = req.into_inner();
+        authorize_project(&self.state, &meta, &r.project)?;
         let ctx = dsh_core::ClientCtx {
             instance_id: r.instance_id.clone(),
             labels: r
@@ -218,7 +250,10 @@ impl config_service_server::ConfigService for ConfigGrpcService {
         &self,
         req: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
+        // 项目访问令牌鉴权：流建立时校验一次（metadata Bearer；须在 into_inner 前取 metadata）
+        let meta = req.metadata().clone();
         let r = req.into_inner();
+        authorize_project(&self.state, &meta, &r.project)?;
         let project = r.project.clone();
         let branch = r.branch.clone();
         let after: i64 = r.after_version;
@@ -346,8 +381,10 @@ impl config_service_server::ConfigService for ConfigGrpcService {
 
     async fn list_members(
         &self,
-        _req: Request<ListMembersRequest>,
+        req: Request<ListMembersRequest>,
     ) -> Result<Response<ListMembersResponse>, Status> {
+        // 数据面鉴权：任一有效项目 token 或 dev token（无 project 字段）
+        authorize_data_plane(&self.state, req.metadata())?;
         let raft = self
             .state
             .raft

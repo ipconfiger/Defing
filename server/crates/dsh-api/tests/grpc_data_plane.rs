@@ -1,4 +1,4 @@
-//! gRPC 数据面集成测试（A1）：GetConfig / GetItem / Watch / ListMembers + 鉴权拦截器。
+//! gRPC 数据面集成测试（A1）：GetConfig / GetItem / Watch / ListMembers + 项目令牌鉴权。
 //! 使用真实 TCP 监听 + 生成的客户端。
 
 use std::sync::{Arc, RwLock};
@@ -15,6 +15,9 @@ use dsh_core::StateMachine;
 use dsh_crypto::Cipher;
 use dsh_testkit::seed_demo_project;
 use dsh_watch::WatchHub;
+
+/// 项目 p 的测试令牌明文（apply 时只存 SHA-256）。
+const RAW_TOKEN: &str = "raw-token-abc123";
 
 fn seed_sm(sm: &RwLock<StateMachine>) {
     // testkit 播种：项目 + 结构(host/port/pass secret) + dev 草稿(host/port) + 发布(v2)
@@ -60,9 +63,21 @@ fn seed_sm(sm: &RwLock<StateMachine>) {
         7,
     )
     .unwrap();
+    // 项目访问令牌（project-token）：只存 SHA-256
+    g.apply(
+        &Command::ProjectTokenCreate {
+            project: "p".into(),
+            name: "test".into(),
+            token_hash: dsh_core::token_hash(RAW_TOKEN),
+            operator: "admin".into(),
+            ts: 0,
+        },
+        8,
+    )
+    .unwrap();
 }
 
-async fn start_server(token: Option<String>) -> (String, ApiState) {
+async fn start_server() -> (String, ApiState) {
     let sm = Arc::new(RwLock::new(StateMachine::new(Box::new(
         InMemoryStore::new(),
     ))));
@@ -78,12 +93,9 @@ async fn start_server(token: Option<String>) -> (String, ApiState) {
         "pw".into(),
         None,
     );
-    let svc = ConfigServiceServer::with_interceptor(
-        ConfigGrpcService {
-            state: state.clone(),
-        },
-        dsh_api::grpc::data_plane_interceptor(token),
-    );
+    let svc = ConfigServiceServer::new(ConfigGrpcService {
+        state: state.clone(),
+    });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -100,18 +112,47 @@ async fn client_at(url: &str) -> ConfigServiceClient<tonic::transport::Channel> 
     ConfigServiceClient::connect(url.to_string()).await.unwrap()
 }
 
+/// 带 metadata authorization Bearer 的客户端（interceptor 包装类型）。
+type AuthedClient = ConfigServiceClient<
+    tonic::service::interceptor::InterceptedService<
+        tonic::transport::Channel,
+        Box<dyn FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Send + Sync>,
+    >,
+>;
+
+async fn authed_client(url: &str, raw: &str) -> AuthedClient {
+    let channel = tonic::transport::Channel::from_shared(url.to_string())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let raw = raw.to_string();
+    ConfigServiceClient::with_interceptor(
+        channel,
+        Box::new(move |mut req: tonic::Request<()>| {
+            req.metadata_mut()
+                .insert("authorization", format!("Bearer {raw}").parse().unwrap());
+            Ok(req)
+        }),
+    )
+}
+
+fn get_req(project: &str) -> GetConfigRequest {
+    GetConfigRequest {
+        project: project.into(),
+        branch: "dev".into(),
+        version: 0,
+        ..Default::default()
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_config_and_get_item() {
-    let (url, _state) = start_server(None).await;
-    let mut client = client_at(&url).await;
+    let (url, _state) = start_server().await;
+    let mut client = authed_client(&url, RAW_TOKEN).await;
 
     let snap = client
-        .get_config(GetConfigRequest {
-            project: "p".into(),
-            branch: "dev".into(),
-            version: 0,
-            ..Default::default()
-        })
+        .get_config(get_req("p"))
         .await
         .unwrap()
         .into_inner();
@@ -166,9 +207,50 @@ async fn get_config_and_get_item() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn project_token_auth_matrix() {
+    let (url, state) = start_server().await;
+
+    // 无 token → Unauthenticated
+    let mut plain = client_at(&url).await;
+    let err = plain.get_config(get_req("p")).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // 错误 token → Unauthenticated
+    let mut wrong = authed_client(&url, "wrong-token").await;
+    let err = wrong.get_config(get_req("p")).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // 正确 token → 成功
+    let mut ok = authed_client(&url, RAW_TOKEN).await;
+    let snap = ok.get_config(get_req("p")).await.unwrap().into_inner();
+    assert_eq!(snap.version, 3);
+
+    // 吊销后 → Unauthenticated（即时生效）
+    let id = {
+        let sm = state.sm.read().unwrap();
+        sm.get_data_token(&dsh_core::token_hash(RAW_TOKEN)).unwrap().unwrap().id
+    };
+    state
+        .sm
+        .write()
+        .unwrap()
+        .apply(
+            &Command::ProjectTokenRevoke {
+                project: "p".into(),
+                token_id: id,
+            },
+            50,
+        )
+        .unwrap();
+    let err = ok.get_config(get_req("p")).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    let _ = &mut plain;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watch_delivers_publish_events() {
-    let (url, state) = start_server(None).await;
-    let mut client = client_at(&url).await;
+    let (url, state) = start_server().await;
+    let mut client = authed_client(&url, RAW_TOKEN).await;
 
     // 订阅（after_version=2 = 当前活动版本）→ 只收后续事件
     let mut stream = client
@@ -220,56 +302,15 @@ async fn watch_delivers_publish_events() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auth_interceptor_enforces_token() {
-    let (url, _state) = start_server(Some("tok-123".into())).await;
-
+async fn list_members_requires_valid_token() {
+    let (url, _state) = start_server().await;
     // 无 token → Unauthenticated
     let mut plain = client_at(&url).await;
-    let err = plain
-        .get_config(GetConfigRequest {
-            project: "p".into(),
-            branch: "dev".into(),
-            version: 0,
-            ..Default::default()
-        })
-        .await
-        .unwrap_err();
+    let err = plain.list_members(ListMembersRequest {}).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
-
-    // 带正确 token → 成功
-    let channel = tonic::transport::Channel::from_shared(url)
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
-    let mut authed =
-        ConfigServiceClient::with_interceptor(channel, |mut req: tonic::Request<()>| {
-            req.metadata_mut()
-                .insert("authorization", "Bearer tok-123".parse().unwrap());
-            Ok(req)
-        });
-    let snap = authed
-        .get_config(GetConfigRequest {
-            project: "p".into(),
-            branch: "dev".into(),
-            version: 0,
-            ..Default::default()
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(snap.version, 3); // testkit v2 + secret v3
-    let _ = &mut plain;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn list_members_dev_single_fails_precondition() {
-    let (url, _state) = start_server(None).await;
-    let mut client = client_at(&url).await;
-    let err = client
-        .list_members(ListMembersRequest {})
-        .await
-        .unwrap_err();
+    // 任一有效项目 token → 通过鉴权；dev-single 无 raft → FailedPrecondition
+    let mut authed = authed_client(&url, RAW_TOKEN).await;
+    let err = authed.list_members(ListMembersRequest {}).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }
 
@@ -278,8 +319,8 @@ async fn list_members_dev_single_fails_precondition() {
 /// G3：gRPC get_config / get_item 按身份 resolve——命中读灰度快照、未命中/无身份读稳定（D26/D27/Q6）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gray_data_plane_resolves_by_identity() {
-    let (url, state) = start_server(None).await;
-    let mut client = client_at(&url).await;
+    let (url, state) = start_server().await;
+    let mut client = authed_client(&url, RAW_TOKEN).await;
 
     // 直接写状态机：新草稿（host=gray-host）→ GrayPublish（规则 zone=cn-north-1）
     {
@@ -414,8 +455,8 @@ async fn gray_data_plane_resolves_by_identity() {
 /// 的 GrayPublish 事件仍投递（Q4：promote/abort 补发不丢）；last 游标不因 gray 事件倒挂。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gray_watch_delivers_gray_events() {
-    let (url, state) = start_server(None).await;
-    let mut client = client_at(&url).await;
+    let (url, state) = start_server().await;
+    let mut client = authed_client(&url, RAW_TOKEN).await;
 
     // 订阅：after_version=3（当前 active）→ last=3
     let mut stream = client
