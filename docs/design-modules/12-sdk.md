@@ -13,7 +13,7 @@
 
 | 语言 | 运行时 | 关键点 |
 |------|--------|--------|
-| TS | 浏览器（SSE/WebSocket）+ Node（grpc-js） | 双运行时适配层；类型化 WatchEvent；token 注入 |
+| TS | 浏览器（SSE/WebSocket）+ Node（grpc-js） | 双运行时适配层；类型化 WatchEvent；token 注入（项目访问令牌，Bearer） |
 | Go | grpc-go | goroutine 扇出；context 贯穿；sync.RWMutex 缓存；Watch 阻塞直至 ctx 取消 |
 | Python | grpc.aio | async listener；asyncio 任务；线程安全缓存（单线程 + 锁） |
 

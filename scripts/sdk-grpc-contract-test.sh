@@ -27,6 +27,9 @@ curl -sf -H "$AUTH" -X POST $BASE/api/v1/projects/$PROJECT/structure-draft/publi
 curl -sf -H "$AUTH" -X PUT $BASE/api/v1/projects/$PROJECT/branches/dev/draft -H 'Content-Type: application/json' -d '{"updates":[{"group":"redis","key":"host","value":{"type":"string","str_value":"10.0.0.9"}}]}' >/dev/null
 curl -sf -H "$AUTH" -X POST $BASE/api/v1/projects/$PROJECT/branches/dev/publish -H 'Content-Type: application/json' -d '{"comment":"v2","request_id":"r1"}' >/dev/null
 
+# project-token：数据面一律需要项目访问令牌（仅全局管理员可建）
+DSH_TOKEN=$(curl -sf -H "$AUTH" -X POST $BASE/api/v1/projects/$PROJECT/tokens -H 'Content-Type: application/json' -d '{"name":"contract-test"}' | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])") || { echo "FAIL token create"; exit 1; }
+
 publish_change() { # $1=新值
   curl -sf -H "$AUTH" -X PUT $BASE/api/v1/projects/$PROJECT/branches/dev/draft -H 'Content-Type: application/json' -d "{\"updates\":[{\"group\":\"redis\",\"key\":\"host\",\"value\":{\"type\":\"string\",\"str_value\":\"$1\"}}]}" >/dev/null
   curl -sf -H "$AUTH" -X POST $BASE/api/v1/projects/$PROJECT/branches/dev/publish -H 'Content-Type: application/json' -d "{\"comment\":\"next\",\"request_id\":\"n-$(date +%s%N)\"}" >/dev/null
@@ -34,7 +37,7 @@ publish_change() { # $1=新值
 
 echo "== D-TEST：after_version 断线续传（HTTP watch 重放）+ 事件字段断言 =="
 # 当前活动版本 v2（结构 v1 + 发布 r1 = v2）；after_version=1 → 应重放 v2 事件
-RV=$(curl -sN --max-time 3 "$BASE/v1/projects/$PROJECT/branches/dev/watch?after_version=1" | grep '^data:' | head -1)
+RV=$(curl -sN --max-time 3 -H "Authorization: Bearer $DSH_TOKEN" "$BASE/v1/projects/$PROJECT/branches/dev/watch?after_version=1" | grep '^data:' | head -1)
 echo "  重放事件: $RV"
 echo "$RV" | grep -q '"version":2' && echo "  after_version 重放 v2 OK ✅" || { echo "  FAIL: 期望重放 v2"; exit 1; }
 echo "$RV" | grep -q '"ty":"value_publish"' && echo "$RV" | grep -q '"request_id"' && echo "$RV" | grep -q '"structure_version"' \
@@ -43,7 +46,7 @@ echo "$RV" | grep -q '"ty":"value_publish"' && echo "$RV" | grep -q '"request_id
 run_lang() { # $1=名称 $2=命令
   echo "== $1 SDK gRPC =="
   publish_change "10.0.0.9"
-  DSH_GRPC=127.0.0.1:$GRPC_PORT DSH_HTTP=$BASE DSH_PROJECT=$PROJECT sh -c "$2" > /tmp/sdk-grpc-$1.out 2>&1 &
+  DSH_GRPC=127.0.0.1:$GRPC_PORT DSH_HTTP=$BASE DSH_PROJECT=$PROJECT DSH_TOKEN=$DSH_TOKEN sh -c "$2" > /tmp/sdk-grpc-$1.out 2>&1 &
   local TP=$!
   # 持续发布直到测试进程退出（消除编译/启动窗口竞态）
   for i in $(seq 1 60); do
@@ -67,7 +70,7 @@ pip install --quiet --disable-pip-version-check -r $REPO/sdk/python/requirements
 (cd $REPO/sdk/go && go mod tidy >/dev/null 2>&1) && echo "  go deps ok"
 
 run_lang "ts"   "cd $REPO/sdk/ts && node --experimental-strip-types grpc-test.ts"
-run_lang "go"   "export GOCACHE=/tmp/dsh-gocache && cd $REPO/sdk/go && go run ./grpc-test"
+run_lang "go"   "export GOCACHE=/tmp/dsh-gocache GOMODCACHE=/tmp/dsh-gomodcache && cd $REPO/sdk/go && go run ./grpc-test"
 run_lang "py"   "cd $REPO/sdk/python && ${PYTHON:-python3} grpc-test.py"
 
 echo

@@ -25,6 +25,10 @@ curl -sf -H "$AUTH" -X POST $BASE/api/v1/projects/$PROJECT/structure-draft/publi
 curl -sf -H "$AUTH" -X PUT $BASE/api/v1/projects/$PROJECT/branches/dev/draft -H 'Content-Type: application/json' -d '{"updates":[{"group":"redis","key":"host","value":{"type":"string","str_value":"10.0.0.9"}}]}' >/dev/null || { echo "FAIL draft"; exit 1; }
 curl -sf -H "$AUTH" -X POST $BASE/api/v1/projects/$PROJECT/branches/dev/publish -H 'Content-Type: application/json' -d '{"comment":"v2","request_id":"r1"}' >/dev/null || { echo "FAIL publish"; exit 1; }
 
+# project-token：数据面一律需要项目访问令牌（仅全局管理员可建）
+DSH_TOKEN=$(curl -sf -H "$AUTH" -X POST $BASE/api/v1/projects/$PROJECT/tokens -H 'Content-Type: application/json' -d '{"name":"contract-test"}' | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])") || { echo "FAIL token create"; exit 1; }
+export DSH_TOKEN
+
 publish_change() { # $1=新值
   curl -sf -H "$AUTH" -X PUT $BASE/api/v1/projects/$PROJECT/branches/dev/draft -H 'Content-Type: application/json' -d "{\"updates\":[{\"group\":\"redis\",\"key\":\"host\",\"value\":{\"type\":\"string\",\"str_value\":\"$1\"}}]}" >/dev/null
   curl -sf -H "$AUTH" -X POST $BASE/api/v1/projects/$PROJECT/branches/dev/publish -H 'Content-Type: application/json' -d "{\"comment\":\"next\",\"request_id\":\"n-$(date +%s%N)\"}" >/dev/null
@@ -33,7 +37,7 @@ publish_change() { # $1=新值
 run_lang() { # $1=名称 $2=命令
   echo "== $1 SDK =="
   publish_change "10.0.0.9"   # 重置为各语言测试期望值
-  DSH_ENDPOINTS=$BASE DSH_PROJECT=$PROJECT sh -c "$2" > /tmp/sdk-$1.out 2>&1 &
+  DSH_ENDPOINTS=$BASE DSH_PROJECT=$PROJECT DSH_TOKEN=$DSH_TOKEN sh -c "$2" > /tmp/sdk-$1.out 2>&1 &
   local TP=$!
   # 持续发布直到测试进程退出（消除首编/启动耗时导致的订阅窗口错过；watch 收到订阅后首个事件）
   for i in $(seq 1 60); do
@@ -52,7 +56,7 @@ run_lang() { # $1=名称 $2=命令
 }
 
 run_lang "ts"   "cd $REPO/sdk/ts && node --experimental-strip-types test.ts"
-run_lang "go"   "export GOCACHE=/tmp/dsh-gocache && cd $REPO/sdk/go && go run ./test"
+run_lang "go"   "export GOCACHE=/tmp/dsh-gocache GOMODCACHE=/tmp/dsh-gomodcache && cd $REPO/sdk/go && go run ./test"
 run_lang "py"   "cd $REPO/sdk/python && python3 test.py"
 
 echo

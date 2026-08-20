@@ -468,6 +468,49 @@
         }
       }
     },
+    "ProjectTokenRecord": {
+      "type": "object",
+      "description": "项目访问令牌（机器凭据）：数据面鉴权；key = tok/{hash}，明文不落盘",
+      "required": [
+        "id",
+        "name",
+        "project",
+        "hash",
+        "created_at",
+        "created_by",
+        "revoked"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "token id（= hash 前 16 位 hex）"
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "展示名，项目内唯一（[A-Za-z0-9._-]{1,64}）"
+        },
+        "project": {
+          "type": "string"
+        },
+        "hash": {
+          "type": "string",
+          "description": "SHA-256(明文 token) hex——落盘/备份/审计永无明文"
+        },
+        "created_at": {
+          "type": "integer",
+          "description": "墙钟 ms（API 层注入）"
+        },
+        "created_by": {
+          "type": "string"
+        },
+        "revoked": {
+          "type": "boolean",
+          "description": "软删除标记（数据面鉴权过滤）"
+        }
+      }
+    },
     "AuditEntry": {
       "type": "object",
       "required": [

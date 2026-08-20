@@ -29,7 +29,7 @@ assert str(d.get("$schema", "")).startswith("https://json-schema.org"), "missing
 defs = d.get("$defs") or {}
 need = ["ItemDef","GroupDef","Structure","StructureDraft","Value","Ciphertext",
         "DraftValue","BranchState","DiffEntry","VersionRecord","SharedItem",
-        "SharedVersion","RefBinding","AdminSession","AuditEntry"]
+        "SharedVersion","AdminSession","ProjectTokenRecord","AuditEntry"]
 missing = [n for n in need if n not in defs]
 assert not missing, f"missing $defs: {missing}"
 print(f"storage schema OK: {len(defs)} $defs")

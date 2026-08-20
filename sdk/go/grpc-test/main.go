@@ -17,7 +17,8 @@ func main() {
 	grpcAddr := env("DSH_GRPC", "127.0.0.1:8383")
 	project := env("DSH_PROJECT", "sdk-project")
 
-	c, err := configclient.NewGrpc(grpcAddr, "")
+	token := env("DSH_TOKEN", "")
+	c, err := configclient.NewGrpc(grpcAddr, token)
 	if err != nil {
 		fmt.Println("[go-grpc] FAIL new:", err)
 		os.Exit(1)

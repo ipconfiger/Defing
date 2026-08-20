@@ -783,6 +783,53 @@ paths:
       responses:
         '204': { description: 删除成功 }
         '404': { $ref: '#/components/responses/NotFound' }
+  # 项目访问令牌（project-token）：数据面 SDK 机器凭据（admin-only；仅全局管理员可管理）
+  /api/v1/projects/{p}/tokens:
+    get:
+      summary: 项目访问令牌列表（不含明文与 hash；含 revoked 标记）
+      security: [AdminSession: []]
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+      responses:
+        '200':
+          description: 令牌列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ProjectToken' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      summary: 创建项目访问令牌（明文仅创建响应返回一次；SHA-256 落盘）
+      security: [AdminSession: []]
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TokenCreateRequest' }
+      responses:
+        '201':
+          description: 创建成功（token 明文仅此一次）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenCreatedResponse' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/projects/{p}/tokens/{id}:
+    delete:
+      summary: 吊销项目访问令牌（幂等；已吊销重复删仍 204）
+      security: [AdminSession: []]
+      parameters:
+        - { $ref: '#/components/parameters/ProjectPath' }
+        - { name: id, in: path, required: true, schema: { type: string }, description: token id（hash 前 16 位） }
+      responses:
+        '204': { description: 吊销成功 }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
 components:
   securitySchemes:
@@ -1172,6 +1219,29 @@ components:
       properties:
         username: { type: string, description: "[A-Za-z0-9_-]{2,64}，≠ admin" }
         password: { type: string, minLength: 6, description: 新密码（≥6 位） }
+    ProjectToken:
+      type: object
+      required: [id, name, created_at, revoked]
+      properties:
+        id: { type: string, description: token id（= SHA-256 前 16 位 hex） }
+        name: { type: string, description: "展示名，项目内唯一（[A-Za-z0-9._-]{1,64}）" }
+        created_at: { type: integer, format: int64, description: 墙钟 ms }
+        created_by: { type: string }
+        revoked: { type: boolean }
+        # 不含 hash/token 明文：列表永不返回凭据
+    TokenCreateRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, description: "展示名，项目内唯一（[A-Za-z0-9._-]{1,64}）" }
+    TokenCreatedResponse:
+      type: object
+      required: [id, name, token, created_at]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        token: { type: string, description: 明文令牌——仅此响应返回一次，服务端只存 SHA-256 }
+        created_at: { type: integer, format: int64 }
     MemberList:
       type: object
       properties:

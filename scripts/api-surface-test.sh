@@ -23,6 +23,10 @@ curl -sf $BASE/healthz >/dev/null || { echo "  healthz FAIL"; cat /tmp/dsh-api-s
 
 AUTH="Authorization: Bearer $(curl -sf -X POST $BASE/api/v1/login -H 'Content-Type: application/json' -d '{"password":"admin123"}' | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")"
 J() { curl -sf -H "$AUTH" -H 'Content-Type: application/json' "$@"; }
+# project-token：dev-single 启动时打印全局开发数据面 token（数据面一律需要 token）
+DEV_TOKEN=$(sed -n 's/.*开发数据面 token = \([a-f0-9]*\).*/\1/p' /tmp/dsh-api-surface.log)
+[ -n "$DEV_TOKEN" ] || { echo "  dev token 未打印"; cat /tmp/dsh-api-surface.log; exit 1; }
+DP() { curl -sf -H "Authorization: Bearer $DEV_TOKEN" "$@"; }
 
 echo "== 1. 建项目 + 结构(host/port/password secret) + 发布 =="
 J -X POST $BASE/api/v1/projects -d '{"name":"order-service"}' >/dev/null
@@ -122,10 +126,10 @@ C=$(J "$BASE/api/v1/projects/mask-test/branches/dev/config?reveal=true")
 echo "$C" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['groups']['db']['pass']=='plainpass', d" && echo "  admin config reveal OK"
 J $BASE/api/v1/audit | python3 -c "import json,sys; a=[x for x in json.load(sys.stdin) if x['action']=='config_reveal']; assert len(a)>=1, a" && echo "  config_reveal 审计 OK"
 # 数据面 snapshot：secret 掩码
-C=$(curl -sf $BASE/v1/projects/mask-test/branches/dev/snapshot)
+C=$(DP $BASE/v1/projects/mask-test/branches/dev/snapshot)
 echo "$C" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['groups']['db']['pass']=='***', d" && echo "  snapshot 数据面掩码 OK"
 # 渲染端点：默认掩码（无会话）
-R=$(curl -sf "$BASE/v1/projects/mask-test/branches/dev/config?format=json")
+R=$(DP "$BASE/v1/projects/mask-test/branches/dev/config?format=json")
 echo "$R" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['db']['pass']=='***', d" && echo "  render 默认掩码 OK"
 # 渲染端点 reveal=true 无会话 → 401
 CODE=$(curl -s -o /tmp/reveal-nosess.json -w '%{http_code}' "$BASE/v1/projects/mask-test/branches/dev/config?format=json&reveal=true")
@@ -136,7 +140,7 @@ echo "$R" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['db'][
 # 渲染端点 version 参数（历史版本；v1=结构空值版本，v2=含 db1 的值版本）
 J -X PUT $BASE/api/v1/projects/mask-test/branches/dev/draft -d '{"updates":[{"group":"db","key":"host","value":{"type":"string","str_value":"db2"}}]}' >/dev/null
 J -X POST $BASE/api/v1/projects/mask-test/branches/dev/publish -d '{"comment":"v3","request_id":"r2"}' >/dev/null
-R=$(curl -sf "$BASE/v1/projects/mask-test/branches/dev/config?format=json&version=2")
+R=$(DP "$BASE/v1/projects/mask-test/branches/dev/config?format=json&version=2")
 echo "$R" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['db']['host']=='db1', d" && echo "  render version 参数 OK"
 
 echo
@@ -163,9 +167,9 @@ S=$(J $BASE/api/v1/projects/gray-test/branches/dev/gray-status)
 echo "$S" | python3 -c "import json,sys; s=json.load(sys.stdin); assert s['gray_active'] and s['gray_seq']==1 and s['gray_rule']['match_labels'][0]['value']=='cn-north-1', s" && echo "  gray-status OK"
 
 # 数据面联动：命中 → gray=true + resolved_version=gray_seq；未命中 → gray=false
-N=$(curl -sf $BASE/v1/projects/gray-test/branches/dev/snapshot -H 'X-Dsh-Instance: web-1' -H 'X-Dsh-Labels: zone=cn-north-1')
+N=$(DP $BASE/v1/projects/gray-test/branches/dev/snapshot -H 'X-Dsh-Instance: web-1' -H 'X-Dsh-Labels: zone=cn-north-1')
 echo "$N" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['gray']==True and d['resolved_version']==1 and d['groups']['app']['feature']=='gray-feature', d" && echo "  数据面命中 → gray=true OK"
-S2=$(curl -sf $BASE/v1/projects/gray-test/branches/dev/snapshot -H 'X-Dsh-Instance: web-2' -H 'X-Dsh-Labels: zone=cn-south-1')
+S2=$(DP $BASE/v1/projects/gray-test/branches/dev/snapshot -H 'X-Dsh-Instance: web-2' -H 'X-Dsh-Labels: zone=cn-south-1')
 echo "$S2" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['gray']==False and d['resolved_version']==2 and d['groups']['app']['feature']=='stable', d" && echo "  数据面未命中 → gray=false OK"
 
 # 转正 → active 推进 + 状态清空
@@ -185,3 +189,24 @@ echo "$S" | python3 -c "import json,sys; s=json.load(sys.stdin); assert not s['g
 J "$BASE/api/v1/audit?action=gray_publish" | python3 -c "import json,sys; a=json.load(sys.stdin); assert len(a)>=2, a" && echo "  audit gray_publish OK"
 J "$BASE/api/v1/audit?action=gray_promote" | python3 -c "import json,sys; a=json.load(sys.stdin); assert len(a)>=1, a" && echo "  audit gray_promote OK"
 J "$BASE/api/v1/audit?action=gray_abort" | python3 -c "import json,sys; a=json.load(sys.stdin); assert len(a)>=1, a" && echo "  audit gray_abort OK"
+
+echo "== 项目访问令牌（project-token）生命周期 =="
+# 创建：201，明文仅此一次；列表无明文
+TK=$(J -X POST $BASE/api/v1/projects/mask-test/tokens -d '{"name":"surface-svc"}')
+PT=$(echo "$TK" | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+TID=$(echo "$TK" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+echo "$TK" | python3 -c "import json,sys; t=json.load(sys.stdin); assert t['name']=='surface-svc' and len(t['token'])==32, t" && echo "  token create OK (32-hex plaintext once)"
+L=$(J $BASE/api/v1/projects/mask-test/tokens)
+echo "$L" | python3 -c "import json,sys; l=json.load(sys.stdin); assert len(l)==1 and 'token' not in l[0] and 'hash' not in l[0], l" && echo "  token list no-plaintext OK"
+# 项目 token 数据面：200（鉴权通过）；他项目 → 401；无 token → 401
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $PT" "$BASE/v1/projects/mask-test/branches/dev/snapshot")
+[ "$CODE" = "200" ] && echo "  project token data-plane OK" || { echo "  project token data-plane FAIL $CODE"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $PT" "$BASE/v1/projects/other-project/branches/dev/snapshot")
+[ "$CODE" = "401" ] && echo "  cross-project token → 401 OK" || { echo "  cross-project FAIL $CODE"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/projects/mask-test/branches/dev/snapshot")
+[ "$CODE" = "401" ] && echo "  no-token → 401 OK" || { echo "  no-token FAIL $CODE"; exit 1; }
+# 吊销 → 204；吊销后原 token → 401
+CODE=$(curl -s -H "$AUTH" -o /dev/null -w '%{http_code}' -X DELETE "$BASE/api/v1/projects/mask-test/tokens/$TID")
+[ "$CODE" = "204" ] && echo "  revoke OK" || { echo "  revoke FAIL $CODE"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $PT" "$BASE/v1/projects/mask-test/branches/dev/snapshot")
+[ "$CODE" = "401" ] && echo "  revoked token → 401 OK" || { echo "  revoked-token FAIL $CODE"; exit 1; }

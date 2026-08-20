@@ -13,6 +13,8 @@ server/target/debug/defing --dev-single --admin-password admin123 --allow-no-mas
 # 管理面:  http://127.0.0.1:8384  （/admin 内嵌控制台，/metrics，/healthz）
 # 数据面:  GET  /v1/projects/{p}/branches/{b}/snapshot  （SDK 拉配置，纯值+版本号）
 #          SSE  /v1/projects/{p}/branches/{b}/watch      （订阅发布事件）
+# 鉴权:    数据面一律需要访问令牌 —— dev-single 启动时打印「开发数据面 token」（全局有效）；
+#          生产/集群模式在 Admin UI 项目页「访问令牌」Tab 创建（仅全局管理员，每项目独立、可吊销）
 ```
 
 ### 集群（3 节点）
@@ -47,13 +49,16 @@ defing --node-id 3 --join http://127.0.0.1:8384 --http-addr 127.0.0.1:8388 --raf
 
 ```ts
 import { ConfigClient } from './sdk/ts/src/index.ts';
-const c = new ConfigClient([{ grpc: '127.0.0.1:8383', http: 'http://127.0.0.1:8384' }]);
+const c = new ConfigClient([{ grpc: '127.0.0.1:8383', http: 'http://127.0.0.1:8384' }], {
+  token: '<项目访问令牌>',   // 数据面鉴权：每项目独立令牌（Admin UI 项目页创建）
+});
 const snap = await c.get('my-app', 'dev');          // 读活动版本（gRPC 数据面）
 c.watch('my-app', 'dev', (e) => console.log(e));    // 订阅发布事件（gRPC 流，断线 after_version 续传）
 await c.listMembers();                              // 集群成员（端点池刷新）
 ```
-Go：`sdk/go`（`configclient.NewGrpc(addr, token)` / `New(endpoints)` HTTP 降级）；
-Python：`sdk/python`（`ConfigClient([{'grpc': ..., 'http': ...}])`）。
+Go：`sdk/go`（`configclient.NewGrpc(addr, token)` / `configclient.New(endpoints, token)` HTTP 降级）；
+Python：`sdk/python`（`ConfigClient([{'grpc': ..., 'http': ...}], token=...)`）。
+数据面鉴权：每项目访问令牌（`Authorization: Bearer <token>`，gRPC metadata 同构）；`--dev-single` 自动生成全局开发 token 打印。
 端点带 `grpc` 地址时优先走 gRPC 数据面（:8383），纯字符串端点自动降级 HTTP/SSE；
 gRPC 契约测试：`bash scripts/sdk-grpc-contract-test.sh`（依赖：npm install、pip install grpcio、go mod tidy）。
 
@@ -64,7 +69,7 @@ gRPC 契约测试：`bash scripts/sdk-grpc-contract-test.sh`（依赖：npm inst
 - **配置模型**：项目→分支→分组→item；结构强一致（仅值按分支）
 - **发布闭环**：草稿 → 版本（不可变）→ 发布 → 通知；回滚；共享配置项（扁平库，含描述字段）与级联——引用关系由项目结构页的「共享引用」决定（引用项只读，值由共享库物化）
 - **安全**：secret 项 AES-256-GCM 信封加密（主密钥 env/文件）、多会话并存（每会话独立管理 + 草稿乐观锁防并发编辑冲突）、审计、CSP、
-  join/raft 集群令牌（--join-token/--raft-token 集群模式强制）、HTTP 数据面令牌（--data-plane-token）
+  join/raft 集群令牌（--join-token/--raft-token 集群模式强制）、数据面每项目访问令牌（Admin UI/API 管理，SHA-256 落盘）
 - **多格式**：YAML / TOML / JSON 渲染
 - **可观测**：/healthz、/readyz、/metrics（Prometheus）、审计 API
 - **Admin UI**：内嵌 /admin（项目/配置/watch）

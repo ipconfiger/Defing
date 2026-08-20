@@ -13,7 +13,8 @@ import (
 func main() {
 	endpoints := strings.Split(env("DSH_ENDPOINTS", "http://127.0.0.1:8384"), ",")
 	project := env("DSH_PROJECT", "sdk-project")
-	c := configclient.New(endpoints)
+	token := env("DSH_TOKEN", "")
+	c := configclient.New(endpoints, token)
 
 	snap, err := c.Get(project, "dev")
 	if err != nil {

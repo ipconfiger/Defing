@@ -7,7 +7,7 @@ const P = process.env.DSH_PROJECT || 'sdk-project';
 
 async function main() {
   // gRPC 优先端点（design §3.1 Endpoint{grpc?,http?}）
-  const c = new ConfigClient([{ grpc: GRPC, http: HTTP }]);
+  const c = new ConfigClient([{ grpc: GRPC, http: HTTP }], { token: process.env.DSH_TOKEN });
 
   const snap = await c.get(P, 'dev');
   const host = (snap.groups as any)?.redis?.host;

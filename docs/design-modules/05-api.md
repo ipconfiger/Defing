@@ -22,9 +22,9 @@ trait dsh 进程
 
 | 面 | 方案 |
 |----|------|
-| gRPC 数据面 | metadata `authorization: Bearer <api_token>`；只读+watch；token 校验（静态表，MVP） |
+| gRPC 数据面 | metadata `authorization: Bearer <项目访问令牌>`；只读+watch；per-handler 校验（按请求 project 查 tok/ 集合，SHA-256；dev-single 开发 token 全局有效） |
 | HTTP 管理面 | Bearer 会话令牌；状态机 sess/admin 校验（I7）；登录/心跳免鉴权 |
-| 渲染端点 | 免鉴权（面向应用拉取，配合网络层白名单）；reveal=true 需会话+审计 |
+| 渲染端点 | 项目访问令牌（与 snapshot 同构）；`reveal=true` 走会话鉴权（豁免 token，B2：PA 仅能 reveal 自己项目）+审计 |
 
 ## 4. 幂等中间件（I10）
 - 管理写请求：读 `Idempotency-Key`（缺失则生成并回显）。

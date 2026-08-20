@@ -17,7 +17,7 @@ PROJECT = os.environ.get("DSH_PROJECT", "sdk-project")
 
 
 def main():
-    c = ConfigClient([{"grpc": GRPC, "http": HTTP}])
+    c = ConfigClient([{"grpc": GRPC, "http": HTTP}], token=os.environ.get("DSH_TOKEN"))
     snap = c.get(PROJECT, "dev")
     host = snap.get("groups", {}).get("redis", {}).get("host")
     print("[py-grpc] get ok: version=%s host=%s" % (snap["version"], host))

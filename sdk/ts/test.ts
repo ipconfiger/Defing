@@ -5,7 +5,7 @@ const ENDPOINTS = (process.env.DSH_ENDPOINTS || 'http://127.0.0.1:8384').split('
 const P = process.env.DSH_PROJECT || 'sdk-project';
 
 async function main() {
-  const c = new ConfigClient(ENDPOINTS);
+  const c = new ConfigClient(ENDPOINTS, { token: process.env.DSH_TOKEN });
   const snap = await c.get(P, 'dev');
   const host = (snap.groups as any)?.redis?.host;
   console.log('[ts] get ok: version=' + snap.version + ' host=' + host);

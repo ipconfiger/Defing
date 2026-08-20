@@ -102,12 +102,16 @@
 |---|---|---|---|
 | `--admin-password <pw>` | string | 首启随机生成并打印 | 管理员密码（global，客户端模式也用于登录） |
 | `--session-ttl <sec>` | u64 | `86400`（24h） | 会话 TTL（0=不自动过期） |
-| `--data-plane-token <token>` | string | 缺省开放 | 数据面 gRPC 访问令牌（metadata `authorization: Bearer <token>`）；建议集群启用 |
 | `--join-token <token>` | string | — | join 端点鉴权 Bearer；**集群模式强制**，全集群相同 |
 | `--raft-token <token>` | string | — | Raft RPC 共享令牌；**集群模式强制**，全集群相同（防伪造 vote/append） |
 | `--trusted-proxy <cidrs>` | string | — | 可信代理 CIDR 列表（逗号分隔，如 `10.0.0.0/8,192.168.0.0/16`）；仅信任来自这些网段的 X-Forwarded-For 作登录节流键（F4） |
 | `--admin-endpoint <url>` | string | `http://127.0.0.1:8384` | 客户端模式管理面端点（global） |
 | `--admin-token <token>` | string | — | 客户端模式会话令牌（global）；缺省用 `--admin-password` 登录获取 |
+
+> **数据面鉴权（project-token）**：数据面 `/v1/*` 与 gRPC 一律要求**项目访问令牌**（`Authorization: Bearer <token>` 或 SSE `?token=`）。
+> 令牌在 Admin UI 项目页「访问令牌」Tab 或 `POST /api/v1/projects/{p}/tokens` 创建（**仅全局管理员**）；
+> 每项目多令牌并存、可独立吊销（轮换零中断）、SHA-256 落盘（明文仅创建响应一次）。
+> `--dev-single` 启动时自动生成全局开发 token 打印（仅 dev 模式）。已移除 `--data-plane-token`。
 
 ### 3.6 发布策略与灰度
 
@@ -205,9 +209,11 @@ export DSH_MASTER_KEY="$(defing --gen-master-key)"
 defing --dev-single --data-dir /var/lib/defing \
   --http-addr 0.0.0.0:8384 --grpc-addr 0.0.0.0:8383 \
   --admin-password '<强密码>' --session-ttl 86400 \
-  --version-retention 50 --audit-retention 200000 \
-  --data-plane-token '<随机串>'
+  --version-retention 50 --audit-retention 200000
 ```
+
+> 数据面鉴权改为**项目访问令牌**（无 `--data-plane-token`）：启动后登录 Admin UI，
+> 在每个项目页「访问令牌」Tab 创建令牌并分发给对应 SDK 客户端。
 
 ### 5.3 systemd 服务示例
 
@@ -223,7 +229,7 @@ Group=defing
 EnvironmentFile=/etc/defing/defing.env     # 内含 DSH_MASTER_KEY=...
 ExecStart=/usr/local/bin/defing --dev-single --data-dir /var/lib/defing \
   --http-addr 0.0.0.0:8384 --grpc-addr 0.0.0.0:8383 \
-  --admin-password ${ADMIN_PASSWORD} --data-plane-token ${DATA_PLANE_TOKEN}
+  --admin-password ${ADMIN_PASSWORD}
 Restart=on-failure
 RestartSec=5
 
@@ -427,7 +433,7 @@ compose 要点：
 ```ts
 // TypeScript
 import { ConfigClient } from './sdk/ts/src/index.ts';
-const c = new ConfigClient([{ grpc: '127.0.0.1:8383', http: 'http://127.0.0.1:8384' }]);
+const c = new ConfigClient([{ grpc: '127.0.0.1:8383', http: 'http://127.0.0.1:8384' }], { token: '<项目访问令牌>' });
 const snap = await c.get('my-app', 'dev');        // 读活动版本
 c.watch('my-app', 'dev', (e) => console.log(e));  // 订阅发布事件（断线 after_version 续传）
 await c.listMembers();                            // 集群成员（端点池刷新）
@@ -436,19 +442,19 @@ await c.listMembers();                            // 集群成员（端点池刷
 ```go
 // Go
 import "github.com/.../sdk/go/configclient"
-c := configclient.NewGrpc("127.0.0.1:8383", "<data-plane-token>")  // gRPC 数据面
-// 或 c := configclient.New([]string{"http://127.0.0.1:8384"})      // HTTP 降级
+c := configclient.NewGrpc("127.0.0.1:8383", "<项目访问令牌>")  // gRPC 数据面
+// 或 c := configclient.New([]string{"http://127.0.0.1:8384"}, "<项目访问令牌>")  // HTTP 降级
 ```
 
 ```python
 # Python
 from sdk.python import ConfigClient
-c = ConfigClient([{'grpc': '127.0.0.1:8383', 'http': 'http://127.0.0.1:8384'}])
+c = ConfigClient([{'grpc': '127.0.0.1:8383', 'http': 'http://127.0.0.1:8384'}], token='<项目访问令牌>')
 snap = c.get('my-app', 'dev')
 ```
 
-> 启用 `--data-plane-token` 后，SDK gRPC 调用需带 `authorization: Bearer <token>`（Go 的
-> `NewGrpc(addr, token)` 第二参即此令牌）。
+> 数据面鉴权（project-token）：SDK 调用需带 `authorization: Bearer <token>`（gRPC metadata 同构；
+> HTTP SSE 亦支持 `?token=`）。令牌在 Admin UI 项目页「访问令牌」Tab 创建（仅全局管理员）。
 
 ---
 
@@ -459,7 +465,7 @@ snap = c.get('my-app', 'dev')
 | 主密钥 | 必配（`DSH_MASTER_KEY` 或 `--master-key-file`），强随机 32B；勿用仓库演示默认值 |
 | 管理员密码 | `--admin-password` 强密码（≥12 位混合）；勿用默认 |
 | 集群令牌 | `--join-token`/`--raft-token` 强随机（≥32 hex），全集群一致，仅内网可达 raft 端口 |
-| 数据面令牌 | 建议启用 `--data-plane-token`，SDK 携带 Bearer |
+| 项目访问令牌 | **每个项目都配置访问令牌**（Admin UI/API 创建，仅全局管理员）；SDK 携带 Bearer；泄露即吊销重建 |
 | 监听绑定 | 生产绑定内网地址/防火墙限流，8385 raft 端口绝不暴露公网 |
 | 可信代理 | 前置反代时配 `--trusted-proxy`（否则登录节流键可被伪造 XFF 绕过，F4） |
 | 会话 | `--session-ttl` 按需（默认 24h；0=永不过期，谨慎） |
