@@ -1,5 +1,7 @@
 # Defing —— 分布式配置文档服务
 
+> 📖 **使用文档**：https://alexli.eu.org/Defing/ （项目介绍 + 分章节操作教程，含 Admin UI 截图）
+
 单二进制分布式配置服务：**Rust 主服务（Raft 集群 + 内嵌 Admin UI + 三语言 SDK）**。
 配置按 项目 → 分支（dev/test/prod + 自定义）→ 分组 → item 组织；
 修改走"草稿 → 版本 → 发布 → 通知"闭环；结构项目级强一致，仅值按分支不同。
