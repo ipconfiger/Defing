@@ -166,6 +166,8 @@
             <div id="draft-groups" class="stack"></div>
             <div class="card actionbar">
               <span class="badge" id="draft-rev-badge" title="草稿修订号（乐观锁）">草稿 <span class="mono" id="draft-rev">r0</span></span>
+              <span class="badge warn hidden" id="draft-unsaved" title="当前界面有未保存的修改，先「保存草稿」再发布">未保存</span>
+              <span class="badge acc hidden" id="draft-unpublished" title="已保存但未发布的草稿值数量">草稿未发布</span>
               <button type="button" class="btn" data-act="saveDraft">保存草稿</button>
               <button type="button" class="btn primary" data-act="doPublish"><svg class="ic"><use href="#i-up"/></svg>发布版本</button>
               <span class="hint">发布后，订阅该分支的客户端将收到变更事件</span>
@@ -237,6 +239,8 @@
                 <div class="card-actions">
                   <span class="badge" id="struct-base-badge" title="草稿基于的结构版本；保存时必须等于当前结构版本，否则需重新载入">基于 <span class="mono" id="struct-base">sv0</span></span>
                   <span class="badge warn hidden" id="struct-stale" title="当前结构版本已更新，请「载入当前」后再保存"><span class="dot"></span>结构已更新</span>
+                  <span class="badge warn hidden" id="struct-unsaved" title="结构编辑器有未保存的修改，先「保存草稿」再发布">未保存</span>
+                  <span class="badge acc hidden" id="struct-unpublished" title="已保存但未发布的结构草稿">结构草稿未发布</span>
                   <button type="button" class="btn ghost" data-act="loadStructDraft"><svg class="ic"><use href="#i-refresh"/></svg>载入当前</button>
                   <button type="button" class="btn ghost" data-act="toggleStructJson" id="btn-struct-mode"><svg class="ic"><use href="#i-code"/></svg><span id="btn-struct-mode-label">JSON 模式</span></button>
                   <button type="button" class="btn" data-act="saveStructDraft">保存草稿</button>
@@ -330,6 +334,8 @@
             <p class="view-sub">跨项目复用的公共配置项（无分组）；引用关系由各项目结构页的「共享引用」决定，发布后自动级联</p>
           </div>
           <div class="card-actions">
+            <span class="badge warn hidden" id="sh-unsaved" title="上方表单有未保存的修改，先「保存共享草稿」再发布">表单未保存</span>
+            <span class="badge acc hidden" id="sh-unpublished" title="已保存但未发布的共享草稿数量">共享草稿未发布</span>
             <button type="button" class="btn ghost" data-act="refreshShared"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button>
             <button type="button" class="btn primary" data-act="publishShared"><svg class="ic"><use href="#i-up"/></svg>发布共享</button>
           </div>

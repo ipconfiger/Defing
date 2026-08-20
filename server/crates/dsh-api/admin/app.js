@@ -31,6 +31,11 @@ const S = {
   // 未保存编辑保护：结构 textarea / 灰度规则有用户输入时，后台刷新不覆盖
   structDirty: false, structProj: '',
   grayDirty: false, grayBranch: '',
+  // 保存状态指示（草稿/结构/共享库）：未保存 dirty 标记 + 已保存未发布计数
+  draftDirty: false,        // 草稿页有未保存输入
+  sharedDirty: false,       // 共享库表单有未保存输入
+  sharedDraftCount: 0,      // 已保存未发布的共享草稿数
+  hasStructDraft: false,    // 服务端存在已保存未发布的结构草稿
   // 结构：编辑器工作副本 / 已发布结构（GET /structure 实时拉取，权威）
   structDraft: null,          // {base_version, groups:[{name, items:[...]}]}
   pubStruct: null,            // {version, groups} 最近拉取的已发布结构（值新增级联首选源 + 无草稿时的基线）
@@ -564,6 +569,37 @@ async function loadBranch() {
   }
 }
 
+/* ---------- 保存状态指示（草稿 / 结构 / 共享库） ---------- */
+// 草稿页：未保存（draftDirty）+ 已保存未发布（draftValKeys 数）
+function updateDraftStatus() {
+  const u = $('draft-unsaved'), p = $('draft-unpublished');
+  if (u) u.classList.toggle('hidden', !S.draftDirty);
+  if (p) {
+    const n = Object.keys(S.draftValKeys || {}).length;
+    p.classList.toggle('hidden', n === 0);
+    if (n) p.textContent = n + ' 项草稿未发布';
+  }
+}
+function markDraftDirty() { S.draftDirty = true; updateDraftStatus(); }
+
+// 结构页：未保存（structDirty）+ 已保存未发布（hasStructDraft）
+function updateStructStatus() {
+  const u = $('struct-unsaved'), p = $('struct-unpublished');
+  if (u) u.classList.toggle('hidden', !S.structDirty);
+  if (p) p.classList.toggle('hidden', !S.hasStructDraft);
+}
+
+// 共享库：未保存（sharedDirty）+ 已保存未发布（sharedDraftCount）
+function updateSharedStatus() {
+  const u = $('sh-unsaved'), p = $('sh-unpublished');
+  if (u) u.classList.toggle('hidden', !S.sharedDirty);
+  if (p) {
+    p.classList.toggle('hidden', S.sharedDraftCount === 0);
+    if (S.sharedDraftCount) p.textContent = S.sharedDraftCount + ' 个共享草稿未发布';
+  }
+}
+function markSharedDirty() { S.sharedDirty = true; updateSharedStatus(); }
+
 function renderDraftEditor(b) {
   // 乐观锁：记录草稿修订号，保存时回传 expected_draft_rev
   S.draftRev = b.draft_rev || 0;
@@ -571,6 +607,9 @@ function renderDraftEditor(b) {
   // 现有草稿值索引（保存时空值 = 删除该草稿值）
   S.draftValKeys = {};
   for (const g of Object.keys(b.draft || {})) for (const k of Object.keys(b.draft[g] || {})) S.draftValKeys[g + '/' + k] = true;
+  // 重渲染后视为已同步：清未保存标记，刷新「N 项草稿未发布」计数
+  S.draftDirty = false;
+  updateDraftStatus();
   // 引用项索引（只读展示：值来自共享库）；每次重渲染重置，避免分支切换残留
   S.sharedRefs = {};
   for (const r of (b.shared_refs || [])) S.sharedRefs[r.group + '/' + r.key] = r;
@@ -757,6 +796,9 @@ function serializeGroups(gs) {
 // （GET /structure 的 version 为权威，与分支 sv 徽章交叉校验）—— PUT 要求 base_version 为 u64 且等于当前结构版本
 function applyServerStructDraft(d) {
   const noDraft = d === null || d === undefined || d.base_version === null || d.base_version === undefined;
+  // 服务端结构草稿是否存在 → 「结构草稿未发布」指示
+  S.hasStructDraft = !noDraft;
+  updateStructStatus();
   S.structDraft = {
     base_version: noDraft ? structBaseline() : Number(d.base_version),
     groups: noDraft
@@ -829,6 +871,7 @@ actions.saveDraft = async function (el) {
 
 actions.doPublish = function () {
   if (!S.project || !S.branch) return toast('请先选择项目与分支', 'err');
+  if (S.draftDirty) toast('有未保存的修改：本次发布只包含已保存的草稿值，请先「保存草稿」', 'warn', 6000);
   openModal({
     title: '发布版本',
     message: `将 ${S.project}/${S.branch} 当前草稿发布为新版本。`,
@@ -1134,7 +1177,7 @@ const GROUP_LIMIT = 500;               // MAX_GROUPS_PER_PROJECT
 const ITEM_LIMIT = 10000;              // MAX_ITEMS_PER_PROJECT
 
 function structJsonActive() { return !$('struct-draft').classList.contains('hidden'); }
-function markStructDirty() { S.structDirty = true; }
+function markStructDirty() { S.structDirty = true; updateStructStatus(); }
 
 function syncStructJsonTextarea() {
   $('struct-draft').value = JSON.stringify(
@@ -1442,6 +1485,7 @@ async function loadStructNow() {
     renderStructEditor();
     hideErr('struct-err');
     S.structDirty = false;
+    updateStructStatus();
     return true;
   } catch (e) {
     if (!e.expired) toast(e.message, 'err');
@@ -1481,6 +1525,8 @@ actions.saveStructDraft = async function (el) {
         groups: serializeGroups(S.structDraft.groups),
       });
       S.structDirty = false; // 已保存，与服务端一致
+      S.hasStructDraft = true; // 服务端现在有结构草稿（未发布）
+      updateStructStatus();
       toast('结构草稿已保存');
     } catch (e) {
       if (e.status === 409) {
@@ -1618,6 +1664,10 @@ async function loadShared() {
       j('GET', '/api/v1/shared').catch(() => []),
       j('GET', '/api/v1/shared-draft').catch(() => []),
     ]);
+    // 已保存未发布的共享草稿计数 + 表单未保存标记重置（刷新后视为已同步）
+    S.sharedDraftCount = (draft || []).length;
+    S.sharedDirty = false;
+    updateSharedStatus();
     const rows = (draft || []).map((x) => ({ ...x, __draft: true }))
       .concat((pub || []).map((x) => ({ ...x, __draft: false })));
     if (!rows.length) {
@@ -1681,6 +1731,7 @@ actions.saveShared = async function (el) {
 };
 
 actions.publishShared = function () {
+  if (S.sharedDirty) toast('有未保存的表单：本次发布只包含已保存的共享草稿，请先「保存共享草稿」', 'warn', 6000);
   openModal({
     title: '发布共享',
     message: '发布全部共享草稿；引用这些共享项的项目分支将自动级联生成新版本。',
@@ -1934,6 +1985,21 @@ function bindEvents() {
     if (!el || el.disabled) return;
     const fn = actions[el.dataset.act];
     if (typeof fn === 'function') fn.call(el, el, e);
+  });
+
+  // 保存状态指示：草稿页值输入 → 未保存标记；共享库表单 → 未保存标记
+  document.addEventListener('change', (e) => {
+    const t = e.target;
+    if (!t || !t.classList) return;
+    if (t.classList.contains('draft-in')) markDraftDirty();
+    else if (t.id === 'sh-key' || t.id === 'sh-desc' || t.id === 'sh-value'
+      || t.id === 'sh-type' || t.id === 'sh-secret' || t.id === 'sh-required') markSharedDirty();
+  });
+  document.addEventListener('input', (e) => {
+    const t = e.target;
+    if (!t || !t.classList) return;
+    if (t.classList.contains('draft-in')) markDraftDirty();
+    else if (t.id === 'sh-key' || t.id === 'sh-desc' || t.id === 'sh-value') markSharedDirty();
   });
 
   // 登录（Enter 提交）
