@@ -1515,18 +1515,14 @@ actions.refreshCfg = function () { fetchCfg(); };
 async function fetchCfg() {
   const out = $('cfg-out');
   const reveal = $('cfg-reveal').checked;
-  $('cfg-format').disabled = reveal;
+  const fmt = $('cfg-format').value;
+  // 明文（reveal）同样按所选格式渲染：?format=..&reveal=true 走渲染端点会话鉴权+审计，
+  // 按所选格式（YAML/JSON/TOML/ENV）输出且 secret 解密为明文（不再退回管理面 JSON 结构）。
+  $('cfg-format').disabled = false;
   out.textContent = '加载中…';
   try {
-    if (reveal) {
-      // 明文走管理面（会话鉴权 + 审计），返回 JSON
-      const d = await j('GET', `/api/v1/projects/${S.project}/branches/${S.branch}/config?reveal=true`);
-      out.textContent = JSON.stringify(d, null, 2);
-    } else {
-      // 默认走数据面（secret 掩码 ***），支持 YAML / JSON / TOML 渲染
-      const fmt = $('cfg-format').value;
-      out.textContent = await jtext(`/v1/projects/${S.project}/branches/${S.branch}/config?format=${fmt}`);
-    }
+    const q = 'format=' + encodeURIComponent(fmt) + (reveal ? '&reveal=true' : '');
+    out.textContent = await jtext(`/v1/projects/${S.project}/branches/${S.branch}/config?${q}`);
   } catch (e) {
     out.textContent = '';
     if (!e.expired) toast(e.message, 'err');
