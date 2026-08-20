@@ -287,6 +287,22 @@
           <div id="pane-tokens" class="pane hidden">
             <div class="card">
               <div class="card-head">
+                <h3>构建脚本取值（curl）</h3>
+                <div class="card-actions">
+                  <select class="sel" id="tok-fmt" data-act="tokFmt" aria-label="渲染格式">
+                    <option value="yaml">YAML</option>
+                    <option value="json">JSON</option>
+                    <option value="toml">TOML</option>
+                  </select>
+                  <button type="button" class="btn ghost" data-act="copyCurlUrl"><svg class="ic"><use href="#i-copy"/></svg>复制 curl 命令</button>
+                </div>
+              </div>
+              <p class="hint" style="margin:0 0 10px">编译/构建脚本可预先用 curl 拉取指定分支的配置（带项目访问令牌鉴权，输出指定格式）——纯 HTTP，无需 SDK：</p>
+              <code id="tok-curl-cmd" class="codeblock mono small"></code>
+              <p class="hint" style="margin:8px 0 0">提示：不支持自定义头的环境可用查询参数 <code class="mono">?token=&lt;令牌&gt;</code> 代替 Authorization 头（URL 会含令牌，注意保管）。</p>
+            </div>
+            <div class="card">
+              <div class="card-head">
                 <h3>访问令牌</h3>
                 <div class="card-actions">
                   <button type="button" class="btn primary" data-act="createToken"><svg class="ic"><use href="#i-plus"/></svg>创建令牌</button>

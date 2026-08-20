@@ -187,6 +187,7 @@ async function loadTokens() {
   if (!S.project) return;
   const tbody = $('tokens-body');
   if (!tbody) return;
+  renderCurlCmd(); // 刷新构建脚本 curl 命令（项目/分支/格式）
   try {
     const list = (await j('GET', '/api/v1/projects/' + encodeURIComponent(S.project) + '/tokens')) || [];
     renderTokens(list);
@@ -254,6 +255,23 @@ actions.copyToken = function () {
   const txt = $('token-plaintext').textContent || '';
   if (!txt) return;
   navigator.clipboard.writeText(txt).then(() => toast('已复制')).catch(() => toast('复制失败，请手动选择复制'));
+};
+
+/* ---------- 构建脚本取值：curl 命令展示 ---------- */
+const CURL_FORMATS = ['yaml', 'json', 'toml'];
+function renderCurlCmd() {
+  const el = $('tok-curl-cmd');
+  if (!el) return;
+  const fmt = CURL_FORMATS.includes($('tok-fmt')?.value) ? $('tok-fmt').value : 'yaml';
+  const branch = S.branch || 'dev';
+  const url = location.origin + '/v1/projects/' + encodeURIComponent(S.project || '<项目>') + '/branches/' + encodeURIComponent(branch) + '/config?format=' + fmt;
+  el.textContent = 'curl -s "' + url + '" -H "Authorization: Bearer <项目访问令牌>"';
+}
+actions.tokFmt = function () { renderCurlCmd(); };
+actions.copyCurlUrl = function () {
+  const txt = $('tok-curl-cmd').textContent || '';
+  if (!txt) return;
+  navigator.clipboard.writeText(txt).then(() => toast('curl 命令已复制')).catch(() => toast('复制失败，请手动选择复制'));
 };
 
 actions.closeTokenModal = function () { $('token-overlay').classList.add('hidden'); };

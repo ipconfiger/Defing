@@ -62,6 +62,24 @@ Python：`sdk/python`（`ConfigClient([{'grpc': ..., 'http': ...}], token=...)`�
 端点带 `grpc` 地址时优先走 gRPC 数据面（:8383），纯字符串端点自动降级 HTTP/SSE；
 gRPC 契约测试：`bash scripts/sdk-grpc-contract-test.sh`（依赖：npm install、pip install grpcio、go mod tidy）。
 
+### 构建脚本取值（curl，无需 SDK）
+
+编译/构建脚本可预先拉取指定分支的配置（纯 HTTP，输出 yaml/json/toml 任意格式，带项目访问令牌鉴权）：
+
+```bash
+# 拉取 my-app 项目 dev 分支的 YAML 配置（Bearer 鉴权）
+curl -s "http://<host>:8384/v1/projects/my-app/branches/dev/config?format=yaml" \
+  -H "Authorization: Bearer <项目访问令牌>"
+
+# 或查询参数鉴权（URL 会含令牌，注意保管）：
+curl -s "http://<host>:8384/v1/projects/my-app/branches/dev/config?format=json&token=<项目访问令牌>"
+
+# 指定版本：&version=<n>；分支名按需替换（dev/test/prod/自定义）
+```
+
+项目访问令牌在 Admin UI 项目页「访问令牌」Tab 创建（仅全局管理员，明文仅创建时展示一次）；
+该 Tab 同时展示当前项目的可复制 curl 命令。
+
 ## 核心能力
 
 - **集群**：Raft 强一致、静态成员表建群（--bootstrap-peers，全员 voter 无需 promote）、
