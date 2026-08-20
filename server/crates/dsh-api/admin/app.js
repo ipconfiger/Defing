@@ -645,15 +645,20 @@ function draftStructRowHtml(g, it, v) {
   </div>`;
 }
 
-// 引用项只读行（草稿页）：徽标 + 共享值（secret 已掩码）
+// 引用项只读行（草稿页）：徽标 + 共享值（secret 已掩码）。
+// 徽标放 gkey 下方（可换行）——避免 92px 的 gtype 列放不下 nowrap 徽标而溢出盖住值列；
+// gtype 列显示类型，值列独立展示（修复 key/value 重叠）。
 function sharedRefRowHtml(r) {
   const v = r.value || {};
   const icon = v.masked ? '<svg class="ic ic-xs"><use href="#i-lock"/></svg>' : '';
   const txt = fmtVal(v);
+  const ty = (v && v.type) || '';
   return `<div class="grow ref-grow">
-    <div class="gkey"><span class="mono">${esc(r.key)}</span></div>
-    <div class="gtype"><span class="badge acc">引用共享项 ${esc(r.shared_key)} · v${esc(r.version)}</span></div>
-    <div class="gctl"><span class="mono muted">${icon}${esc(txt)}</span></div>
+    <div class="gkey"><span class="mono">${esc(r.key)}</span>
+      <div class="ref-badge"><span class="badge acc">引用共享项 ${esc(r.shared_key)} · v${esc(r.version)}</span></div>
+    </div>
+    <div class="gtype"><span class="ty">${icon}${esc(ty)}</span></div>
+    <div class="gctl"><span class="mono muted">${esc(txt)}</span></div>
     <div class="gdel"><span class="hint" style="margin:0">只读</span></div>
   </div>`;
 }
