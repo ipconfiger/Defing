@@ -1,5 +1,5 @@
 //! 项目管理员（Project Admin）状态机测试。
-//! 设计文档: docs/design/project-admin.md §8 M1。
+//! 设计文档: dev_docs/design/project-admin.md §8 M1。
 
 use dsh_core::command::Command;
 use dsh_core::model::{AdminSession, Principal};

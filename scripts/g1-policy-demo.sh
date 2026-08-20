@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # G1 验收演示：三旋钮（--publish-policy / --shared-cascade / --read-mode）
-# 依据 docs/design/g1-policy.md（D35-D37）
+# 依据 dev_docs/design/g1-policy.md（D35-D37）
 set -euo pipefail
 BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/defing}
 PORT=${PORT:-8398}

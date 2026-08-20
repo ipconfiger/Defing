@@ -435,7 +435,7 @@ pub enum Principal {
     },
 }
 
-/// 项目管理员账号（设计文档 docs/design/project-admin.md §2）。
+/// 项目管理员账号（设计文档 dev_docs/design/project-admin.md §2）。
 /// 密码 = SHA-256(salt || password) 加盐哈希；明文与哈希均不出现在日志。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectAdminAccount {

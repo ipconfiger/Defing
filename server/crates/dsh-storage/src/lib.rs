@@ -1,6 +1,6 @@
 //! redb 存储实现（模块 02）：多表布局 + Store trait 实现 + 文件级备份。
 //!
-//! rocksdb → redb 迁移（docs/design/storage-redb-migration.md §3.1/3.2/3.4）：
+//! rocksdb → redb 迁移（dev_docs/design/storage-redb-migration.md §3.1/3.2/3.4）：
 //! - 单文件 `{data_dir}/dsh.redb`，4 张 `&[u8]→&[u8]` 表（替代 4 列族）；
 //! - 表定义在本 crate pub 导出、dsh-raft 跨 crate 引用（单一来源，N5）；
 //! - 备份 = 持有未提交写事务互斥写入 + 文件 copy（redb 4.x 无官方 backup API）。

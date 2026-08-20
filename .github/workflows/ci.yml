@@ -1,5 +1,5 @@
 name: ci
-# 依据 docs/design-modules/13-testing-ci.md 的 9 阶段流水线。
+# 依据 dev_docs/design-modules/13-testing-ci.md 的 9 阶段流水线。
 # stage 1 lint / 2 unit / 3 contract 已落地；4 integ(并入 unit) / 5 raft / 6 sdk / 7 e2e / 8 bench / 9 release+SBOM。
 on:
   push:

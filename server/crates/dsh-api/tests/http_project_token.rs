@@ -1,5 +1,5 @@
 //! 项目访问令牌（Project Token）HTTP 集成测试。
-//! 设计文档: docs/design/project-token.md §3。
+//! 设计文档: dev_docs/design/project-token.md §3。
 
 use std::sync::{Arc, RwLock};
 

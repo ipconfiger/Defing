@@ -2,7 +2,7 @@
 //!
 //! 背景：compose/k8s 的启动命令是静态的（每次启动同一参数）。节点带 `--join` 重启时，
 //! 若 join 端点对「已在集群中的 node_id」一律返回 409，客户端会 30s 重试后退出 → 崩溃循环
-//! （docs/defing-cluster.md 坑 C3；修复见 dsh-cli join_cluster / dsh-api cluster_join）。
+//! （dev_docs/defing-cluster.md 坑 C3；修复见 dsh-cli join_cluster / dsh-api cluster_join）。
 //!
 //! 本测试验证修复后的行为契约：
 //!   - 首次 join（node_id 未占用）→ 200 `added_learner`，`rejoined=false`；

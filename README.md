@@ -20,7 +20,7 @@ server/target/debug/defing --dev-single --admin-password admin123 --allow-no-mas
 ### 集群（3 节点）
 
 **方式一（推荐）：静态成员表 `--bootstrap-peers`** —— 三节点传**完全相同**的三段式成员表，
-并行启动直接选举，全员 voter，无需 join/promote（研究/设计见 `docs/research-cluster-bootstrap.md`）：
+并行启动直接选举，全员 voter，无需 join/promote（研究/设计见 `dev_docs/research-cluster-bootstrap.md`）：
 
 ```bash
 SEED="1@127.0.0.1:8385@127.0.0.1:8384,2@127.0.0.1:8387@127.0.0.1:8386,3@127.0.0.1:8389@127.0.0.1:8388"
@@ -113,14 +113,14 @@ bash ../scripts/check-contracts.sh   # proto/openapi/schema lint
 
 ## 文档
 
-- 需求演进：[docs/proposl.md](docs/proposl.md) → [docs/proposal-v4.md](docs/proposal-v4.md)
-- 可行性分析：[docs/feasibility-report.md](docs/feasibility-report.md)
-- 详细设计：[docs/design-v3.md](docs/design-v3.md)、[docs/design-modules/](docs/design-modules/)（15 份模块规格）
-- 进度记录：[docs/progress.md](docs/progress.md)
-- 生态集成调研：[docs/research-ecosystem-integration.md](docs/research-ecosystem-integration.md)（综合结论 + 路线图）
-  - K8s/K3s：[docs/research-k8s-k3s-integration.md](docs/research-k8s-k3s-integration.md)
-  - Spring Cloud：[docs/research-spring-cloud-integration.md](docs/research-spring-cloud-integration.md)
-  - 竞品对标：[docs/research-competitor-benchmark.md](docs/research-competitor-benchmark.md)
+- 需求演进：[dev_docs/proposl.md](dev_docs/proposl.md) → [dev_docs/proposal-v4.md](dev_docs/proposal-v4.md)
+- 可行性分析：[dev_docs/feasibility-report.md](dev_docs/feasibility-report.md)
+- 详细设计：[dev_docs/design-v3.md](dev_docs/design-v3.md)、[dev_docs/design-modules/](dev_docs/design-modules/)（15 份模块规格）
+- 进度记录：[dev_docs/progress.md](dev_docs/progress.md)
+- 生态集成调研：[dev_docs/research-ecosystem-integration.md](dev_docs/research-ecosystem-integration.md)（综合结论 + 路线图）
+  - K8s/K3s：[dev_docs/research-k8s-k3s-integration.md](dev_docs/research-k8s-k3s-integration.md)
+  - Spring Cloud：[dev_docs/research-spring-cloud-integration.md](dev_docs/research-spring-cloud-integration.md)
+  - 竞品对标：[dev_docs/research-competitor-benchmark.md](dev_docs/research-competitor-benchmark.md)
 
 ## 许可
 

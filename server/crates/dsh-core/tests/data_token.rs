@@ -1,5 +1,5 @@
 //! 项目访问令牌（Project Token）状态机测试。
-//! 设计文档: docs/design/project-token.md §2/§6。
+//! 设计文档: dev_docs/design/project-token.md §2/§6。
 
 use dsh_core::command::Command;
 use dsh_core::model::ProjectId;

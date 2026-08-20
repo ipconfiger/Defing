@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # G5 验收演示：灰度指标（/metrics 6 项）+ 自动回滚负例（低错误率不误伤）+ 生命周期指标联动
-# 依据 docs/design/g5-observability.md（D31-D34）
+# 依据 dev_docs/design/g5-observability.md（D31-D34）
 set -euo pipefail
 BIN=${BIN:-/home/alex/Projects/Defing/server/target/debug/defing}
 PORT=${PORT:-8397}

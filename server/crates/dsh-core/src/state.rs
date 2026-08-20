@@ -2352,7 +2352,7 @@ impl StateMachine {
     }
 
     // ---------------- 项目管理员（Project Admin）----------------
-    // 设计文档 docs/design/project-admin.md §3.1/§6。
+    // 设计文档 dev_docs/design/project-admin.md §3.1/§6。
     // 会话判定只看 is_some()，不读墙钟（D16 确定性）。
 
     fn valid_pa_username(name: &str) -> bool {
