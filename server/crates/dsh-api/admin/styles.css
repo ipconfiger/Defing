@@ -370,16 +370,6 @@ textarea.code { min-height: 140px; }
 .chip.mini:hover { border-color: var(--border); color: var(--fg-muted); }
 
 .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; display: inline-block; }
-.live-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #35c47f;
-  animation: pulse 2s infinite;
-  display: inline-block;
-  flex-shrink: 0;
-}
-
 /* ---------- 9. 分段切换 ---------- */
 .seg {
   display: inline-flex;
@@ -697,35 +687,7 @@ textarea.code { min-height: 140px; }
   gap: 0 16px;
 }
 
-/* ---------- 14. 控制台（watch） ---------- */
-.console-wrap { margin: 14px 0; }
-.console-head {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  font-size: 12.5px;
-  font-weight: 500;
-  color: var(--fg-muted);
-  padding: 8px 12px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-bottom: 0;
-  border-radius: 10px 10px 0 0;
-}
-.console {
-  height: 170px;
-  overflow: auto;
-  background: var(--console-bg);
-  color: var(--console-fg);
-  border: 1px solid var(--border);
-  border-radius: 0 0 10px 10px;
-  padding: 10px 12px;
-  font-size: 12px;
-  font-family: var(--mono);
-  line-height: 1.6;
-  white-space: pre-wrap;
-  word-break: break-all;
-}
+
 
 /* ---------- 15. 空状态 / 骨架 ---------- */
 .empty {
@@ -922,8 +884,8 @@ code {
 }
 pre { margin: 0; }
 
-.console::-webkit-scrollbar, .codeblock::-webkit-scrollbar, .table-wrap::-webkit-scrollbar { height: 8px; width: 8px; }
-.console::-webkit-scrollbar-thumb, .codeblock::-webkit-scrollbar-thumb, .table-wrap::-webkit-scrollbar-thumb {
+.codeblock::-webkit-scrollbar, .table-wrap::-webkit-scrollbar { height: 8px; width: 8px; }
+.codeblock::-webkit-scrollbar-thumb, .table-wrap::-webkit-scrollbar-thumb {
   background: var(--border-strong);
   border-radius: 4px;
 }

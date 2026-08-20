@@ -27,7 +27,6 @@ const S = {
   view: 'config', pane: 'draft',
   projects: [], project: '', branches: [], branch: '',
   version: 0, structV: 0, draftRev: 0, gray: null,
-  watchES: null,
   // 未保存编辑保护：结构 textarea / 灰度规则有用户输入时，后台刷新不覆盖
   structDirty: false, structProj: '',
   grayDirty: false, grayBranch: '',
@@ -81,7 +80,6 @@ function sessionExpired() {
   if (!S.token) return;
   S.token = '';
   localStorage.removeItem(LS_TOKEN); localStorage.removeItem(LS_ROLE); localStorage.removeItem(LS_PROJ);
-  stopWatch();
   $('app').classList.add('hidden');
   $('login-view').classList.remove('hidden');
   toast('会话已过期，请重新登录', 'err');
@@ -287,7 +285,6 @@ actions.toggleTheme = function () {
 };
 actions.doLogout = function () {
   j('POST', '/api/v1/logout', {}).catch(() => { /* 登出失败也继续本地清理 */ });
-  stopWatch();
   S.token = '';
   localStorage.removeItem(LS_TOKEN); localStorage.removeItem(LS_ROLE); localStorage.removeItem(LS_PROJ);
   location.reload();
@@ -370,7 +367,6 @@ actions.selectProject = function (el) {
   S.gray = null;
   S.structV = 0;
   S.pubStruct = null; // 切项目：立即丢弃旧项目数据，待 loadProject 拉取新项目的已发布结构
-  stopWatch();
   renderProjects();
   loadProject();
 };
@@ -563,7 +559,6 @@ async function loadBranch() {
     renderCtxBadges();
     renderDraftEditor(b);
     loadGrayStatus();
-    if (S.watchES) { stopWatch(); startWatch(); } // 切换分支后订阅跟随当前分支
   } catch (e) {
     if (!e.expired) toast(e.message, 'err');
   }
@@ -899,37 +894,6 @@ actions.doPublish = function () {
     },
   });
 };
-
-/* ---------- 变更订阅（watch） ---------- */
-actions.toggleWatch = function () { if (S.watchES) stopWatch(); else startWatch(); };
-
-function startWatch() {
-  if (!S.project || !S.branch) { toast('请先选择项目与分支', 'err'); return; }
-  $('watch-panel').classList.remove('hidden');
-  $('btn-watch').classList.add('on');
-  $('btn-watch-label').textContent = '停止订阅';
-  $('watch-ctx').textContent = `${S.project}/${S.branch} · after_version=${S.version}`;
-  $('events').textContent = '';
-  // 断线重连由浏览器自动进行；after_version 保证续传不丢事件
-  S.watchES = new EventSource(`/v1/projects/${S.project}/branches/${S.branch}/watch?after_version=${S.version}`);
-  S.watchES.onmessage = (ev) => appendEvent(ev.data);
-  S.watchES.onerror = () => { $('events').textContent += '（断线重连…）\n'; };
-}
-function appendEvent(data) {
-  const el = $('events');
-  let txt = el.textContent + data + '\n';
-  const lines = txt.split('\n'); // 截断保留最近 200 行（内存防护）
-  if (lines.length > 200) txt = lines.slice(lines.length - 200).join('\n');
-  el.textContent = txt;
-  el.scrollTop = el.scrollHeight;
-  try { const v = JSON.parse(data).version || 0; if (v > S.version) S.version = v; } catch (_) { /* 非事件负载 */ }
-}
-function stopWatch() {
-  if (S.watchES) { S.watchES.close(); S.watchES = null; }
-  $('watch-panel').classList.add('hidden');
-  $('btn-watch').classList.remove('on');
-  $('btn-watch-label').textContent = '订阅变更';
-}
 
 /* ---------- 灰度发布 ---------- */
 async function loadGrayStatus() {

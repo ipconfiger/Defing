@@ -134,20 +134,9 @@
             </div>
             <div class="ctx-actions">
               <button type="button" class="btn" data-act="openCfgModal"><svg class="ic"><use href="#i-eye"/></svg>查看配置</button>
-              <button type="button" class="btn" id="btn-watch" data-act="toggleWatch"><svg class="ic"><use href="#i-radio"/></svg><span id="btn-watch-label">订阅变更</span></button>
               <button type="button" class="btn ghost" data-act="newBranchModal"><svg class="ic"><use href="#i-plus"/></svg>新建分支</button>
               <button type="button" class="icon-btn danger" data-act="deleteBranch" title="删除当前分支" aria-label="删除当前分支"><svg class="ic"><use href="#i-trash"/></svg></button>
             </div>
-          </div>
-
-          <div id="watch-panel" class="console-wrap hidden">
-            <div class="console-head">
-              <span class="live-dot"></span><span>实时变更订阅</span>
-              <span id="watch-ctx" class="mono small"></span>
-              <span class="spacer"></span>
-              <button type="button" class="btn sm ghost" data-act="toggleWatch">停止订阅</button>
-            </div>
-            <div id="events" class="console"></div>
           </div>
 
           <div class="pane-tabs">
