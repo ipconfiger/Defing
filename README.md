@@ -74,6 +74,10 @@ curl -s "http://<host>:8384/v1/projects/my-app/branches/dev/config?format=yaml" 
 # 或查询参数鉴权（URL 会含令牌，注意保管）：
 curl -s "http://<host>:8384/v1/projects/my-app/branches/dev/config?format=json&token=<项目访问令牌>"
 
+# 输出 .env 文件（可直接重定向保存）：GROUP__KEY=VALUE，组/键大写，双下划线分隔
+curl -s "http://<host>:8384/v1/projects/my-app/branches/dev/config?format=env" \
+  -H "Authorization: Bearer <项目访问令牌>" > .env
+
 # 指定版本：&version=<n>；分支名按需替换（dev/test/prod/自定义）
 ```
 

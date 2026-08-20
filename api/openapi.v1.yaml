@@ -710,12 +710,12 @@ paths:
           description: text/event-stream
   /v1/projects/{p}/branches/{b}/config:
     get:
-      summary: 渲染输出配置文档（YAML/TOML/JSON；secret 默认掩码）
+      summary: 渲染输出配置文档（YAML/TOML/JSON/ENV；secret 默认掩码）
       security: []
       parameters:
         - { $ref: '#/components/parameters/ProjectPath' }
         - { $ref: '#/components/parameters/BranchPath' }
-        - { name: format, in: query, schema: { type: string, enum: [yaml, toml, json], default: yaml } }
+        - { name: format, in: query, schema: { type: string, enum: [yaml, toml, json, env], default: yaml }, description: "env = .env 文件（GROUP__KEY=VALUE，组/键大写，双下划线分隔）" }
         - { name: version, in: query, schema: { type: integer, format: int64 } }
         - { name: reveal, in: query, schema: { type: boolean, default: false }, description: 需权限+审计 }
       responses:

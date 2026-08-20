@@ -2503,6 +2503,7 @@ async fn render_config(
         Format::Yaml => "application/yaml",
         Format::Toml => "application/toml",
         Format::Json => "application/json",
+        Format::Env => "text/plain",
     };
     Ok(axum::response::Response::builder()
         .header("content-type", mime)

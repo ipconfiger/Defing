@@ -258,7 +258,7 @@ actions.copyToken = function () {
 };
 
 /* ---------- 构建脚本取值：curl 命令展示 ---------- */
-const CURL_FORMATS = ['yaml', 'json', 'toml'];
+const CURL_FORMATS = ['yaml', 'json', 'toml', 'env'];
 function renderCurlCmd() {
   const el = $('tok-curl-cmd');
   if (!el) return;

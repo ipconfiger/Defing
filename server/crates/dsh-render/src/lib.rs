@@ -1,4 +1,4 @@
-//! 多格式渲染（模块 08）：物化快照 → 规范化 JSON 树 → YAML/TOML/JSON。
+//! 多格式渲染（模块 08）：物化快照 → 规范化 JSON 树 → YAML/TOML/JSON/ENV。
 //! 输入为解密后的普通值（secret 已由上层解密为明文或掩码）。
 
 use std::collections::BTreeMap;
@@ -11,6 +11,7 @@ pub enum Format {
     Yaml,
     Toml,
     Json,
+    Env,
 }
 
 impl Format {
@@ -19,6 +20,7 @@ impl Format {
             "yaml" => Ok(Format::Yaml),
             "toml" => Ok(Format::Toml),
             "json" => Ok(Format::Json),
+            "env" => Ok(Format::Env),
             other => Err(Error::validation(format!("unsupported format: {other}"))),
         }
     }
@@ -47,7 +49,39 @@ impl Renderer {
                     format!("toml（键需为合法标识符）: {e}"),
                 )
             }),
+            Format::Env => Ok(render_env(&tree)),
         }
+    }
+}
+
+/// .env 格式：`GROUP__KEY=VALUE`（组/键转大写，双下划线分隔，dotenv 约定）。
+/// 值：含空白/#/引号/反斜杠/换行的字符串加双引号转义；数组逗号连接；其余按字面输出。
+fn render_env(tree: &BTreeMap<String, BTreeMap<String, serde_json::Value>>) -> String {
+    let mut out = String::new();
+    for (g, items) in tree {
+        for (k, v) in items {
+            let key = format!("{}__{}", g.to_uppercase(), k.to_uppercase());
+            out.push_str(&format!("{key}={}\n", env_value(v)));
+        }
+    }
+    out
+}
+
+fn env_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => {
+            if s.is_empty() || s.contains([' ', '#', '"', '\\', '\n', '\r']) {
+                format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+            } else {
+                s.clone()
+            }
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|x| x.as_str().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join(","),
+        other => other.to_string(),
     }
 }
 
@@ -143,6 +177,36 @@ mod tests {
         assert!(out.contains("[redis]"));
         assert!(out.contains("host = \"127.0.0.1\""));
         assert!(out.contains("port = 6379"));
+    }
+
+    #[test]
+    fn render_env() {
+        let r = Renderer;
+        let out = r.render(&sample(), Format::Env).unwrap();
+        assert!(out.contains("REDIS__HOST=127.0.0.1"), "{out}");
+        assert!(out.contains("REDIS__PORT=6379"), "{out}");
+        assert!(out.contains("REDIS__TLS=true"), "{out}");
+        assert!(out.contains("DB__PASSWORD=***"), "{out}"); // secret 掩码
+        // 顺序确定（BTreeMap 字典序：db < redis）
+        assert!(out.find("DB__").unwrap() < out.find("REDIS__").unwrap(), "{out}");
+    }
+
+    #[test]
+    fn render_env_quotes_special_values() {
+        let mut groups = BTreeMap::new();
+        groups.insert(
+            "app".into(),
+            BTreeMap::from([
+                ("greeting".into(), Value::String("hello world".into())),
+                ("flag".into(), Value::String("a#b".into())),
+                ("tags".into(), Value::Array(vec!["x".into(), "y".into()])),
+            ]),
+        );
+        let r = Renderer;
+        let out = r.render(&groups, Format::Env).unwrap();
+        assert!(out.contains("APP__GREETING=\"hello world\""), "{out}");
+        assert!(out.contains("APP__FLAG=\"a#b\""), "{out}");
+        assert!(out.contains("APP__TAGS=x,y"), "{out}");
     }
 
     #[test]
