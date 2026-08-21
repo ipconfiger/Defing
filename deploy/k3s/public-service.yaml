@@ -1,0 +1,19 @@
+# 数据面 + 管理面对外 Service。
+# 三种暴露方式取一（按环境）：
+#   A. ClusterIP（默认）+ ingress.yaml（域名/TLS，需 Traefik h2c 才能代理 gRPC）
+#   B. type: LoadBalancer → K3s ServiceLB 分配外部 IP（8384 HTTP / 8383 gRPC 直连）
+#   C. type: NodePort → 固定节点端口（裸机/无 LB）
+# 数据面（读/watch）任意节点可服务（stale 本地读 + watch raft 转发广播）；
+# 管理面写命中 follower 由服务端写转发中间件透明转发到 leader。
+apiVersion: v1
+kind: Service
+metadata:
+  name: defing-public
+  namespace: defing
+  labels: { app: defing }
+spec:
+  selector: { app: defing }
+  type: ClusterIP
+  ports:
+    - { name: http, port: 8384, targetPort: http }
+    - { name: grpc, port: 8383, targetPort: grpc }

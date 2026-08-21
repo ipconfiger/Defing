@@ -1,0 +1,15 @@
+# Headless Service：StatefulSet serviceName，为 Pod 提供稳定 DNS（defing-0..2）
+# raft 内部互访走 Pod 短主机名（同 namespace 经 search domain 解析），本 Service 不承载转发。
+apiVersion: v1
+kind: Service
+metadata:
+  name: defing
+  namespace: defing
+  labels: { app: defing }
+spec:
+  clusterIP: None
+  selector: { app: defing }
+  ports:
+    - { name: http, port: 8384, targetPort: http }
+    - { name: grpc, port: 8383, targetPort: grpc }
+    - { name: raft, port: 8385, targetPort: raft }

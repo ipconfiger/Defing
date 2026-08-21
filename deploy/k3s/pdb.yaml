@@ -1,0 +1,11 @@
+# PodDisruptionBudget：3 节点 quorum = ⌈3/2⌉ = 2，升级/驱逐最多同时下线 1 节点。
+# 扩容到 5 节点后改为 minAvailable: 3（⌈5/2⌉）。
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: defing-quorum
+  namespace: defing
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels: { app: defing }

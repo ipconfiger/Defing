@@ -1,0 +1,28 @@
+# 可选：Traefik Ingress（域名 + TLS）。
+# 注意：
+#   - gRPC（8383）经 Traefik 需要 HTTP/2 后端支持（h2c serversTransport）；若未配置，
+#     gRPC 客户端请直连 defing-public 的 LoadBalancer/NodePort（public-service.yaml 方式 B/C）。
+#   - 若启用，建议为 defing 配 --trusted-proxy（K3s flannel 默认 10.42.0.0/16）保证
+#     登录节流的 X-Forwarded-For 可信。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: defing
+  namespace: defing
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    # traefik.ingress.kubernetes.io/router.serversTransport: h2c@internal   # gRPC 需要
+spec:
+  rules:
+    - host: defing.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: defing-public
+                port: { name: http }
+  tls:
+    - hosts: [defing.example.com]
+      secretName: defing-tls   # cert-manager 或自签（K3s 默认无 cert-manager，需自装）

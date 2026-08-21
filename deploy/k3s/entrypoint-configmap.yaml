@@ -1,0 +1,45 @@
+# 启动脚本：按 StatefulSet ordinal 生成 --bootstrap-peers 静态成员表（首启建群），
+# 或对扩容节点（ordinal ≥ SEED_NODES）走 --join。
+# 关键设计（见 dev_docs/plan-k3s-deployment.md §5/§9.3）：
+#   - raft/http 监听地址绑 pod 短主机名（$HOSTNAME，/etc/hosts 可解析，免 DNS 启动竞争）；
+#     seed 本节点条目与 --http-addr/--raft-addr 字符串一致（dsh-cli 校验硬约束）；
+#   - --grpc-addr 必须 IP 字面量（dsh-cli parse::<SocketAddr>），gRPC 不落成员表；
+#   - 主密钥复制到 PVC 数据目录（ring 文件可写、持久 → 在线轮换可用）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: defing-entrypoint
+  namespace: defing
+data:
+  k3s-entrypoint.sh: |
+    #!/bin/sh
+    set -e
+    ORDINAL=$(printf '%s' "$HOSTNAME" | sed 's/.*-\([0-9]*\)$/\1/')
+    NODE_ID=$((ORDINAL + 1))
+    SEED_NODES=${SEED_NODES:-3}
+    HTTP_PORT=${HTTP_PORT:-8384}
+    RAFT_PORT=${RAFT_PORT:-8385}
+    GRPC_PORT=${GRPC_PORT:-8383}
+    DATA_DIR=${DATA_DIR:-/data}
+    KEY_FILE="$DATA_DIR/master.key"
+    cp /etc/defing/master.key "$KEY_FILE" && chmod 600 "$KEY_FILE"
+    CLUSTER_TOKEN=$(cat /etc/defing/cluster-token)
+    ADMIN_PASSWORD=$(cat /etc/defing/admin-password)
+
+    COMMON="--node-id $NODE_ID --data-dir $DATA_DIR --http-addr ${HOSTNAME}:${HTTP_PORT} \
+      --raft-addr ${HOSTNAME}:${RAFT_PORT} --grpc-addr 0.0.0.0:${GRPC_PORT} \
+      --admin-password $ADMIN_PASSWORD --master-key-file $KEY_FILE \
+      --join-token $CLUSTER_TOKEN --raft-token $CLUSTER_TOKEN"
+
+    if [ "$ORDINAL" -lt "$SEED_NODES" ]; then
+      SEED=""
+      i=0
+      while [ "$i" -lt "$SEED_NODES" ]; do
+        [ -n "$SEED" ] && SEED="$SEED,"
+        SEED="${SEED}$((i + 1))@defing-${i}:${RAFT_PORT}@defing-${i}:${HTTP_PORT}"
+        i=$((i + 1))
+      done
+      exec defing $COMMON --bootstrap-peers "$SEED"
+    else
+      exec defing $COMMON --join "http://defing-0:${HTTP_PORT}"
+    fi
