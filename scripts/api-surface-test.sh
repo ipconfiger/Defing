@@ -111,7 +111,7 @@ CODE=$(curl -s -H "$AUTH" -o /dev/null -w '%{http_code}' -X DELETE "$BASE/api/v1
 [ "$CODE" = "204" ] && echo "  project delete OK (204)" || { echo "  project delete FAIL $CODE"; exit 1; }
 curl -s -H "$AUTH" $BASE/api/v1/projects | python3 -c "import json,sys; assert json.load(sys.stdin)==[], sys.stdin.read()" && echo "  project gone OK"
 
-echo "== 11. secret 掩码策略（P0-b）：管理面/渲染/数据面默认掩码；reveal 需会话+审计 =="
+echo "== 11. secret 策略（P0-b）：管理面/快照掩码；渲染端点数据面 token 解密；reveal 审计 =="
 J -X POST $BASE/api/v1/projects -d '{"name":"mask-test"}' >/dev/null
 J -X PUT $BASE/api/v1/projects/mask-test/structure-draft -d '{"base_version":1,"groups":[{"name":"db","items":[{"key":"host","type":"string","required":true},{"key":"pass","type":"secret","secret":true}]}]}' >/dev/null
 J -X POST $BASE/api/v1/projects/mask-test/structure-draft/publish -d '{"comment":"s","request_id":"s1"}' >/dev/null
@@ -128,9 +128,9 @@ J $BASE/api/v1/audit | python3 -c "import json,sys; a=[x for x in json.load(sys.
 # 数据面 snapshot：secret 掩码
 C=$(DP $BASE/v1/projects/mask-test/branches/dev/snapshot)
 echo "$C" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['groups']['db']['pass']=='***', d" && echo "  snapshot 数据面掩码 OK"
-# 渲染端点：默认掩码（无会话）
+# 渲染端点（数据面 token）：secret 解密返回（构建脚本取真值，README「构建脚本取值」）
 R=$(DP "$BASE/v1/projects/mask-test/branches/dev/config?format=json")
-echo "$R" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['db']['pass']=='***', d" && echo "  render 默认掩码 OK"
+echo "$R" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['db']['pass']=='plainpass', d" && echo "  render 数据面 token 解密 OK"
 # 渲染端点 reveal=true 无会话 → 401
 CODE=$(curl -s -o /tmp/reveal-nosess.json -w '%{http_code}' "$BASE/v1/projects/mask-test/branches/dev/config?format=json&reveal=true")
 [ "$CODE" = "401" ] && echo "  render reveal 无会话 → 401 OK" || { echo "  render reveal guard FAIL $CODE: $(cat /tmp/reveal-nosess.json)"; exit 1; }

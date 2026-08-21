@@ -581,6 +581,27 @@ fn data_plane_authorized(app: &ApiState, req: &axum::extract::Request) -> bool {
     }
 }
 
+/// 数据面 reveal 审计身份：dev-single 开发 token → "data-plane:dev-single"；
+/// 项目访问令牌 → "data-plane:{token name}"；无法解析 → "data-plane"。
+fn data_plane_operator(app: &ApiState, req: &axum::extract::Request) -> String {
+    let Some(raw) = extract_data_token(req) else {
+        return "data-plane".into();
+    };
+    if let Some(dev) = &app.dev_token {
+        if raw == dev.as_ref() {
+            return "data-plane:dev-single".into();
+        }
+    }
+    let sm = match app.sm.read() {
+        Ok(s) => s,
+        Err(_) => return "data-plane".into(),
+    };
+    match sm.get_data_token(&dsh_core::token_hash(&raw)) {
+        Ok(Some(rec)) => format!("data-plane:{}", rec.name),
+        _ => "data-plane".into(),
+    }
+}
+
 /// 项目管理员授权矩阵（§4：默认拒绝、显式放行）。
 /// 返回 true=放行。全局管理员永远放行（调用方判断）。
 fn pa_allowed(principal: &dsh_core::Principal, method: &str, path: &str) -> bool {
@@ -680,10 +701,10 @@ async fn auth_middleware(
     } else if path.starts_with("/v1/") {
         // 项目访问令牌鉴权：/v1/projects/{p}/... 需该项目有效 token（Bearer 或 ?token=，
         // 后者兼容 SSE EventSource）；dev-single 开发 token 全局有效。无有效 token → 401。
-        // 例外①：渲染端点 + reveal=true → 走 handler 内会话鉴权（B2：PA 仅能 reveal 自己项目）。
-        // 例外②：渲染端点（掩码）→ 管理会话可查看（Admin 全项目 / PA 仅自己项目）——
-        //         Admin UI 配置预览用会话访问（数据面 token 化后回归修复），
-        //         掩码输出与会话可访问的 /api/v1/.../config 掩码 JSON 同级。
+        // 例外①：渲染端点 + reveal=true → 走 handler 内鉴权（会话或数据面 token，B2：PA 仅能 reveal 自己项目）。
+        // 例外②：渲染端点（掩码/数据面解密）→ 管理会话可查看（Admin 全项目 / PA 仅自己项目）——
+        //         Admin UI 配置预览用会话访问（数据面 token 化后回归修复）；
+        //         数据面 token 授权下 handler 默认解密 secret（构建脚本取真值，README「构建脚本取值」）。
         let is_render = path.ends_with("/config");
         let reveal_render = is_render
             && req
@@ -2510,7 +2531,9 @@ fn default_format() -> String {
 }
 
 /// 渲染配置文档（GET /v1/projects/{p}/branches/{b}/config?format=&version=&reveal=）。
-/// secret 默认掩码（渲染器对密文输出 "***"）；reveal=true 需管理员会话（Bearer）+ 审计。
+/// secret 策略：管理会话 → 默认掩码、reveal=true 解密（审计）；
+/// 数据面项目 token 授权（构建脚本取值，README「构建脚本取值（curl）」）→ **默认解密**（token 即机器凭据）。
+/// SDK 快照（/snapshot、gRPC）保持恒掩码（proto masked 语义）。
 async fn render_config(
     State(app): State<ApiState>,
     AxumPath((pid, branch)): AxumPath<(String, String)>,
@@ -2530,8 +2553,8 @@ async fn render_config(
     })?;
     // G3/D28（Q6）：管理面渲染——明确**不接身份**（不 resolve 灰度）。管理员看到的是
     // 稳定客户端所见（version=0 → active）；要看灰度明文须显式传版本号（G4 gray-status）。
-    // reveal=true：校验管理面会话（本端点不在 /api/v1 鉴权中间件覆盖内，手动校验）。
-    // B2 修复：走共享 resolve_principal（与中间件同一实现，N15），PA 只能 reveal 自己项目。
+    // reveal=true：校验管理面会话（本端点不在 /api/v1 鉴权中间件覆盖内，手动校验）；
+    // 或数据面项目 token 授权（构建脚本取真值，B2：PA 只能 reveal 自己项目）。
     // 区分两种失败：无有效会话 → 401；已认证但越权 → 403。
     let principal = resolve_principal(
         &app,
@@ -2544,13 +2567,15 @@ async fn render_config(
         Ok(dsh_core::Principal::ProjectAdmin { project, .. }) => project.0 == pid,
         Err(_) => false,
     };
-    if q.reveal {
+    // 数据面授权：dev token 全局有效；项目访问令牌须匹配本项目（单次 KV 读）
+    let data_ok = data_plane_authorized(&app, &req);
+    if q.reveal && !data_ok {
         if principal.is_err() {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 Json(ApiErrorBody {
                     code: "ERR_SESSION_EXPIRED".into(),
-                    message: "reveal=true 需要管理员会话".into(),
+                    message: "reveal=true 需要管理员会话或本项目数据面 token".into(),
                     detail: None,
                 }),
             ));
@@ -2566,7 +2591,8 @@ async fn render_config(
             ));
         }
     }
-    let _ = session_ok;
+    // 数据面 token 授权（构建脚本）：无论 reveal 标记，secret 解密返回
+    let reveal = q.reveal || data_ok;
     let (version, mut groups) = {
         let sm = app.sm.read().map_err(lock_err)?;
         let snap = sm
@@ -2578,8 +2604,13 @@ async fn render_config(
             .map_err(ApiError::from)?;
         (snap.version, snap.groups)
     };
-    apply_secret_policy(&mut groups, app.cipher.as_deref(), q.reveal);
-    if q.reveal {
+    apply_secret_policy(&mut groups, app.cipher.as_deref(), reveal);
+    if reveal {
+        // 审计 operator：会话 principal；数据面 → 项目 token 名（dev-single 开发 token → data-plane:dev-single）
+        let operator = match &principal {
+            Ok(p) => principal_op(p),
+            Err(_) => data_plane_operator(&app, &req),
+        };
         app.audit
             .append(
                 "config_reveal",
@@ -2587,11 +2618,8 @@ async fn render_config(
                 Some(branch.clone()),
                 Some(version),
                 None,
-                serde_json::json!({ "format": q.format }),
-                &principal
-                    .as_ref()
-                    .map(principal_op)
-                    .unwrap_or_else(|_| "admin".to_string()),
+                serde_json::json!({ "format": q.format, "via": if data_ok { "data-plane" } else { "session" } }),
+                &operator,
             )
             .await;
     }

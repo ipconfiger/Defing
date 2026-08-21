@@ -66,14 +66,15 @@ gRPC 契约测试：`bash scripts/sdk-grpc-contract-test.sh`（依赖：npm inst
 
 ### 构建脚本取值（curl，无需 SDK）
 
-编译/构建脚本可预先拉取指定分支的配置（纯 HTTP，输出 yaml/json/toml 任意格式，带项目访问令牌鉴权）：
+编译/构建脚本可预先拉取指定分支的配置（纯 HTTP，输出 yaml/json/toml/env 任意格式，带项目访问令牌鉴权）：
+**项目访问令牌即机器凭据，持有者可读取该项目的全部配置明文（含 secret 解密值）** —— 请妥善保管令牌。
 
 ```bash
-# 拉取 my-app 项目 dev 分支的 YAML 配置（Bearer 鉴权）
+# 拉取 my-app 项目 dev 分支的 YAML 配置（Bearer 鉴权；secret 解密返回）
 curl -s "http://<host>:8384/v1/projects/my-app/branches/dev/config?format=yaml" \
   -H "Authorization: Bearer <项目访问令牌>"
 
-# 或查询参数鉴权（URL 会含令牌，注意保管）：
+# 或查询参数鉴权（URL 会含令牌，注意保管——URL 可能进入代理/日志）：
 curl -s "http://<host>:8384/v1/projects/my-app/branches/dev/config?format=json&token=<项目访问令牌>"
 
 # 输出 .env 文件（可直接重定向保存）：KEY=VALUE，键大写，无分组前缀
@@ -85,6 +86,7 @@ curl -s "http://<host>:8384/v1/projects/my-app/branches/dev/config?format=env" \
 
 项目访问令牌在 Admin UI 项目页「访问令牌」Tab 创建（仅全局管理员，明文仅创建时展示一次）；
 该 Tab 同时展示当前项目的可复制 curl 命令。
+> 说明：渲染端点（/config）对数据面 token 授权请求默认解密 secret；SDK 快照（/snapshot、gRPC）保持恒掩码（proto masked 语义），如需明文请走 /config。
 
 ## 核心能力
 
