@@ -363,6 +363,8 @@ async fn admin_index() -> axum::response::Response {
     match AdminAssets::get("index.html") {
         Some(f) => axum::response::Response::builder()
             .header("content-type", "text/html; charset=utf-8")
+            // admin 资源禁用缓存：UI 随二进制版本演进，浏览器缓存旧 JS 会造成「更新后仍显示旧界面」
+            .header("cache-control", "no-store")
             .body(axum::body::Body::from(f.data.into_owned()))
             .expect("admin index"),
         None => axum::response::Response::builder()
@@ -393,6 +395,8 @@ async fn admin_static(
             };
             axum::response::Response::builder()
                 .header("content-type", ct)
+                // admin 资源禁用缓存（同上：避免浏览器缓存旧 JS 导致界面与二进制版本脱节）
+                .header("cache-control", "no-store")
                 .body(axum::body::Body::from(f.data.into_owned()))
                 .expect("asset")
         }
