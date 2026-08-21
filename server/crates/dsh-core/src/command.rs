@@ -14,7 +14,16 @@ pub struct DraftUpdateItem {
     pub value: Value,
 }
 
-/// 状态机写命令（M1 子集；M2 追加 Rollback/SharedPublish/Promote/会话命令；共享引用内嵌 ItemDef.shared_ref）。
+/// 分支级共享引用绑定条目（DraftUpdate 载荷；shared_key 空串 = 解除绑定）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SharedBinding {
+    pub group: String,
+    pub key: String,
+    pub shared_key: String,
+}
+
+/// 状态机写命令（M1 子集；M2 追加 Rollback/SharedPublish/Promote/会话命令；共享引用选择在分支
+/// BranchState.shared_bindings，结构仅声明 ItemDef.shared 标记——设计 shared-ref-branch-scope）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Command {
     ProjectCreate {
@@ -79,6 +88,9 @@ pub enum Command {
         updates: Vec<DraftUpdateItem>,
         /// 待删除 item："group/key"
         deletes: Vec<(String, String)>,
+        /// 分支级共享引用绑定 upsert/解除（空 shared_key = 解除）；旧日志无此字段 → 空（兼容）。
+        #[serde(default)]
+        shared_bindings: Vec<SharedBinding>,
         #[serde(default)]
         operator: String,
         /// 墙钟 ms（API 层注入；0 = 回退 apply 的 now_ms 参数，旧日志重放兼容）

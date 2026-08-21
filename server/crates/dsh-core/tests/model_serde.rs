@@ -43,7 +43,7 @@ fn structure_golden_matches_schema_shape() {
                     secret: false,
                     validate: None,
                     description: None,
-                    shared_ref: None,
+                    shared: false,
                 },
                 ItemDef {
                     key: "password".into(),
@@ -52,7 +52,7 @@ fn structure_golden_matches_schema_shape() {
                     secret: true,
                     validate: None,
                     description: Some("口令".into()),
-                    shared_ref: None,
+                    shared: false,
                 },
             ],
         }],

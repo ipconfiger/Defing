@@ -1,6 +1,6 @@
 //! 状态机流程测试（M1）：CRUD / 结构发布 / 值草稿 / 发布 / GetConfig / 幂等 / 隔离。
 
-use dsh_core::command::{Command, DraftUpdateItem};
+use dsh_core::command::{Command, DraftUpdateItem, SharedBinding};
 use dsh_core::model::*;
 use dsh_core::{ClientCtx, ErrorKind, InMemoryStore, ResolvedVersion, StateMachine, Value};
 use std::collections::BTreeMap;
@@ -20,7 +20,7 @@ fn redis_structure() -> Vec<GroupDef> {
                 secret: false,
                 validate: None,
                 description: None,
-                shared_ref: None,
+                shared: false,
             },
             ItemDef {
                 key: "port".into(),
@@ -29,7 +29,7 @@ fn redis_structure() -> Vec<GroupDef> {
                 secret: false,
                 validate: None,
                 description: None,
-                shared_ref: None,
+                shared: false,
             },
             ItemDef {
                 key: "password".into(),
@@ -38,7 +38,7 @@ fn redis_structure() -> Vec<GroupDef> {
                 secret: true,
                 validate: None,
                 description: None,
-                shared_ref: None,
+                shared: false,
             },
         ],
     }]
@@ -112,6 +112,7 @@ fn full_flow_dev_publish() {
                     },
                 ],
                 deletes: vec![],
+                shared_bindings: vec![],
                 operator: String::new(),
                 ts: 0,
                 expected_draft_rev: None,
@@ -175,6 +176,7 @@ fn publish_is_idempotent_by_request_id() {
                 value: Value::String("x".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
 
             operator: String::new(),
             ts: 0,
@@ -217,6 +219,7 @@ fn required_unset_blocks_publish() {
                 value: Value::Int(6379),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
 
             operator: String::new(),
             ts: 0,
@@ -280,6 +283,7 @@ fn branch_inherits_structure_and_values() {
                 value: Value::String("10.0.0.1".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
 
             operator: String::new(),
             ts: 0,
@@ -342,6 +346,7 @@ fn draft_update_validates_unknown_item_and_type() {
                     value: Value::String("x".into()),
                 }],
                 deletes: vec![],
+                shared_bindings: vec![],
                 operator: String::new(),
                 ts: 0,
                 expected_draft_rev: None,
@@ -362,6 +367,7 @@ fn draft_update_validates_unknown_item_and_type() {
                     value: Value::String("abc".into()),
                 }],
                 deletes: vec![],
+                shared_bindings: vec![],
                 operator: String::new(),
                 ts: 0,
                 expected_draft_rev: None,
@@ -451,6 +457,7 @@ fn rollback_creates_new_version_with_old_content() {
                 value: Value::String("10.0.0.9".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
 
             operator: String::new(),
             ts: 0,
@@ -604,7 +611,7 @@ fn struct_with_shared_ref() -> Vec<GroupDef> {
             secret: false,
             validate: None,
             description: Some("数据库地址（共享）".into()),
-            shared_ref: Some("db_host".into()),
+            shared: true,
         }],
     });
     groups
@@ -640,7 +647,7 @@ fn shared_ref_materializes_and_cascades() {
     )
     .unwrap();
 
-    // 分支发布（dev：只填 redis/host）→ db/host 由共享物化
+    // 分支发布（dev：只填 redis/host + 绑定 db/host → db_host）→ db/host 由共享物化
     s.apply(
         &Command::DraftUpdate {
             project: pid.clone(),
@@ -651,6 +658,11 @@ fn shared_ref_materializes_and_cascades() {
                 value: Value::String("127.0.0.1".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![SharedBinding {
+                group: "db".into(),
+                key: "host".into(),
+                shared_key: "db_host".into(),
+            }],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -728,6 +740,7 @@ fn shared_ref_rejects_local_draft_value() {
                     value: Value::String("local".into()),
                 }],
                 deletes: vec![],
+                shared_bindings: vec![],
                 operator: String::new(),
                 ts: 0,
                 expected_draft_rev: None,
@@ -754,7 +767,7 @@ fn structure_publish_cleans_draft_of_shared_ref_items() {
             secret: false,
             validate: None,
             description: None,
-            shared_ref: None,
+            shared: false,
         }],
     });
     s.apply(
@@ -789,6 +802,7 @@ fn structure_publish_cleans_draft_of_shared_ref_items() {
                 value: Value::String("local".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -836,39 +850,57 @@ fn structure_publish_cleans_draft_of_shared_ref_items() {
 }
 
 #[test]
-fn dangling_shared_ref_rejected_at_structure_draft() {
+fn binding_missing_shared_item_rejected() {
     let mut s = sm();
     let (pid, _) = setup(&mut s);
-    // 引用未发布的共享项 → 结构草稿保存即拒（替代旧 ref_requires_published_shared）
-    let mut groups = redis_structure();
-    groups.push(GroupDef {
-        name: "db".into(),
-        items: vec![ItemDef {
-            key: "host".into(),
-            ty: ValueType::String,
-            required: false,
-            secret: false,
-            validate: None,
-            description: None,
-            shared_ref: Some("nope".into()),
-        }],
-    });
+    // 结构标记 shared=true 保存/发布均成功（选择在分支，结构不再校验共享项存在性）
+    s.apply(
+        &Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: 2,
+            groups: struct_with_shared_ref(),
+            operator: String::new(),
+        },
+        12,
+    )
+    .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "s".into(),
+            request_id: "s2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        13,
+    )
+    .unwrap();
+    // 分支绑定未发布的共享项 → DraftUpdate 校验拒绝
     let err = s
         .apply(
-            &Command::StructureDraftSet {
+            &Command::DraftUpdate {
                 project: pid.clone(),
-                base_version: 2,
-                groups,
+                branch: BranchName("dev".into()),
+                updates: vec![],
+                deletes: vec![],
+                shared_bindings: vec![SharedBinding {
+                    group: "db".into(),
+                    key: "host".into(),
+                    shared_key: "nope".into(),
+                }],
                 operator: String::new(),
+                ts: 0,
+                expected_draft_rev: None,
             },
-            12,
+            15,
         )
         .unwrap_err();
     assert_eq!(err.kind, ErrorKind::Validation);
 }
 
 #[test]
-fn shared_ref_type_mismatch_rejected() {
+fn binding_type_mismatch_rejected() {
     let mut s = sm();
     publish_shared(&mut s, "db_port", Value::Int(5432), "sp1");
     let (pid, _) = setup(&mut s);
@@ -882,25 +914,56 @@ fn shared_ref_type_mismatch_rejected() {
             secret: false,
             validate: None,
             description: None,
-            shared_ref: Some("db_port".into()),
+            shared: true,
         }],
     });
+    s.apply(
+        &Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: 2,
+            groups,
+            operator: String::new(),
+        },
+        12,
+    )
+    .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "s".into(),
+            request_id: "s2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        13,
+    )
+    .unwrap();
+    // 分支绑定类型不一致的共享项 → DraftUpdate 校验拒绝
     let err = s
         .apply(
-            &Command::StructureDraftSet {
+            &Command::DraftUpdate {
                 project: pid.clone(),
-                base_version: 2,
-                groups,
+                branch: BranchName("dev".into()),
+                updates: vec![],
+                deletes: vec![],
+                shared_bindings: vec![SharedBinding {
+                    group: "db".into(),
+                    key: "port".into(),
+                    shared_key: "db_port".into(),
+                }],
                 operator: String::new(),
+                ts: 0,
+                expected_draft_rev: None,
             },
-            12,
+            15,
         )
         .unwrap_err();
     assert_eq!(err.kind, ErrorKind::Validation);
 }
 
 #[test]
-fn shared_delete_blocks_when_referenced() {
+fn shared_delete_blocks_when_bound() {
     let mut s = sm();
     publish_shared(&mut s, "db_host", Value::String("sh".into()), "sp1");
     let (pid, _) = setup(&mut s);
@@ -926,14 +989,42 @@ fn shared_delete_blocks_when_referenced() {
         13,
     )
     .unwrap();
-    // 被项目结构引用 → Conflict（列出引用方）
+    // 结构标记 shared 但不绑定 → 删除仍成功（引用保护发生在分支绑定层）
+    s.apply(
+        &Command::SharedDelete {
+            key: "db_host".into(),
+            operator: String::new(),
+        },
+        14,
+    )
+    .unwrap();
+    // 重新发布共享项 + 分支绑定 → 删除被拒（Conflict，detail 含分支）
+    publish_shared(&mut s, "db_host", Value::String("sh".into()), "sp2");
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: BranchName("dev".into()),
+            updates: vec![],
+            deletes: vec![],
+            shared_bindings: vec![SharedBinding {
+                group: "db".into(),
+                key: "host".into(),
+                shared_key: "db_host".into(),
+            }],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        15,
+    )
+    .unwrap();
     let err = s
         .apply(
             &Command::SharedDelete {
                 key: "db_host".into(),
                 operator: String::new(),
             },
-            15,
+            16,
         )
         .unwrap_err();
     assert_eq!(err.kind, ErrorKind::Conflict);
@@ -1004,12 +1095,861 @@ fn shared_usage_reverse_mapping() {
         13,
     )
     .unwrap();
+    // 仅结构标记不产生反向引用；dev 分支绑定后命中
+    assert!(s.shared_usage("db_host").unwrap().is_empty());
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: BranchName("dev".into()),
+            updates: vec![],
+            deletes: vec![],
+            shared_bindings: vec![SharedBinding {
+                group: "db".into(),
+                key: "host".into(),
+                shared_key: "db_host".into(),
+            }],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        15,
+    )
+    .unwrap();
     let usage = s.shared_usage("db_host").unwrap();
     assert_eq!(usage.len(), 1);
     assert_eq!(usage[0].0, pid);
-    assert_eq!(usage[0].1, "db");
-    assert_eq!(usage[0].2, "host");
+    assert_eq!(usage[0].1, BranchName("dev".into()));
+    assert_eq!(usage[0].2, "db");
+    assert_eq!(usage[0].3, "host");
 }
+// ---------------- 分支级共享引用（shared-ref branch-scope） ----------------
+
+/// 核心场景：结构声明 shared=true，dev 绑 A、prod 绑 B → 各自发布 → 快照值不同。
+#[test]
+fn branch_scoped_binding_differs() {
+    let mut s = sm();
+    publish_shared(&mut s, "db_a", Value::String("dev-db".into()), "sp1");
+    publish_shared(&mut s, "db_b", Value::String("prod-db".into()), "sp2");
+    let (pid, _) = setup(&mut s);
+    // 结构 v2：redis/host 标记引用共享（type String）
+    let mut groups = redis_structure();
+    for g in &mut groups {
+        for item in &mut g.items {
+            if item.key == "host" {
+                item.shared = true;
+            }
+        }
+    }
+    s.apply(
+        &Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: 2,
+            groups,
+            operator: String::new(),
+        },
+        12,
+    )
+    .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "s".into(),
+            request_id: "s2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        13,
+    )
+    .unwrap();
+    // dev 绑 db_a、prod 绑 db_b（同结构 item，不同分支不同选择）
+    let dev = BranchName("dev".into());
+    let prod = BranchName("prod".into());
+    for (b, rk) in [(&dev, "db_a"), (&prod, "db_b")] {
+        s.apply(
+            &Command::DraftUpdate {
+                project: pid.clone(),
+                branch: b.clone(),
+                updates: vec![DraftUpdateItem {
+                    group: "redis".into(),
+                    key: "port".into(),
+                    value: Value::Int(6379),
+                }],
+                deletes: vec![],
+                shared_bindings: vec![SharedBinding {
+                    group: "redis".into(),
+                    key: "host".into(),
+                    shared_key: rk.into(),
+                }],
+                operator: String::new(),
+                ts: 0,
+                expected_draft_rev: None,
+            },
+            15,
+        )
+        .unwrap();
+        s.apply(
+            &Command::Publish {
+                project: pid.clone(),
+                branch: b.clone(),
+                comment: "v".into(),
+                request_id: "r1".into(),
+                operator: String::new(),
+                ts: 0,
+                policy: PublishPolicy::Block,
+            },
+            16,
+        )
+        .unwrap();
+    }
+    let dev_cfg = s.get_config(&pid, &dev, 0).unwrap();
+    let prod_cfg = s.get_config(&pid, &prod, 0).unwrap();
+    assert_eq!(
+        dev_cfg.groups["redis"]["host"],
+        Value::String("dev-db".into()),
+        "dev 取 db_a"
+    );
+    assert_eq!(
+        prod_cfg.groups["redis"]["host"],
+        Value::String("prod-db".into()),
+        "prod 取 db_b"
+    );
+}
+
+/// 未绑定 shared 项：Block 拒绝发布（明细列出），Warn 记录继续（快照不含该项）。
+#[test]
+fn shared_item_unbound_blocks_publish() {
+    let mut s = sm();
+    let (pid, _) = setup(&mut s);
+    let dev = BranchName("dev".into());
+    let mut groups = redis_structure();
+    for g in &mut groups {
+        for item in &mut g.items {
+            if item.key == "host" {
+                item.shared = true;
+            }
+        }
+    }
+    s.apply(
+        &Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: 2,
+            groups,
+            operator: String::new(),
+        },
+        12,
+    )
+    .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "s".into(),
+            request_id: "s2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        13,
+    )
+    .unwrap();
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "redis".into(),
+                key: "port".into(),
+                value: Value::Int(6379),
+            }],
+            deletes: vec![],
+            shared_bindings: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        15,
+    )
+    .unwrap();
+    // Block：未选择引用共享项 → 发布阻断
+    let err = s
+        .apply(
+            &Command::Publish {
+                project: pid.clone(),
+                branch: dev.clone(),
+                comment: "v".into(),
+                request_id: "r1".into(),
+                operator: String::new(),
+                ts: 0,
+                policy: PublishPolicy::Block,
+            },
+            16,
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::PublishBlocked);
+    let detail = err.detail.as_ref().expect("detail 携带明细");
+    let joined = serde_json::to_string(detail).unwrap();
+    assert!(joined.contains("未选择引用共享项"), "{joined}");
+    // Warn：记录继续发布，快照不含该 shared 项
+    s.apply(
+        &Command::Publish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            comment: "v".into(),
+            request_id: "r2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Warn,
+        },
+        17,
+    )
+    .unwrap();
+    let cfg = s.get_config(&pid, &dev, 0).unwrap();
+    assert!(!cfg.groups["redis"].contains_key("host"), "Warn 快照不含未绑定项");
+}
+
+/// 绑定类型不一致 → DraftUpdate 拒绝（绑定时校验，非发布期）。
+#[test]
+fn binding_type_mismatch_rejected_at_binding() {
+    let mut s = sm();
+    publish_shared(&mut s, "db_port", Value::Int(5432), "sp1");
+    let (pid, _) = setup(&mut s);
+    let dev = BranchName("dev".into());
+    let mut groups = redis_structure();
+    groups.push(GroupDef {
+        name: "db".into(),
+        items: vec![ItemDef {
+            key: "host".into(),
+            ty: ValueType::String,
+            required: false,
+            secret: false,
+            validate: None,
+            description: None,
+            shared: true,
+        }],
+    });
+    s.apply(
+        &Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: 2,
+            groups,
+            operator: String::new(),
+        },
+        12,
+    )
+    .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "s".into(),
+            request_id: "s2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        13,
+    )
+    .unwrap();
+    // 未发布共享项 → 拒
+    let err = s
+        .apply(
+            &Command::DraftUpdate {
+                project: pid.clone(),
+                branch: dev.clone(),
+                updates: vec![],
+                deletes: vec![],
+                shared_bindings: vec![SharedBinding {
+                    group: "db".into(),
+                    key: "host".into(),
+                    shared_key: "nope".into(),
+                }],
+                operator: String::new(),
+                ts: 0,
+                expected_draft_rev: None,
+            },
+            15,
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Validation);
+    // 类型不一致 → 拒
+    let err = s
+        .apply(
+            &Command::DraftUpdate {
+                project: pid.clone(),
+                branch: dev.clone(),
+                updates: vec![],
+                deletes: vec![],
+                shared_bindings: vec![SharedBinding {
+                    group: "db".into(),
+                    key: "host".into(),
+                    shared_key: "db_port".into(),
+                }],
+                operator: String::new(),
+                ts: 0,
+                expected_draft_rev: None,
+            },
+            16,
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Validation);
+}
+
+/// 守卫：只改绑定（无值草稿）也可发布；再次发布无变更 → NoDraft。
+#[test]
+fn binding_only_publish_allowed() {
+    let mut s = sm();
+    publish_shared(&mut s, "db_host", Value::String("sh".into()), "sp1");
+    let (pid, _) = setup(&mut s);
+    let dev = BranchName("dev".into());
+    // redis 组本地项全 optional（草稿=全量状态，绑定-only 发布不允许必填未设）
+    let mut groups = redis_structure();
+    for g in &mut groups {
+        for item in &mut g.items {
+            item.required = false;
+        }
+    }
+    groups.push(GroupDef {
+        name: "db".into(),
+        items: vec![ItemDef {
+            key: "host".into(),
+            ty: ValueType::String,
+            required: false,
+            secret: false,
+            validate: None,
+            description: Some("数据库地址（共享）".into()),
+            shared: true,
+        }],
+    });
+    s.apply(
+        &Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: 2,
+            groups,
+            operator: String::new(),
+        },
+        12,
+    )
+    .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "s".into(),
+            request_id: "s2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        13,
+    )
+    .unwrap();
+    // 只改绑定（updates 空）→ 发布成功（守卫放行 bindings_dirty）
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![],
+            deletes: vec![],
+            shared_bindings: vec![SharedBinding {
+                group: "db".into(),
+                key: "host".into(),
+                shared_key: "db_host".into(),
+            }],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        15,
+    )
+    .unwrap();
+    let st = s.get_branch_state(&pid, &dev).unwrap().unwrap();
+    assert!(st.bindings_dirty, "绑定变更 → 脏标记");
+    s.apply(
+        &Command::Publish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            comment: "v".into(),
+            request_id: "r1".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        16,
+    )
+    .unwrap();
+    let st = s.get_branch_state(&pid, &dev).unwrap().unwrap();
+    assert!(!st.bindings_dirty, "发布后脏标记复位");
+    assert!(
+        st.shared_bindings["db"].contains_key("host"),
+        "绑定跨发布持久化"
+    );
+    // 再次发布（无值无绑定变更）→ NoDraft
+    let err = s
+        .apply(
+            &Command::Publish {
+                project: pid.clone(),
+                branch: dev.clone(),
+                comment: "v2".into(),
+                request_id: "r2".into(),
+                operator: String::new(),
+                ts: 0,
+                policy: PublishPolicy::Block,
+            },
+            17,
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::NoDraft);
+}
+
+/// 绑定跨发布持久化：值草稿发布后绑定仍在，下次物化继续生效。
+#[test]
+fn bindings_persist_after_publish() {
+    let mut s = sm();
+    publish_shared(&mut s, "db_host", Value::String("sh1".into()), "sp1");
+    let (pid, _) = setup(&mut s);
+    let dev = BranchName("dev".into());
+    s.apply(
+        &Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: 2,
+            groups: struct_with_shared_ref(),
+            operator: String::new(),
+        },
+        12,
+    )
+    .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "s".into(),
+            request_id: "s2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        13,
+    )
+    .unwrap();
+    // 第一次发布：值 + 绑定
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "redis".into(),
+                key: "host".into(),
+                value: Value::String("127.0.0.1".into()),
+            }],
+            deletes: vec![],
+            shared_bindings: vec![SharedBinding {
+                group: "db".into(),
+                key: "host".into(),
+                shared_key: "db_host".into(),
+            }],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        15,
+    )
+    .unwrap();
+    s.apply(
+        &Command::Publish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            comment: "v1".into(),
+            request_id: "r1".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        16,
+    )
+    .unwrap();
+    // 共享项更新（Auto 级联会推进 dev）→ 改 Manual 只更共享版本，验证绑定持久化后的下次发布
+    s.apply(
+        &Command::SharedDraftUpdate {
+            item: SharedItem {
+                key: "db_host".into(),
+                ty: ValueType::String,
+                secret: false,
+                required: false,
+                value: Value::String("sh2".into()),
+                version: 1,
+                description: None,
+            },
+            operator: String::new(),
+        },
+        17,
+    )
+    .unwrap();
+    s.apply(
+        &Command::SharedPublish {
+            comment: "v2".into(),
+            request_id: "sp2".into(),
+            operator: String::new(),
+            ts: 0,
+            cascade: SharedCascadeMode::Manual,
+            policy: PublishPolicy::Block,
+        },
+        18,
+    )
+    .unwrap();
+    // 值草稿变更 + 发布 → 物化仍读绑定（sh2），绑定未丢
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![
+                DraftUpdateItem {
+                    group: "redis".into(),
+                    key: "host".into(),
+                    value: Value::String("127.0.0.1".into()),
+                },
+                DraftUpdateItem {
+                    group: "redis".into(),
+                    key: "port".into(),
+                    value: Value::Int(6379),
+                },
+            ],
+            deletes: vec![],
+            shared_bindings: vec![],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        19,
+    )
+    .unwrap();
+    s.apply(
+        &Command::Publish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            comment: "v3".into(),
+            request_id: "r2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        20,
+    )
+    .unwrap();
+    let cfg = s.get_config(&pid, &dev, 0).unwrap();
+    assert_eq!(
+        cfg.groups["db"]["host"],
+        Value::String("sh2".into()),
+        "绑定持久化：下次发布物化新共享值"
+    );
+}
+
+/// 结构发布清理绑定：删除 item / shared→local 翻转 / ty 变更 → 绑定丢弃。
+#[test]
+fn structure_publish_cleans_bindings() {
+    let mut s = sm();
+    publish_shared(&mut s, "db_host", Value::String("sh".into()), "sp1");
+    publish_shared(&mut s, "db_port", Value::Int(5432), "sp2");
+    let (pid, _) = setup(&mut s);
+    let dev = BranchName("dev".into());
+    // v2：db 组 host(shared) + port(shared, String 声明)
+    let mut g2 = redis_structure();
+    g2.push(GroupDef {
+        name: "db".into(),
+        items: vec![
+            ItemDef {
+                key: "host".into(),
+                ty: ValueType::String,
+                required: false,
+                secret: false,
+                validate: None,
+                description: None,
+                shared: true,
+            },
+            ItemDef {
+                key: "port".into(),
+                ty: ValueType::String,
+                required: false,
+                secret: false,
+                validate: None,
+                description: None,
+                shared: true,
+            },
+        ],
+    });
+    s.apply(
+        &Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: 2,
+            groups: g2,
+            operator: String::new(),
+        },
+        12,
+    )
+    .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "s".into(),
+            request_id: "s2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        13,
+    )
+    .unwrap();
+    // dev 绑定 host→db_host；port 声明 String 无法绑 int 的 db_port（校验即拒），跳过
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![],
+            deletes: vec![],
+            shared_bindings: vec![SharedBinding {
+                group: "db".into(),
+                key: "host".into(),
+                shared_key: "db_host".into(),
+            }],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        15,
+    )
+    .unwrap();
+    assert!(s
+        .get_branch_state(&pid, &dev)
+        .unwrap()
+        .unwrap()
+        .shared_bindings["db"]
+        .contains_key("host"));
+    // v3：db/host 改本地项（shared→local 翻转）→ 发布后绑定被清
+    let mut g3 = redis_structure();
+    g3.push(GroupDef {
+        name: "db".into(),
+        items: vec![ItemDef {
+            key: "host".into(),
+            ty: ValueType::String,
+            required: false,
+            secret: false,
+            validate: None,
+            description: None,
+            shared: false,
+        }],
+    });
+    s.apply(
+        &Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: 3,
+            groups: g3,
+            operator: String::new(),
+        },
+        16,
+    )
+    .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "s".into(),
+            request_id: "s3".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        17,
+    )
+    .unwrap();
+    let st = s.get_branch_state(&pid, &dev).unwrap().unwrap();
+    assert!(
+        !st.shared_bindings.contains_key("db"),
+        "shared→local 翻转 → 绑定被清"
+    );
+}
+
+/// 共享发布级联：仅推进绑定该共享项的分支，未绑定分支版本不变。
+#[test]
+fn shared_publish_cascades_only_bound_branches() {
+    let mut s = sm();
+    publish_shared(&mut s, "db_host", Value::String("sh1".into()), "sp1");
+    let (pid, _) = setup(&mut s);
+    let dev = BranchName("dev".into());
+    let prod = BranchName("prod".into());
+    s.apply(
+        &Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: 2,
+            groups: struct_with_shared_ref(),
+            operator: String::new(),
+        },
+        12,
+    )
+    .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "s".into(),
+            request_id: "s2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        13,
+    )
+    .unwrap();
+    // dev 绑定并发布；prod 不绑定
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![
+                DraftUpdateItem {
+                    group: "redis".into(),
+                    key: "host".into(),
+                    value: Value::String("127.0.0.1".into()),
+                },
+                DraftUpdateItem {
+                    group: "redis".into(),
+                    key: "port".into(),
+                    value: Value::Int(6379),
+                },
+            ],
+            deletes: vec![],
+            shared_bindings: vec![SharedBinding {
+                group: "db".into(),
+                key: "host".into(),
+                shared_key: "db_host".into(),
+            }],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        15,
+    )
+    .unwrap();
+    s.apply(
+        &Command::Publish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            comment: "v1".into(),
+            request_id: "r1".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        16,
+    )
+    .unwrap();
+    let prod_ver_before = s
+        .get_branch_state(&pid, &prod)
+        .unwrap()
+        .unwrap()
+        .active_version;
+    // 共享项更新 → Auto 级联只推进 dev
+    publish_shared(&mut s, "db_host", Value::String("sh2".into()), "sp2");
+    let dev_after = s.get_config(&pid, &dev, 0).unwrap();
+    assert_eq!(
+        dev_after.groups["db"]["host"],
+        Value::String("sh2".into()),
+        "dev 级联取新值"
+    );
+    let prod_ver_after = s
+        .get_branch_state(&pid, &prod)
+        .unwrap()
+        .unwrap()
+        .active_version;
+    assert_eq!(prod_ver_before, prod_ver_after, "prod 未绑定 → 版本不变");
+}
+
+/// 分支创建(source)：跳过 shared 项的值复制 + 继承源分支绑定。
+#[test]
+fn branch_create_source_skips_shared_and_inherits_bindings() {
+    let mut s = sm();
+    publish_shared(&mut s, "db_host", Value::String("sh".into()), "sp1");
+    let (pid, _) = setup(&mut s);
+    let dev = BranchName("dev".into());
+    let staging = BranchName("staging".into());
+    s.apply(
+        &Command::StructureDraftSet {
+            project: pid.clone(),
+            base_version: 2,
+            groups: struct_with_shared_ref(),
+            operator: String::new(),
+        },
+        12,
+    )
+    .unwrap();
+    s.apply(
+        &Command::PublishStructure {
+            project: pid.clone(),
+            comment: "s".into(),
+            request_id: "s2".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        13,
+    )
+    .unwrap();
+    // dev：写 redis/host 值 + 绑定 db/host → 发布
+    s.apply(
+        &Command::DraftUpdate {
+            project: pid.clone(),
+            branch: dev.clone(),
+            updates: vec![DraftUpdateItem {
+                group: "redis".into(),
+                key: "host".into(),
+                value: Value::String("127.0.0.1".into()),
+            }],
+            deletes: vec![],
+            shared_bindings: vec![SharedBinding {
+                group: "db".into(),
+                key: "host".into(),
+                shared_key: "db_host".into(),
+            }],
+            operator: String::new(),
+            ts: 0,
+            expected_draft_rev: None,
+        },
+        15,
+    )
+    .unwrap();
+    s.apply(
+        &Command::Publish {
+            project: pid.clone(),
+            branch: dev.clone(),
+            comment: "v1".into(),
+            request_id: "r1".into(),
+            operator: String::new(),
+            ts: 0,
+            policy: PublishPolicy::Block,
+        },
+        16,
+    )
+    .unwrap();
+    // 从 dev 创建 staging：绑定继承、shared 项无本地草稿值
+    s.apply(
+        &Command::BranchCreate {
+            project: pid.clone(),
+            name: staging.clone(),
+            source: Some(dev.clone()),
+            operator: String::new(),
+            ts: 0,
+        },
+        17,
+    )
+    .unwrap();
+    let st = s.get_branch_state(&pid, &staging).unwrap().unwrap();
+    assert_eq!(
+        st.shared_bindings["db"]["host"], "db_host",
+        "绑定继承"
+    );
+    assert!(
+        !st.value_draft.get("db").is_some_and(|m| m.contains_key("host")),
+        "shared 项物化值不复制为本地草稿"
+    );
+    assert!(
+        st.value_draft["redis"].contains_key("host"),
+        "本地值正常复制"
+    );
+}
+
 // ---------------- 会话（I7 单管理员） ----------------
 
 #[test]
@@ -1222,6 +2162,7 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
                 },
             ],
             deletes: vec![],
+            shared_bindings: vec![],
 
             operator: String::new(),
             ts: 0,
@@ -1288,6 +2229,7 @@ fn rewrap_deks_rewrites_snapshot_shared_and_draft_secrets() {
                 value: fake_ct(1),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
 
             operator: String::new(),
             ts: 0,
@@ -1387,6 +2329,7 @@ fn publish_n_versions(s: &mut StateMachine, n: u64) -> (ProjectId, BranchName) {
                     value: Value::String(format!("10.0.0.{}", i + 1)),
                 }],
                 deletes: vec![],
+                shared_bindings: vec![],
                 operator: String::new(),
                 ts: 0,
                 expected_draft_rev: None,
@@ -1512,6 +2455,7 @@ fn rewrap_deks_covers_diff_secrets() {
                 value: Value::String("h".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -1537,6 +2481,7 @@ fn rewrap_deks_covers_diff_secrets() {
                 }),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -1900,6 +2845,7 @@ fn draft_optimistic_lock_conflict_detection() {
             branch: b.clone(),
             updates: upd("A"),
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: Some(0),
@@ -1917,6 +2863,7 @@ fn draft_optimistic_lock_conflict_detection() {
             branch: b.clone(),
             updates: upd("A2"),
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: Some(1),
@@ -1932,6 +2879,7 @@ fn draft_optimistic_lock_conflict_detection() {
                 branch: b.clone(),
                 updates: upd("B"),
                 deletes: vec![],
+                shared_bindings: vec![],
                 operator: String::new(),
                 ts: 0,
                 expected_draft_rev: Some(1), // 过期（当前 rev=2）
@@ -1948,6 +2896,7 @@ fn draft_optimistic_lock_conflict_detection() {
             branch: b.clone(),
             updates: upd("B2"),
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: Some(2), // 最新
@@ -1982,6 +2931,7 @@ fn draft_optimistic_lock_legacy_no_check() {
             branch: b.clone(),
             updates: upd("v1"),
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -1995,6 +2945,7 @@ fn draft_optimistic_lock_legacy_no_check() {
             branch: b.clone(),
             updates: upd("v2"),
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -2051,6 +3002,7 @@ fn gray_setup(s: &mut StateMachine) -> (ProjectId, BranchName) {
                 value: Value::String("stable-host".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -2082,6 +3034,7 @@ fn gray_setup(s: &mut StateMachine) -> (ProjectId, BranchName) {
                 value: Value::String("gray-host".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -2453,6 +3406,7 @@ fn gray_commands_idempotent() {
                 value: Value::String("gray-2".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -2538,6 +3492,7 @@ fn gray_command_error_paths() {
                 value: Value::String("h".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -2747,6 +3702,7 @@ fn gray_snapshot_recycled_on_lifecycle() {
                 value: Value::String("gray-2".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -2801,6 +3757,7 @@ fn gray_snapshot_recycled_on_lifecycle() {
                 value: Value::String("gray-3".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -2891,6 +3848,7 @@ fn gray_resolve_no_identity_never_gray() {
                 value: Value::String("ip-gray".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -2964,6 +3922,7 @@ fn prune_keeps_gray_snapshot() {
                     value: Value::String(format!("h{i}")),
                 }],
                 deletes: vec![],
+                shared_bindings: vec![],
                 operator: String::new(),
                 ts: 0,
                 expected_draft_rev: None,
@@ -2996,6 +3955,7 @@ fn prune_keeps_gray_snapshot() {
                 value: Value::String("gray-host".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -3125,6 +4085,7 @@ fn g3_numeric_coincidence_gray_seq_eq_active() {
                 value: Value::String("gray-host".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -3230,6 +4191,7 @@ fn g1_warn_policy_publishes_incomplete() {
                 value: Value::Int(6379),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -3310,11 +4272,11 @@ fn g1_manual_cascade_shared_publish() {
         11,
     )
     .unwrap();
-    // 结构 v2：redis.port 引用共享项 timeout
+    // 结构 v2：redis.port 标记为引用共享
     let mut groups = redis_structure();
     for g in &mut groups {
         for item in &mut g.items {
-            if item.key == "port" { item.shared_ref = Some("timeout".into()); }
+            if item.key == "port" { item.shared = true; }
         }
     }
     s.apply(
@@ -3339,7 +4301,7 @@ fn g1_manual_cascade_shared_publish() {
         13,
     )
     .unwrap();
-    // 发布 dev（草稿只填 host）→ port 由共享物化 30
+    // 发布 dev（草稿只填 host + 绑定 redis/port → timeout）→ port 由共享物化 30
     s.apply(
         &Command::DraftUpdate {
             project: pid.clone(),
@@ -3350,6 +4312,11 @@ fn g1_manual_cascade_shared_publish() {
                 value: Value::String("h".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![SharedBinding {
+                group: "redis".into(),
+                key: "port".into(),
+                shared_key: "timeout".into(),
+            }],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -3424,6 +4391,7 @@ fn g1_manual_cascade_shared_publish() {
                 value: Value::String("h2".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,

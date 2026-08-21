@@ -45,7 +45,7 @@ pub fn validate_publish(
     for g in &structure.groups {
         for item in &g.items {
             // 引用项只读：值由共享库物化，不参与草稿必填/类型校验
-            if item.shared_ref.is_some() {
+            if item.shared {
                 continue;
             }
             let has = draft
@@ -64,7 +64,7 @@ pub fn validate_publish(
     errs
 }
 
-/// 键名/分组名/共享项 key 字符集校验（结构定义、共享项 key、shared_ref 共用）。
+/// 键名/分组名/共享项 key 字符集校验（结构定义、共享项 key、分支绑定 shared_key 共用）。
 ///
 /// 规则：非空、`len() <= 128`、全部字符 ∈ `[A-Za-z0-9._-]`。
 /// - 禁止 `/`：`keys.rs` 以 `/` 拼接 `sh/{key}`，`/` 会使键错位；
@@ -119,14 +119,6 @@ pub fn validate_structure(structure: &Structure) -> Vec<String> {
                     g.name, item.key
                 ));
             }
-            if let Some(rk) = &item.shared_ref {
-                if !valid_key_name(rk) {
-                    errs.push(format!(
-                        "{}/{}: invalid shared_ref {:?}: only [A-Za-z0-9._-] allowed",
-                        g.name, item.key, rk
-                    ));
-                }
-            }
         }
         total_items += g.items.len();
     }
@@ -149,7 +141,7 @@ mod tests {
             secret: false,
             validate: None,
             description: None,
-            shared_ref: None,
+            shared: false,
         }
     }
 
@@ -169,7 +161,7 @@ mod tests {
             secret: false,
             validate: None,
             description: None,
-            shared_ref: None,
+            shared: false,
         };
         assert!(validate_value(&def, &Value::Json("{bad".into())).len() == 1);
         assert!(validate_value(&def, &Value::Json("{\"a\":1}".into())).is_empty());
@@ -238,7 +230,7 @@ mod tests {
                     secret: true,
                     validate: None,
                     description: None,
-                    shared_ref: None,
+                    shared: false,
                 }],
             }],
         };

@@ -994,6 +994,7 @@ impl StateMachine {
                 branch,
                 updates,
                 deletes,
+                shared_bindings,
                 operator,
                 ts,
                 expected_draft_rev,
@@ -1002,6 +1003,7 @@ impl StateMachine {
                 branch,
                 updates,
                 deletes,
+                shared_bindings,
                 Self::eff_ts(ts, now_ms),
                 operator,
                 expected_draft_rev.as_ref(),
@@ -1311,11 +1313,24 @@ impl StateMachine {
                 )));
             }
             let snap = self.snapshot_of(id, src, src_state.active_version)?;
+            // 跳过结构标记 shared=true 的 item（避免物化值变成引用项本地草稿）；
+            // 继承源分支的共享引用绑定（设计 shared-ref-branch-scope §4.8）
+            let shared_items: std::collections::HashSet<(String, String)> = structure
+                .groups
+                .iter()
+                .flat_map(|g| {
+                    g.items
+                        .iter()
+                        .filter(|i| i.shared)
+                        .map(|i| (g.name.clone(), i.key.clone()))
+                })
+                .collect();
             state.value_draft = snap
                 .into_iter()
                 .map(|(g, items)| {
-                    let m = items
+                    let m: BTreeMap<String, DraftValue> = items
                         .into_iter()
+                        .filter(|(k, _)| !shared_items.contains(&(g.clone(), k.clone())))
                         .map(|(k, v)| {
                             (
                                 k,
@@ -1328,7 +1343,10 @@ impl StateMachine {
                         .collect();
                     (g, m)
                 })
+                .filter(|(_, m)| !m.is_empty())
                 .collect();
+            state.shared_bindings = src_state.shared_bindings.clone();
+            state.bindings_dirty = false;
         }
         self.save_pending(&branch_state_key(id, name), &state)?;
         Ok(vec![])
@@ -1381,8 +1399,6 @@ impl StateMachine {
                 serde_json::json!({ "errors": errs }),
             ));
         }
-        // 引用校验：shared_ref 必须指向已发布共享项且类型一致
-        self.check_shared_refs(&draft_structure)?;
         let draft = StructureDraft {
             base_version,
             groups: groups.to_vec(),
@@ -1420,8 +1436,6 @@ impl StateMachine {
                 serde_json::json!({ "errors": errs }),
             ));
         }
-        // 引用校验：shared_ref 必须指向已发布共享项且类型一致（草稿期已校验，双保险）
-        self.check_shared_refs(&draft_structure)?;
         let new_structure = Structure {
             version: structure.version + 1,
             groups: draft.groups.clone(),
@@ -1485,16 +1499,43 @@ impl StateMachine {
                     !items.is_empty()
                 }
             });
-            // D14 扩展：引用项只读——清理 shared_ref 项的既有草稿值（值由共享库物化）
+            // D14 扩展：引用项只读——清理 shared 项的既有草稿值（值由共享库物化；含 local→shared 翻转）
             for g in &new_structure.groups {
                 for item in &g.items {
-                    if item.shared_ref.is_some() {
+                    if item.shared {
                         if let Some(m) = st.value_draft.get_mut(&g.name) {
                             m.remove(&item.key);
                         }
                     }
                 }
             }
+            // 分支级绑定清理：仅保留仍在结构中、仍 shared=true、且绑定共享项类型与新结构 ty 一致的条目
+            // （删除 item / shared→local 翻转 / ty 变更致失配 → 绑定丢弃，分支需重新选择）
+            let new_shared: std::collections::HashMap<(String, String), ValueType> =
+                new_structure
+                    .groups
+                    .iter()
+                    .flat_map(|g| {
+                        g.items
+                            .iter()
+                            .filter(|i| i.shared)
+                            .map(|i| ((g.name.clone(), i.key.clone()), i.ty))
+                    })
+                    .collect();
+            st.shared_bindings.retain(|g, m| {
+                m.retain(|k, rk| {
+                    match new_shared.get(&(g.clone(), k.clone())) {
+                        None => false, // item 已删除或不再 shared
+                        Some(ty) => self
+                            .get_shared(rk)
+                            .ok()
+                            .flatten()
+                            .map(|s| s.ty == *ty)
+                            .unwrap_or(false), // 类型失配或共享项缺失 → 丢弃
+                    }
+                });
+                !m.is_empty()
+            });
             self.save_pending(&branch_state_key(id, branch), &st)?;
             events.push(PublishEvent {
                 project: id.clone(),
@@ -1520,6 +1561,7 @@ impl StateMachine {
         branch: &BranchName,
         updates: &[crate::command::DraftUpdateItem],
         deletes: &[(String, String)],
+        bindings: &[crate::command::SharedBinding],
         now_ms: i64,
         _operator: &str,
         expected_draft_rev: Option<&u64>,
@@ -1558,8 +1600,8 @@ impl StateMachine {
                 .get(&u.group)
                 .and_then(|m| m.get(&u.key))
                 .ok_or_else(|| Error::validation(format!("unknown item {}/{}", u.group, u.key)))?;
-            // 引用项只读：值由共享库物化，禁止分支草稿设置本地值
-            if def.shared_ref.is_some() {
+            // 引用项只读：值由共享库物化，禁止分支草稿设置本地值（选择引用走 shared_bindings）
+            if def.shared {
                 return Err(Error::validation(format!(
                     "item {}/{} 引用共享项，不可设置本地值",
                     u.group, u.key
@@ -1585,6 +1627,63 @@ impl StateMachine {
                     return Err(Error::limit_exceeded("too many draft items"));
                 }
             }
+        }
+        // 分支级共享引用绑定：upsert/解除（空 shared_key = 解除）；def 须存在且 shared=true。
+        // 仅在实际变更时置 bindings_dirty（设计 shared-ref-branch-scope §4.6）。
+        let mut bindings_changed = false;
+        for b in bindings {
+            let def = index
+                .get(&b.group)
+                .and_then(|m| m.get(&b.key))
+                .ok_or_else(|| Error::validation(format!("unknown item {}/{}", b.group, b.key)))?;
+            if !def.shared {
+                return Err(Error::validation(format!(
+                    "item {}/{} 未标记为引用共享，不可绑定共享项",
+                    b.group, b.key
+                )));
+            }
+            let cur = st
+                .shared_bindings
+                .get(&b.group)
+                .and_then(|m| m.get(&b.key))
+                .map(|s| s.as_str());
+            if b.shared_key.is_empty() {
+                if cur.is_some() {
+                    bindings_changed = true;
+                    if let Some(m) = st.shared_bindings.get_mut(&b.group) {
+                        m.remove(&b.key);
+                        if m.is_empty() {
+                            st.shared_bindings.remove(&b.group);
+                        }
+                    }
+                }
+                continue;
+            }
+            if !validator::valid_key_name(&b.shared_key) {
+                return Err(Error::validation(format!(
+                    "invalid shared key {:?}: only [A-Za-z0-9._-] allowed",
+                    b.shared_key
+                )));
+            }
+            let shared = self
+                .get_shared(&b.shared_key)?
+                .ok_or_else(|| Error::validation(format!("shared item {} 未发布", b.shared_key)))?;
+            if shared.ty != def.ty {
+                return Err(Error::validation(format!(
+                    "{}/{}: type {:?} 与共享项 {} 的 {:?} 不一致",
+                    b.group, b.key, def.ty, b.shared_key, shared.ty
+                )));
+            }
+            if cur != Some(b.shared_key.as_str()) {
+                bindings_changed = true;
+            }
+            st.shared_bindings
+                .entry(b.group.clone())
+                .or_default()
+                .insert(b.key.clone(), b.shared_key.clone());
+        }
+        if bindings_changed {
+            st.bindings_dirty = true;
         }
         for (g, key) in deletes {
             if let Some(m) = st.value_draft.get_mut(g) {
@@ -1616,16 +1715,13 @@ impl StateMachine {
         structure: &Structure,
         policy: PublishPolicy,
     ) -> Result<(SnapshotMap, Vec<String>), Error> {
-        // 完整性校验（G1/D35：策略编码进命令——确定性由日志序保证）
+        // 完整性校验（G1/D35：策略编码进命令——确定性由日志序保证）。
+        // 注意：共享解析（未绑定/悬空/类型失配）产生的 errs 也在本策略判定范围内——
+        // 判定须在完整 errs 收集之后（未绑定是分支级正常态，Block 必须拦住）。
         let draft_map: BTreeMap<String, BTreeMap<String, DraftValue>> = st.value_draft.clone();
         let mut errs = validator::validate_publish(&draft_map, structure);
-        if !errs.is_empty() && policy == PublishPolicy::Block {
-            return Err(Error::publish_blocked(
-                serde_json::json!({ "errors": errs }),
-            ));
-        }
 
-        // 物化：草稿值 + 共享引用（引用项只读：值来自共享库，忽略草稿中该 item 的值）
+        // 物化：草稿值 + 共享引用（引用项只读：值来自本分支 shared_bindings 选定的共享项）
         let mut resolved: SnapshotMap = draft_map
             .into_iter()
             .map(|(g, items)| {
@@ -1635,21 +1731,44 @@ impl StateMachine {
             .collect();
         for g in &structure.groups {
             for item in &g.items {
-                if let Some(rk) = &item.shared_ref {
-                    match self.get_shared(rk)? {
-                        Some(shared) => {
-                            resolved
-                                .entry(g.name.clone())
-                                .or_default()
-                                .insert(item.key.clone(), shared.value.clone());
+                if !item.shared {
+                    continue;
+                }
+                let rk = st
+                    .shared_bindings
+                    .get(&g.name)
+                    .and_then(|m| m.get(&item.key));
+                let Some(rk) = rk else {
+                    errs.push(format!("{}/{}: 未选择引用共享项", g.name, item.key));
+                    continue;
+                };
+                match self.get_shared(rk)? {
+                    Some(shared) => {
+                        // 防御性类型复查：结构 ty 在绑定后被修改的残留（正常流程不可达，结构发布已清失配绑定）
+                        if shared.ty != item.ty {
+                            errs.push(format!(
+                                "{}/{}: 共享项 {rk} 类型 {:?} 与结构声明 {:?} 不一致",
+                                g.name, item.key, shared.ty, item.ty
+                            ));
+                            continue;
                         }
-                        None => errs.push(format!(
-                            "{}/{}: shared item {} 缺失（悬空引用）",
-                            g.name, item.key, rk
-                        )),
+                        resolved
+                            .entry(g.name.clone())
+                            .or_default()
+                            .insert(item.key.clone(), shared.value.clone());
                     }
+                    None => errs.push(format!(
+                        "{}/{}: shared item {rk} 缺失（悬空引用）",
+                        g.name, item.key
+                    )),
                 }
             }
+        }
+        // 策略判定在完整 errs 收集之后（含共享解析错误：未绑定/悬空/类型失配）
+        if !errs.is_empty() && policy == PublishPolicy::Block {
+            return Err(Error::publish_blocked(
+                serde_json::json!({ "errors": errs }),
+            ));
         }
         Ok((resolved, errs))
     }
@@ -1676,7 +1795,8 @@ impl StateMachine {
         if st.last_request_id.as_deref() == Some(request_id) {
             return Ok(vec![]);
         }
-        if st.value_draft.is_empty() {
+        // 发布守卫：值草稿非空或有未发布的绑定变更（只改绑定的分支也可发布）
+        if st.value_draft.is_empty() && !st.bindings_dirty {
             return Err(Error::new(ErrorKind::NoDraft, "no pending draft"));
         }
 
@@ -1708,6 +1828,8 @@ impl StateMachine {
         st.active_version = vno;
         st.last_request_id = Some(request_id.to_string());
         st.value_draft.clear();
+        // 绑定常驻分支状态（值草稿清空但绑定不清——shared 项无本地值可清）；发布后脏标记复位
+        st.bindings_dirty = false;
         self.save_pending(&branch_state_key(id, branch), &st)?;
 
         Ok(vec![PublishEvent {
@@ -1815,7 +1937,8 @@ impl StateMachine {
         if st.last_request_id.as_deref() == Some(request_id) {
             return Ok(vec![]);
         }
-        if st.value_draft.is_empty() {
+        // 发布守卫：值草稿非空或有未发布的绑定变更（只改绑定的分支也可发布）
+        if st.value_draft.is_empty() && !st.bindings_dirty {
             return Err(Error::new(ErrorKind::NoDraft, "no pending draft"));
         }
 
@@ -1840,6 +1963,8 @@ impl StateMachine {
         st.gray_rule = Some(rule.clone());
         st.last_request_id = Some(request_id.to_string());
         st.value_draft.clear();
+        // 绑定常驻分支状态；发布后脏标记复位
+        st.bindings_dirty = false;
         self.save_pending(&branch_state_key(id, branch), &st)?;
 
         Ok(vec![PublishEvent {
@@ -2055,15 +2180,16 @@ impl StateMachine {
             self.save_pending(&shared_key(&item.key), &published)?;
             self.store.delete(shared_draft_key(&item.key).as_bytes())?;
 
-            // 级联（G1/D36）：Auto = 引用该共享项的 (项目, 分支) 版本推进（原子 D15）；
+            // 级联（G1/D36）：Auto = 绑定该共享项的 (项目, 分支) 版本推进（原子 D15）；
             // Manual = 只更共享版本，引用分支下次发布时经 materialize_resolved 物化新值。
             if cascade == SharedCascadeMode::Manual {
                 continue;
             }
-            // 引用已内嵌项目结构：扫描全项目已发布结构，收集 shared_ref == 本 key 的 (project, group, item_key)
-            for (project, group, key) in self.shared_usage(&item.key)? {
-                self.cascade_to_project(
+            // 引用选择在分支 shared_bindings：扫描全项目全分支，收集绑定 == 本 key 的 (project, branch, group, item_key)
+            for (project, branch, group, key) in self.shared_usage(&item.key)? {
+                self.cascade_to_branch(
                     &project,
+                    &branch,
                     &group,
                     &key,
                     &item.value,
@@ -2077,11 +2203,12 @@ impl StateMachine {
         Ok(events)
     }
 
-    /// 级联单个 (项目, group, key) 的值更新到全部分支（版本推进 + SharedCascade 事件）。
+    /// 级联单个 (项目, 分支, group, key) 的值更新（版本推进 + SharedCascade 事件）。
     #[allow(clippy::too_many_arguments)]
-    fn cascade_to_project(
+    fn cascade_to_branch(
         &mut self,
         project: &ProjectId,
+        branch: &BranchName,
         group: &str,
         key: &str,
         value: &Value,
@@ -2090,54 +2217,52 @@ impl StateMachine {
         now_ms: i64,
         events: &mut Vec<PublishEvent>,
     ) -> Result<(), Error> {
-        for branch in self.list_branches(project)? {
-            let mut st = self
-                .get_branch_state(project, &branch)?
-                .ok_or_else(|| Error::internal("branch state missing"))?;
-            let old = if st.active_version == 0 {
-                SnapshotMap::new()
-            } else {
-                self.snapshot_of(project, &branch, st.active_version)?
-            };
-            let mut new_snap = old.clone();
-            new_snap
-                .entry(group.to_string())
-                .or_default()
-                .insert(key.to_string(), value.clone());
-            let diff = compute_diff(&old, &new_snap);
-            let vno = st.active_version + 1;
-            let mut record = VersionRecord {
-                no: vno,
-                structure_version: st.structure_version,
-                created_at: now_ms,
-                operator: "shared".into(),
-                comment: comment.to_string(),
-                rollback_of: None,
-                kind: VersionKind::Full,
-                snapshot_ref: None,
-                diff_ref: None,
-                event_ty: Some(EventType::SharedCascade),
-                gray: false,
-            };
-            self.write_version_snapshot(project, &branch, vno, &old, &new_snap, &mut record)?;
-            st.active_version = vno;
-            self.save_pending(&branch_state_key(project, &branch), &st)?;
-            events.push(PublishEvent {
-                project: project.clone(),
-                branch,
-                version: vno,
-                ty: EventType::SharedCascade,
-                structure_version: st.structure_version,
-                comment: comment.to_string(),
-                request_id: request_id.to_string(),
-                changes: diff,
-                gray: false,
-            });
-        }
+        let mut st = self
+            .get_branch_state(project, branch)?
+            .ok_or_else(|| Error::internal("branch state missing"))?;
+        let old = if st.active_version == 0 {
+            SnapshotMap::new()
+        } else {
+            self.snapshot_of(project, branch, st.active_version)?
+        };
+        let mut new_snap = old.clone();
+        new_snap
+            .entry(group.to_string())
+            .or_default()
+            .insert(key.to_string(), value.clone());
+        let diff = compute_diff(&old, &new_snap);
+        let vno = st.active_version + 1;
+        let mut record = VersionRecord {
+            no: vno,
+            structure_version: st.structure_version,
+            created_at: now_ms,
+            operator: "shared".into(),
+            comment: comment.to_string(),
+            rollback_of: None,
+            kind: VersionKind::Full,
+            snapshot_ref: None,
+            diff_ref: None,
+            event_ty: Some(EventType::SharedCascade),
+            gray: false,
+        };
+        self.write_version_snapshot(project, branch, vno, &old, &new_snap, &mut record)?;
+        st.active_version = vno;
+        self.save_pending(&branch_state_key(project, branch), &st)?;
+        events.push(PublishEvent {
+            project: project.clone(),
+            branch: branch.clone(),
+            version: vno,
+            ty: EventType::SharedCascade,
+            structure_version: st.structure_version,
+            comment: comment.to_string(),
+            request_id: request_id.to_string(),
+            changes: diff,
+            gray: false,
+        });
         Ok(())
     }
 
-    /// 删除共享项（草稿 + 已发布，幂等）：已发布项被项目结构引用 → 拒绝。
+    /// 删除共享项（草稿 + 已发布，幂等）：已发布项被任一分支绑定引用 → 拒绝。
     fn apply_shared_delete(&mut self, key: &str, _operator: &str) -> ApplyOutcome {
         if !validator::valid_key_name(key) {
             return Err(Error::validation("shared key 须为 1-128 位 [A-Za-z0-9._-]"));
@@ -2147,11 +2272,11 @@ impl StateMachine {
             if !refs.is_empty() {
                 let detail = refs
                     .iter()
-                    .map(|(p, g, k)| format!("{}/{}/{}", p.as_str(), g, k))
+                    .map(|(p, b, g, k)| format!("{}/{}/{}/{}", p.as_str(), b.as_str(), g, k))
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Err(Error::conflict(format!(
-                    "shared item {key} 被 {} 处项目配置引用：{detail}；请先移除引用",
+                    "shared item {key} 被 {} 处分支配置引用：{detail}；请先移除引用",
                     refs.len()
                 )));
             }
@@ -2162,44 +2287,26 @@ impl StateMachine {
         Ok(vec![])
     }
 
-    /// 反向引用：扫描全项目已发布结构，收集 shared_ref == key 的 (project, group, item_key)。
-    pub fn shared_usage(&self, key: &str) -> Result<Vec<(ProjectId, String, String)>, Error> {
+    /// 反向引用：扫描全项目全分支 shared_bindings，收集绑定 == key 的 (project, branch, group, item_key)。
+    pub fn shared_usage(
+        &self,
+        key: &str,
+    ) -> Result<Vec<(ProjectId, BranchName, String, String)>, Error> {
         let mut out = Vec::new();
         for p in self.list_projects()? {
-            if let Some(st) = self.get_structure(&p.id)? {
-                for g in &st.groups {
-                    for item in &g.items {
-                        if item.shared_ref.as_deref() == Some(key) {
-                            out.push((p.id.clone(), g.name.clone(), item.key.clone()));
+            for b in self.list_branches(&p.id)? {
+                if let Some(st) = self.get_branch_state(&p.id, &b)? {
+                    for (g, m) in &st.shared_bindings {
+                        for (k, rk) in m {
+                            if rk == key {
+                                out.push((p.id.clone(), b.clone(), g.clone(), k.clone()));
+                            }
                         }
                     }
                 }
             }
         }
         Ok(out)
-    }
-
-    /// 结构引用校验：shared_ref 必须指向已发布共享项且类型一致（保存草稿/发布结构均调用）。
-    fn check_shared_refs(&self, structure: &Structure) -> Result<(), Error> {
-        for g in &structure.groups {
-            for item in &g.items {
-                if let Some(rk) = &item.shared_ref {
-                    let shared = self.get_shared(rk)?.ok_or_else(|| {
-                        Error::validation(format!(
-                            "shared item {rk} 未发布（{}/{} 引用）",
-                            g.name, item.key
-                        ))
-                    })?;
-                    if shared.ty != item.ty {
-                        return Err(Error::validation(format!(
-                            "{}/{}: type {:?} 与共享项 {rk} 的 {:?} 不一致",
-                            g.name, item.key, item.ty, shared.ty
-                        )));
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     // ---------------- 会话（I7 单管理员；状态机内强制） ----------------
@@ -2771,7 +2878,7 @@ mod tests {
             1,
         )
         .unwrap();
-        // 发布共享项，结构引用它（经 Command 提交，保证 pending 落库）
+        // 发布共享项，结构标记引用共享 + 分支绑定它（经 Command 提交，保证 pending 落库）
         s.apply(
             &Command::SharedDraftUpdate {
                 item: shared_item("db_host"),
@@ -2805,7 +2912,7 @@ mod tests {
                         secret: false,
                         validate: None,
                         description: None,
-                        shared_ref: Some("db_host".into()),
+                        shared: true,
                     }],
                 }],
                 operator: String::new(),
@@ -2825,6 +2932,36 @@ mod tests {
             4,
         )
         .unwrap();
+        // 项目自动创建 dev/test/prod；用自定义分支绑定共享项
+        s.apply(
+            &Command::BranchCreate {
+                project: ProjectId(proj.into()),
+                name: BranchName("staging".into()),
+                source: None,
+                operator: String::new(),
+                ts: 0,
+            },
+            5,
+        )
+        .unwrap();
+        s.apply(
+            &Command::DraftUpdate {
+                project: ProjectId(proj.into()),
+                branch: BranchName("staging".into()),
+                updates: vec![],
+                deletes: vec![],
+                shared_bindings: vec![crate::command::SharedBinding {
+                    group: "redis".into(),
+                    key: "host".into(),
+                    shared_key: "db_host".into(),
+                }],
+                operator: String::new(),
+                ts: 0,
+                expected_draft_rev: None,
+            },
+            6,
+        )
+        .unwrap();
         assert_eq!(s.shared_usage("db_host").unwrap().len(), 1);
 
         s.apply(
@@ -2832,7 +2969,7 @@ mod tests {
                 id: ProjectId(proj.into()),
                 operator: String::new(),
             },
-            5,
+            7,
         )
         .unwrap();
         assert!(s.shared_usage("db_host").unwrap().is_empty());
@@ -2901,7 +3038,7 @@ mod tests {
                         secret: false,
                         validate: None,
                         description: None,
-                        shared_ref: None,
+                        shared: false,
                     }],
                 }],
                 operator: String::new(),
@@ -2962,6 +3099,7 @@ mod tests {
                     value: Value::String("h".into()),
                 }],
                 deletes: vec![],
+                shared_bindings: vec![],
                 operator: String::new(),
                 ts: 0,
                 expected_draft_rev: None,

@@ -164,7 +164,7 @@ async fn three_node_bootstrap_join_failover() {
                 secret: false,
                 validate: None,
                 description: None,
-                shared_ref: None,
+                shared: false,
             },
             ItemDef {
                 key: "port".into(),
@@ -173,7 +173,7 @@ async fn three_node_bootstrap_join_failover() {
                 secret: false,
                 validate: None,
                 description: None,
-                shared_ref: None,
+                shared: false,
             },
         ],
     }];
@@ -225,6 +225,7 @@ async fn three_node_bootstrap_join_failover() {
                 },
             ],
             deletes: vec![],
+            shared_bindings: vec![],
 
             operator: String::new(),
             ts: 0,
@@ -458,7 +459,7 @@ async fn cluster_watch_events_reach_subscribers() {
             secret: false,
             validate: None,
                 description: None,
-                shared_ref: None,
+                shared: false,
         }],
     }];
     client_write(
@@ -609,7 +610,7 @@ async fn gray_percentage_consistent_across_nodes() {
                     secret: false,
                     validate: None,
                 description: None,
-                shared_ref: None,
+                shared: false,
                 }],
             }],
             operator: String::new(),
@@ -631,6 +632,7 @@ async fn gray_percentage_consistent_across_nodes() {
                 value: Value::String("stable-v1".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,
@@ -654,6 +656,7 @@ async fn gray_percentage_consistent_across_nodes() {
                 value: Value::String("gray-v1".into()),
             }],
             deletes: vec![],
+            shared_bindings: vec![],
             operator: String::new(),
             ts: 0,
             expected_draft_rev: None,

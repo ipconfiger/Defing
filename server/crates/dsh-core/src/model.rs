@@ -194,10 +194,15 @@ pub struct ItemDef {
     /// 助记描述（自由文本 ≤200 字节；不进入渲染输出）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// 引用共享项（共享库扁平化后的共享项 key；None = 本地项，值来自分支草稿）。
-    /// 非 None 时本项只读：值完全来自共享项，type/required/secret 继承共享项定义。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shared_ref: Option<String>,
+    /// 引用共享标记：true = 本项值为共享来源，由各分支在 shared_bindings 中选择引用哪个共享项。
+    /// 引用项只读：值完全来自共享库，type/required/secret 语义随绑定共享项（设计 shared-ref-branch-scope）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shared: bool,
+}
+
+/// serde 辅助：布尔字段序列化时省略 false（与 `Vec::is_empty` 模式一致）。
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// 分组定义。
@@ -279,6 +284,13 @@ pub struct BranchState {
     /// 灰度规则（Some = 灰度活跃；None = 无灰度。旧数据无此字段 → None，兼容）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gray_rule: Option<GrayRule>,
+    /// 分支级共享引用绑定：group → key → 共享项 key（仅对结构标记 shared=true 的 item 有意义）。
+    #[serde(default)]
+    pub shared_bindings: BTreeMap<String, BTreeMap<String, String>>,
+    /// 绑定是否有未发布的变更（发布守卫/级联判定；设计 shared-ref-branch-scope §4.6）。
+    /// 值草稿用「非空」判定，绑定必须跨发布持久化，故用脏标记区分「有无待发布变更」。
+    #[serde(default)]
+    pub bindings_dirty: bool,
 }
 
 impl BranchState {
@@ -291,6 +303,8 @@ impl BranchState {
             draft_rev: 0,
             gray_seq: 0,
             gray_rule: None,
+            shared_bindings: BTreeMap::new(),
+            bindings_dirty: false,
         }
     }
 }

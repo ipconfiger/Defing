@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use dsh_core::command::{Command, DraftUpdateItem};
+use dsh_core::command::{Command, DraftUpdateItem, SharedBinding};
 use dsh_core::error::Error;
 use dsh_core::model::{
     BranchName, DiffEntry, GrayRule, ProjectId, PublishEvent, PublishPolicy, SharedCascadeMode,
@@ -126,6 +126,7 @@ impl PublishService {
         branch: &BranchName,
         mut updates: Vec<DraftUpdateItem>,
         deletes: Vec<(String, String)>,
+        bindings: Vec<SharedBinding>,
         expected_draft_rev: Option<u64>,
         operator: &str,
     ) -> Result<(), Error> {
@@ -136,7 +137,7 @@ impl PublishService {
                 branch: branch.clone(),
                 updates,
                 deletes,
-
+                shared_bindings: bindings,
                 operator: operator.to_string(),
                 ts: now_ms(),
                 expected_draft_rev,
@@ -396,7 +397,7 @@ mod tests {
                             secret: false,
                             validate: None,
                 description: None,
-                shared_ref: None,
+                shared: false,
                         },
                         ItemDef {
                             key: "pass".into(),
@@ -405,7 +406,7 @@ mod tests {
                             secret: true,
                             validate: None,
                 description: None,
-                shared_ref: None,
+                shared: false,
                         },
                     ],
                 }],

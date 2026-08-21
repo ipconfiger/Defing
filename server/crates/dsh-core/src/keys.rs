@@ -8,7 +8,8 @@ pub const K_STRUCT_DRAFT: &str = "/struct-draft";
 pub const K_BRANCH: &str = "/b/";
 pub const K_STATE: &str = "/state";
 pub const K_VERSION: &str = "/v/";
-/// 共享引用已内嵌结构 ItemDef.shared_ref；不再使用独立 refs 键。
+/// 共享引用选择在分支状态 BranchState.shared_bindings（设计 shared-ref-branch-scope）；
+/// 结构仅声明 ItemDef.shared 标记，无独立引用键。
 pub const K_SHARED: &str = "sh/";
 pub const K_SHARED_DRAFT: &str = "sh-draft/";
 pub const K_SESSION: &str = "sess/admin";

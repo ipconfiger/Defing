@@ -302,10 +302,20 @@ struct DraftUpdateReq {
     /// "group/key" 列表
     #[serde(default)]
     deletes: Vec<String>,
+    /// 分支级共享引用绑定 upsert/解除（shared_key 空串 = 解除绑定）
+    #[serde(default)]
+    shared_bindings: Vec<SharedBindingReq>,
     /// 乐观锁：期望的草稿修订号（缺省 None = 不校验，兼容旧客户端）。
     /// 不匹配 → 409 Conflict（并发编辑冲突，客户端刷新最新草稿后重试）。
     #[serde(default)]
     expected_draft_rev: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct SharedBindingReq {
+    group: String,
+    key: String,
+    shared_key: String,
 }
 
 #[derive(Deserialize)]
@@ -944,6 +954,16 @@ async fn update_draft(
         .collect();
     let updates_len = req.updates.len();
     let deletes_len = deletes.len();
+    let bindings_len = req.shared_bindings.len();
+    let bindings: Vec<dsh_core::command::SharedBinding> = req
+        .shared_bindings
+        .iter()
+        .map(|b| dsh_core::command::SharedBinding {
+            group: b.group.clone(),
+            key: b.key.clone(),
+            shared_key: b.shared_key.clone(),
+        })
+        .collect();
     let pid_obj = ProjectId(pid.clone());
     let branch_obj = BranchName(branch.clone());
     app.publish
@@ -952,6 +972,7 @@ async fn update_draft(
             &branch_obj,
             req.updates,
             deletes,
+            bindings,
             req.expected_draft_rev,
             &principal_op(&principal),
         )
@@ -964,7 +985,11 @@ async fn update_draft(
             Some(branch.clone()),
             None,
             None,
-            serde_json::json!({ "updates": updates_len, "deletes": deletes_len }),
+            serde_json::json!({
+                "updates": updates_len,
+                "deletes": deletes_len,
+                "bindings": bindings_len,
+            }),
             &principal_op(&principal),
         )
         .await;
@@ -1298,21 +1323,38 @@ async fn branch_detail(
             (g.clone(), serde_json::Value::Object(m))
         })
         .collect();
-    // 引用项只读展示：结构 items.shared_ref → 共享项解析值（secret 掩码，与共享库列表一致）
+    // 引用项展示：结构 shared 项 × 本分支绑定解析值（secret 掩码，与共享库列表一致）；
+    // 未绑定项 shared_key 为空串、version/value 为 null（草稿页据此渲染「请选择」下拉状态）
     let mut shared_refs = Vec::new();
     if let Some(structure) = sm.get_structure(&id).map_err(ApiError::from)? {
         for g in &structure.groups {
             for item in &g.items {
-                if let Some(rk) = &item.shared_ref {
-                    if let Some(shared) = sm.get_shared(rk).map_err(ApiError::from)? {
-                        shared_refs.push(serde_json::json!({
-                            "group": g.name,
-                            "key": item.key,
-                            "shared_key": rk,
-                            "version": shared.version,
-                            "value": masked_shared_value(&shared),
-                        }));
+                if !item.shared {
+                    continue;
+                }
+                let rk = st
+                    .shared_bindings
+                    .get(&g.name)
+                    .and_then(|m| m.get(&item.key));
+                match rk {
+                    Some(rk) => {
+                        if let Some(shared) = sm.get_shared(rk).map_err(ApiError::from)? {
+                            shared_refs.push(serde_json::json!({
+                                "group": g.name,
+                                "key": item.key,
+                                "shared_key": rk,
+                                "version": shared.version,
+                                "value": masked_shared_value(&shared),
+                            }));
+                        }
                     }
+                    None => shared_refs.push(serde_json::json!({
+                        "group": g.name,
+                        "key": item.key,
+                        "shared_key": "",
+                        "version": null,
+                        "value": null,
+                    })),
                 }
             }
         }
@@ -1486,7 +1528,7 @@ async fn promote(
                     .flat_map(|g| {
                         g.items
                             .iter()
-                            .filter(|i| i.shared_ref.is_some())
+                            .filter(|i| i.shared)
                             .map(move |i| (g.name.clone(), i.key.clone()))
                     })
                     .collect()
@@ -1536,6 +1578,7 @@ async fn promote(
                 &pid_obj,
                 &to_b,
                 updates,
+                vec![],
                 vec![],
                 None,
                 &principal_op(&principal),
@@ -1592,7 +1635,7 @@ fn masked_shared_value(item: &SharedItem) -> serde_json::Value {
 
 fn shared_item_json(
     item: &SharedItem,
-    refs: Option<&[(ProjectId, String, String)]>,
+    refs: Option<&[(ProjectId, BranchName, String, String)]>,
 ) -> serde_json::Value {
     let mut obj = serde_json::json!({
         "key": item.key,
@@ -1608,8 +1651,9 @@ fn shared_item_json(
     if let Some(r) = refs {
         obj["refs"] = serde_json::json!(
             r.iter()
-                .map(|(p, g, k)| serde_json::json!({
+                .map(|(p, b, g, k)| serde_json::json!({
                     "project": p.as_str(),
+                    "branch": b.as_str(),
                     "group": g,
                     "item_key": k,
                 }))
@@ -4004,6 +4048,124 @@ fn new_token() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// 通用写转发（K3s/Service 负载均衡场景）：写请求落到 follower 时，服务端把
+/// 428 ERR_LEADER_REDIRECT 透明转发到 leader 的同一路径，客户端无感。
+///
+/// 设计要点：
+/// - 仅 POST/PUT/PATCH/DELETE 且路径以 /api/v1/ 开头才可能转发；
+/// - 豁免：/api/v1/login、/api/v1/admin/rotate-master-key（已有内联服务端转发）、
+///   /api/v1/cluster/join（428 是「客户端跟随 leader_hint」的设计契约，join 客户端自行跟随）；
+/// - 仅当响应为 428 且 body.detail.leader_hint 非空时转发；单次尝试，
+///   leader 不可达则回落原 428（客户端行为不变）；
+/// - 转发保留原请求头（Authorization 等；会话令牌经 Raft 复制，全集群有效）。
+async fn forward_leader_writes(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{header, Method, StatusCode};
+
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let path = uri.path().to_string();
+    let is_write = matches!(
+        method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
+    let eligible = is_write
+        && path.starts_with("/api/v1/")
+        && path != "/api/v1/login"
+        && path != "/api/v1/admin/rotate-master-key"
+        && path != "/api/v1/cluster/join";
+    if !eligible {
+        return next.run(req).await;
+    }
+
+    // 缓冲请求体（重建交给 handler；转发时复用同一份 bytes）
+    let (parts, body) = req.into_parts();
+    let req_headers = parts.headers.clone();
+    let body_bytes = match axum::body::to_bytes(body, 2 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return next
+                .run(axum::extract::Request::from_parts(
+                    parts,
+                    axum::body::Body::empty(),
+                ))
+                .await
+        }
+    };
+    let req = axum::extract::Request::from_parts(
+        parts,
+        axum::body::Body::from(body_bytes.clone()),
+    );
+    let resp = next.run(req).await;
+    if resp.status() != StatusCode::PRECONDITION_REQUIRED {
+        return resp;
+    }
+
+    // 解析 428 体 → leader_hint
+    let (rparts, rbody) = resp.into_parts();
+    let rbytes = match axum::body::to_bytes(rbody, 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return axum::response::Response::from_parts(rparts, axum::body::Body::empty())
+        }
+    };
+    let hint: Option<String> = serde_json::from_slice::<serde_json::Value>(&rbytes)
+        .ok()
+        .and_then(|v| {
+            v.get("detail")
+                .and_then(|d| d.get("leader_hint"))
+                .and_then(|h| h.as_str())
+                .map(String::from)
+        })
+        .filter(|h| !h.is_empty());
+    let Some(hint) = hint else {
+        // 非 LeaderRedirect 的 428（如 join 契约）：原样返回
+        return axum::response::Response::from_parts(rparts, axum::body::Body::from(rbytes));
+    };
+
+    // 转发到 leader（http_addr 无 scheme → 补 http://）
+    let base = if hint.starts_with("http://") || hint.starts_with("https://") {
+        hint
+    } else {
+        format!("http://{hint}")
+    };
+    let query = uri
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let target = format!("{base}{path}{query}");
+
+    let client = reqwest::Client::new();
+    let fwd = client
+        .request(method, &target)
+        .headers(req_headers)
+        .body(body_bytes)
+        .timeout(std::time::Duration::from_secs(10));
+    match fwd.send().await {
+        Ok(leader_resp) => {
+            let status = leader_resp.status();
+            let lheaders = leader_resp.headers().clone();
+            let lbytes = leader_resp.bytes().await.unwrap_or_default();
+            let mut builder = axum::response::Response::builder().status(status);
+            for (k, v) in lheaders.iter() {
+                if k != header::CONTENT_LENGTH && k != header::TRANSFER_ENCODING {
+                    builder = builder.header(k, v);
+                }
+            }
+            builder
+                .header("X-Defing-Forwarded-To", &target)
+                .body(axum::body::Body::from(lbytes))
+                .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty()))
+        }
+        Err(_) => {
+            // leader 不可达：回落原 428（客户端行为不变，可自行重试）
+            axum::response::Response::from_parts(rparts, axum::body::Body::from(rbytes))
+        }
+    }
+}
+
 // ---------------- 路由 ----------------
 
 pub fn build_router(app: ApiState) -> Router {
@@ -4119,6 +4281,8 @@ pub fn build_router(app: ApiState) -> Router {
         auth_middleware,
     ));
     router = router.layer(axum::middleware::from_fn(security_headers));
+    // 写转发：包住鉴权+handler，仅对鉴权通过的写响应处理 428（K3s/LB 场景管理面写）
+    router = router.layer(axum::middleware::from_fn(forward_leader_writes));
     // G5/D32：HTTP 计数最外层（统计全部请求含 healthz/metrics）
     router = router.layer(axum::middleware::from_fn(count_http));
     router.with_state(app)

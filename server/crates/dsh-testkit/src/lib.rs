@@ -19,7 +19,7 @@ pub fn demo_structure() -> Vec<GroupDef> {
                 secret: false,
                 validate: None,
                 description: None,
-                shared_ref: None,
+                shared: false,
             },
             ItemDef {
                 key: "port".into(),
@@ -28,7 +28,7 @@ pub fn demo_structure() -> Vec<GroupDef> {
                 secret: false,
                 validate: None,
                 description: None,
-                shared_ref: None,
+                shared: false,
             },
             ItemDef {
                 key: "pass".into(),
@@ -37,7 +37,7 @@ pub fn demo_structure() -> Vec<GroupDef> {
                 secret: true,
                 validate: None,
                 description: None,
-                shared_ref: None,
+                shared: false,
             },
         ],
     }]
@@ -108,6 +108,7 @@ pub fn seed_demo_project(
                 },
             ],
             deletes: vec![],
+            shared_bindings: vec![],
 
             operator: String::new(),
             ts: 0,
