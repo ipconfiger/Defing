@@ -1602,7 +1602,7 @@ function renderDiff(d, a, b) {
   let html = `<div class="table-wrap"><table class="table">
     <thead><tr><th>key</th><th>${esc(a)}</th><th>${esc(b)}</th></tr></thead><tbody>`;
   for (const x of diffs) {
-    html += `<tr><td class="mono">${esc(x.group)}/${esc(x.key)}</td><td class="mono brk">${esc(JSON.stringify(x.branch_a))}</td><td class="mono brk">${esc(JSON.stringify(x.branch_b))}</td></tr>`;
+    html += `<tr><td class="mono">${esc(x.group)}/${esc(x.key)}</td><td class="mono brk">${esc(fmtVal(x.branch_a))}</td><td class="mono brk">${esc(fmtVal(x.branch_b))}</td></tr>`;
   }
   for (const m of missing) {
     html += `<tr><td class="mono">${esc(m)}</td><td colspan="2" class="muted">仅一侧有值</td></tr>`;
@@ -1654,7 +1654,7 @@ async function loadShared() {
       <td class="mono">${esc(x.key)}</td>
       <td class="mono muted">${esc(x.ty || x.type || '')}</td>
       <td>${x.__draft ? '<span class="badge warn">草稿</span>' : `<span class="badge ok">v${x.version}</span>`}</td>
-      <td class="mono brk">${esc(JSON.stringify(x.value))}</td>
+      <td class="mono brk">${esc(fmtVal(x.value))}</td>
       <td class="mono muted">${esc(x.description || '')}</td>
       <td class="small" title="被项目结构引用">${refs.length ? `<span class="badge acc" title="${esc(refTxt)}">${refs.length} 处</span>` : '<span class="muted">—</span>'}</td>
       <td>${x.secret ? '<span class="badge err"><svg class="ic ic-xs"><use href="#i-lock"/></svg>secret</span>' : ''}</td>
