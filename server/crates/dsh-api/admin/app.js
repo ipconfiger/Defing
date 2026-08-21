@@ -180,7 +180,6 @@ function setPane(pane) {
   S.pane = pane;
   $$('#pane-seg button').forEach((b) => b.classList.toggle('active', b.dataset.pane === S.pane));
   $$('.pane').forEach((p) => p.classList.toggle('hidden', p.id !== 'pane-' + S.pane));
-  if (pane === 'structure') loadSharedItems(); // 进入结构页刷新共享引用下拉数据源
   if (pane === 'tokens') loadTokens();          // 进入访问令牌页拉取列表
 }
 actions.switchPane = function (el) { setPane(el.dataset.pane); };
@@ -428,14 +427,36 @@ function renderBranchSelects() {
   fillBranchOptions($('promote-to'), S.branches, true);
 }
 
-// 已发布共享项缓存（结构编辑器「共享引用」下拉数据源）
+// 已发布共享项缓存（草稿页「引用共享」绑定下拉的数据源）
 async function loadSharedItems() {
   try {
     S.sharedItems = (await j('GET', '/api/v1/shared')) || [];
   } catch (_) {
     S.sharedItems = []; // 端点暂态失败 → 下拉为空（保存时服务端双校验兜底）
   }
-  renderStructEditor(); // 异步加载完成后重渲染结构编辑器（含引用共享勾选状态）
+  refreshDraftBindDropdowns(); // 就地刷新草稿页绑定下拉（结构页勾选框不依赖共享项列表）
+}
+
+// 就地刷新草稿页「引用共享」下拉的选项（保留当前选择）；下拉不存在时无操作。
+// 注意：不可在此调用 renderStructEditor/loadSharedItems（会与结构页渲染互相递归）。
+// 不按 pane 守卫：共享库页保存/发布共享项时草稿页下拉仍在 DOM（隐藏面板），需同步刷新。
+function refreshDraftBindDropdowns() {
+  if (!S.sharedItems) return;
+  for (const sel of $$('#pane-draft .draft-shared-bind')) {
+    const prev = sel.value;
+    sel.innerHTML = sharedBindOptions(sel.dataset.g, sel.dataset.k, prev);
+  }
+}
+
+// 「引用共享」绑定下拉的选项 HTML（按结构声明 type 过滤；secret 项带 🔒 徽标）
+function sharedBindOptions(g, k, cur) {
+  const def = ((S.pubStruct && S.pubStruct.groups) || [])
+    .flatMap((gg) => gg.items)
+    .find((it) => it.key === k);
+  const ty = (def && def.type) || '';
+  return '<option value="">— 请选择 —</option>' + (S.sharedItems || [])
+    .filter((s) => !ty || s.type === ty)
+    .map((s) => `<option value="${esc(s.key)}"${s.key === cur ? ' selected' : ''} title="${esc(s.description || '')}">${esc(s.key)}${s.secret ? ' 🔒' : ''}${s.description ? ' · ' + esc(s.description) : ''}</option>`).join('');
 }
 
 async function loadProject() {
@@ -668,22 +689,36 @@ function draftStructRowHtml(g, it, v, av, hasActive) {
 // 徽标放 gkey 下方（可换行）；gtype 列显示结构声明类型；值列展示物化值或「未选择」。
 function sharedBindRowHtml(g, it) {
   const ref = S.sharedRefs[g.name + '/' + it.key];
-  const opts = '<option value="">— 请选择 —</option>' + (S.sharedItems || [])
-    .filter((s) => s.type === it.type)
-    .map((s) => `<option value="${esc(s.key)}"${s.key === (ref && ref.shared_key) ? ' selected' : ''} title="${esc(s.description || '')}">${esc(s.key)}${s.secret ? ' 🔒' : ''}${s.description ? ' · ' + esc(s.description) : ''}</option>`).join('');
+  const cur = (ref && ref.shared_key) || '';
+  const opts = sharedBindOptions(g.name, it.key, cur);
   const tip = (ref && ref.shared_key) ? '引用共享项 ' + ref.shared_key + (ref.version ? ' · v' + ref.version : '') : '未选择共享项';
-  const valHtml = (ref && ref.value)
-    ? `<span class="mono ${ref.value.masked ? 'muted' : ''}">${esc(fmtVal(ref.value))}</span>${ref.value.masked ? ' <span class="hint">（已加密）</span>' : ''}`
-    : '<span class="hint" style="margin:0">未选择共享项</span>';
+  const sh = cur ? (S.sharedItems || []).find((s) => s.key === cur) : null;
+  const valHtml = sharedBindValueHtml(cur, ref, sh);
   return `<div class="grow ref-grow">
     <div class="gkey"><span class="mono">${esc(it.key)}</span><span class="badge acc ref-badge" title="${esc(tip)}">引用共享</span>${it.description ? `<div class="hint small" style="margin:2px 0 0">${esc(it.description)}</div>` : ''}</div>
     <div class="gtype"><span class="ty">${esc(it.type || '')}</span></div>
     <div class="gctl">
       <select class="sel draft-shared-bind" data-g="${esc(g.name)}" data-k="${esc(it.key)}" title="本分支引用的共享项（值由共享库物化，只读）">${opts}</select>
-      <div style="margin-top:2px">${valHtml}</div>
+      <div class="bind-val" style="margin-top:2px">${valHtml}</div>
     </div>
     <div class="gdel"><span class="hint" style="margin:0">${ref && ref.version ? 'v' + ref.version : ''}</span></div>
   </div>`;
+}
+
+// 绑定值展示：服务端解析（S.sharedRefs，含版本）优先；否则客户端按当前选择查 S.sharedItems 即时预览
+function sharedBindValueHtml(sharedKey, ref, sh) {
+  if (ref && ref.value) {
+    const v = ref.value;
+    const masked = v.masked ? ' <span class="hint">（已加密）</span>' : '';
+    return `<span class="mono ${v.masked ? 'muted' : ''}">${esc(fmtVal(v))}</span>${masked}`;
+  }
+  if (sharedKey && sh && sh.value) {
+    const v = sh.value;
+    const masked = v && v.masked ? ' <span class="hint">（已加密）</span>' : '';
+    const val = (v && fmtVal(v)) || '…';
+    return `<span class="mono muted">${esc(val)}</span>${masked}<span class="hint"> · 待保存生效</span>`;
+  }
+  return '<span class="hint" style="margin:0">未选择共享项</span>';
 }
 
 function fmtVal(v) {
@@ -1145,7 +1180,6 @@ function syncStructJsonTextarea() {
 function renderStructEditor() {
   const d = S.structDraft;
   if (!d) return;
-  loadSharedItems(); // 始终触发：异步加载/变更后就地刷新「共享引用」下拉（refreshSharedRefDropdowns）
   $('struct-base').textContent = 'sv' + d.base_version;
   // 滞后判定：与 structBaseline()（已发布结构版本为权威，分支 sv 交叉校验）比较
   const stale = d.base_version !== structBaseline();
@@ -1927,7 +1961,18 @@ function bindEvents() {
   document.addEventListener('change', (e) => {
     const t = e.target;
     if (!t || !t.classList) return;
-    if (t.classList.contains('draft-in') || t.classList.contains('draft-shared-bind')) markDraftDirty();
+    if (t.classList.contains('draft-in') || t.classList.contains('draft-shared-bind')) {
+      markDraftDirty();
+      // 绑定选择即时预览物化值（客户端查 S.sharedItems；保存后由服务端解析值替换）
+      if (t.classList.contains('draft-shared-bind')) {
+        const row = t.closest('.grow');
+        const valEl = row && row.querySelector('.bind-val');
+        if (valEl) {
+          const sh = (S.sharedItems || []).find((s) => s.key === t.value);
+          valEl.innerHTML = sharedBindValueHtml(t.value, null, sh);
+        }
+      }
+    }
     else if (t.id === 'sh-key' || t.id === 'sh-desc' || t.id === 'sh-value'
       || t.id === 'sh-type' || t.id === 'sh-secret' || t.id === 'sh-required') markSharedDirty();
   });
