@@ -54,13 +54,14 @@ impl Renderer {
     }
 }
 
-/// .env 格式：`GROUP__KEY=VALUE`（组/键转大写，双下划线分隔，dotenv 约定）。
+/// .env 格式：`KEY=VALUE`（键转大写，无分组前缀——组仅组织语义，不进入 .env 输出）。
+/// 注意：跨组同名 key 会输出重复行（dotenv 后写覆盖）；需区分时在键命名上体现。
 /// 值：含空白/#/引号/反斜杠/换行的字符串加双引号转义；数组逗号连接；其余按字面输出。
 fn render_env(tree: &BTreeMap<String, BTreeMap<String, serde_json::Value>>) -> String {
     let mut out = String::new();
-    for (g, items) in tree {
+    for (_g, items) in tree {
         for (k, v) in items {
-            let key = format!("{}__{}", g.to_uppercase(), k.to_uppercase());
+            let key = k.to_uppercase();
             out.push_str(&format!("{key}={}\n", env_value(v)));
         }
     }
@@ -183,12 +184,12 @@ mod tests {
     fn render_env() {
         let r = Renderer;
         let out = r.render(&sample(), Format::Env).unwrap();
-        assert!(out.contains("REDIS__HOST=127.0.0.1"), "{out}");
-        assert!(out.contains("REDIS__PORT=6379"), "{out}");
-        assert!(out.contains("REDIS__TLS=true"), "{out}");
-        assert!(out.contains("DB__PASSWORD=***"), "{out}"); // secret 掩码
-        // 顺序确定（BTreeMap 字典序：db < redis）
-        assert!(out.find("DB__").unwrap() < out.find("REDIS__").unwrap(), "{out}");
+        assert!(out.contains("HOST=127.0.0.1"), "{out}");
+        assert!(out.contains("PORT=6379"), "{out}");
+        assert!(out.contains("TLS=true"), "{out}");
+        assert!(out.contains("PASSWORD=***"), "{out}"); // secret 掩码
+        // 无分组前缀：输出仅含键（大写）
+        assert!(!out.contains("__"), "group 前缀已去除: {out}");
     }
 
     #[test]
@@ -204,9 +205,9 @@ mod tests {
         );
         let r = Renderer;
         let out = r.render(&groups, Format::Env).unwrap();
-        assert!(out.contains("APP__GREETING=\"hello world\""), "{out}");
-        assert!(out.contains("APP__FLAG=\"a#b\""), "{out}");
-        assert!(out.contains("APP__TAGS=x,y"), "{out}");
+        assert!(out.contains("GREETING=\"hello world\""), "{out}");
+        assert!(out.contains("FLAG=\"a#b\""), "{out}");
+        assert!(out.contains("TAGS=x,y"), "{out}");
     }
 
     #[test]

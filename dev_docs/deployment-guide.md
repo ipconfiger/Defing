@@ -457,7 +457,7 @@ snap = c.get('my-app', 'dev')
 > HTTP SSE 亦支持 `?token=`）。令牌在 Admin UI 项目页「访问令牌」Tab 创建（仅全局管理员）。
 >
 > **构建脚本取值（curl）**：`GET /v1/projects/{p}/branches/{b}/config?format=yaml|json|toml|env&version=<n>`
-> （`env` = .env 文件格式：`GROUP__KEY=VALUE`，组/键大写、双下划线分隔，可直接 `> .env` 落盘）
+> （`env` = .env 文件格式：`KEY=VALUE`，键大写、无分组前缀，可直接 `> .env` 落盘）
 > 输出指定格式配置（secret 掩码；`reveal=true` 需管理面会话）。
 > `curl -s "http://<host>:8384/v1/projects/{p}/branches/dev/config?format=yaml" -H "Authorization: Bearer <token>"`
 > Admin UI 项目页「访问令牌」Tab 展示可复制命令。

@@ -40,14 +40,14 @@ curl -s "http://<host>:8384/v1/projects/my-app/branches/dev/config?format=env" \
 输出示例（`format=env`）：
 
 ```text
-BUILD__CC=gcc
-REDIS__HOST=10.0.0.1
-REDIS__PORT=6379
-REDIS__TIMEOUT=60
-DEPLOY__TAG=dev-gray-2025.08
+CC=gcc
+HOST=10.0.0.1
+PORT=6379
+TIMEOUT=60
+TAG=dev-gray-2025.08
 ```
 
-> ENV 约定：`GROUP__KEY=VALUE`，组 / 键转大写、双下划线分隔；含空格 / 特殊字符自动加引号转义；secret 恒为 `***`。
+> ENV 约定：`KEY=VALUE`，键转大写、**无分组前缀**（组仅组织语义，不进入 .env 输出）；含空格 / 特殊字符自动加引号转义；secret 恒为 `***`。
 
 ## 8.3 在 Admin UI 中获取命令
 
