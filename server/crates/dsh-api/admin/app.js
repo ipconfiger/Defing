@@ -2029,11 +2029,26 @@ function bindEvents() {
 function boot() {
   initTheme();
   bindEvents();
+  loadBuildInfo(); // 页脚部署版本标记（/healthz build 信息，登录页同样可见）
   S.token = localStorage.getItem(LS_TOKEN) || '';
   S.role = localStorage.getItem(LS_ROLE) || '';
   S.roleProject = localStorage.getItem(LS_PROJ) || '';
   if (S.token) enterApp();
   else $('login-view').classList.remove('hidden');
+}
+
+// 页脚显示构建版本：Defing · build <git 短哈希> · <构建时间>（便于确认部署产物）
+function loadBuildInfo() {
+  fetch('/healthz')
+    .then((r) => r.json())
+    .then((j) => {
+      const el = $('build-info');
+      if (!el || !j || !j.build) return;
+      const t = new Date((j.build.time || 0) * 1000);
+      const ts = Number.isNaN(t.getTime()) ? '' : ' · ' + t.toISOString().replace('T', ' ').slice(0, 16);
+      el.textContent = 'Defing · build ' + (j.build.commit || 'unknown') + ts;
+    })
+    .catch(() => { /* 版本标记获取失败不打扰 */ });
 }
 
 boot();

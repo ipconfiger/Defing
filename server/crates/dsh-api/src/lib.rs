@@ -5,6 +5,12 @@
 
 pub mod grpc;
 
+/// 构建元数据（部署版本标记）：由 build.rs 注入 git 短哈希与构建时间（UNIX 秒）。
+/// 暴露于 /healthz、/readyz 与 Admin UI 页脚；docker 构建可用
+/// `--build-arg DEFING_GIT_COMMIT=$(git rev-parse --short HEAD)` 覆盖。
+pub const BUILD_COMMIT: &str = env!("DEFING_GIT_COMMIT");
+pub const BUILD_TIME: &str = env!("DEFING_BUILD_TIME");
+
 use std::convert::Infallible;
 use std::sync::{Arc, RwLock};
 
@@ -342,15 +348,13 @@ struct ConfigResp {
     gray: bool,
 }
 
-#[derive(Serialize)]
-struct ErrorOk {
-    status: &'static str,
-}
-
 // ---------------- handlers ----------------
 
-async fn health() -> Json<ErrorOk> {
-    Json(ErrorOk { status: "ok" })
+async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "ok",
+        "build": { "commit": BUILD_COMMIT, "time": BUILD_TIME.parse::<u64>().unwrap_or(0) },
+    }))
 }
 
 // ---------------- Admin UI（模块 09：内嵌静态页） ----------------
@@ -3139,7 +3143,11 @@ async fn readyz(State(app): State<ApiState>) -> Result<Json<serde_json::Value>, 
         .as_ref()
         .map(|r| format!("{:?}", r.metrics().borrow().state))
         .unwrap_or_else(|| "dev-single".into());
-    Ok(Json(serde_json::json!({ "status": "ok", "state": state })))
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "state": state,
+        "build": { "commit": BUILD_COMMIT, "time": BUILD_TIME.parse::<u64>().unwrap_or(0) },
+    })))
 }
 
 #[derive(Deserialize)]
