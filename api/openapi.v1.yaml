@@ -931,15 +931,18 @@ components:
         draft_rev: { type: integer, format: int64, description: 草稿修订号（乐观锁） }
         shared_refs:
           type: array
-          description: 引用项解析（值来自共享库；secret 已掩码），供草稿页只读展示
+          description: 结构 shared 项 × 本分支绑定解析值（secret 已掩码）；未绑定项 shared_key 为空串、version/value 为 null
           items:
             type: object
             properties:
               group: { type: string }
               key: { type: string }
-              shared_key: { type: string }
-              version: { type: integer, format: int64 }
-              value: { $ref: '#/components/schemas/Value' }
+              shared_key: { type: string, description: 本分支绑定的共享项 key；空串 = 未绑定 }
+              version: { type: [integer, "null"], format: int64 }
+              value:
+                anyOf:
+                  - { $ref: '#/components/schemas/Value' }
+                  - { type: "null" }
     ConfigSnapshot:
       type: object
       required: [project, branch, version]
@@ -967,6 +970,8 @@ components:
         required: { type: boolean, default: false }
         secret: { type: boolean, default: false }
         validate: { type: string, description: 校验规则（正则/范围，JSON 字符串） }
+        description: { type: string, maxLength: 200, description: 助记描述（≤200 字节，不渲染） }
+        shared: { type: boolean, default: false, description: 引用共享标记：true 时值由共享库物化，各分支在草稿页选择引用的共享项 }
     GroupDef:
       type: object
       required: [name, items]
@@ -1018,6 +1023,16 @@ components:
           type: array
           items: { type: string }
           description: '待删除 item，格式 "group/key"'
+        shared_bindings:
+          type: array
+          description: 分支级共享引用绑定 upsert/解除（shared_key 空串 = 解除绑定）
+          items:
+            type: object
+            required: [group, key, shared_key]
+            properties:
+              group: { type: string }
+              key: { type: string }
+              shared_key: { type: string, description: 共享项 key；空串 = 解除绑定 }
     PublishRequest:
       type: object
       required: [comment]
@@ -1163,11 +1178,12 @@ components:
         description: { type: string, description: 助记描述（≤200 字节，不渲染） }
         refs:
           type: array
-          description: 引用该共享项的项目结构位置（仅 GET /api/v1/shared 返回）
+          description: 绑定该共享项的项目分支位置（仅 GET /api/v1/shared 返回）
           items:
             type: object
             properties:
               project: { type: string }
+              branch: { type: string }
               group: { type: string }
               item_key: { type: string }
     SharedPublishResult:

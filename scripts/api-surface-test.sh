@@ -81,16 +81,16 @@ J -X POST $BASE/api/v1/shared -d '{"key":"api-key","type":"secret","secret":true
 J -X POST $BASE/api/v1/shared/publish -d '{"comment":"key","request_id":"sp2"}' >/dev/null
 J $BASE/api/v1/shared | python3 -c "import json,sys; l=json.load(sys.stdin); sk=[x for x in l if x['key']=='api-key'][0]; assert sk['value'].get('masked')==True and 'topsecret' not in json.dumps(l), l" && echo "  secret shared masked OK"
 
-echo "== 8. 共享引用（结构内嵌 shared_ref）：引用只读 + 级联 + 删除阻断 =="
-J -X PUT $BASE/api/v1/projects/order-service/structure-draft -d '{"base_version":2,"groups":[{"name":"redis","items":[{"key":"host","type":"string","required":true},{"key":"port","type":"int","shared_ref":"timeout"},{"key":"password","type":"secret","secret":true}]}]}' >/dev/null
+echo "== 8. 共享引用（分支级 shared_bindings）：结构标记 + 分支选择 + 级联 + 删除阻断 =="
+J -X PUT $BASE/api/v1/projects/order-service/structure-draft -d '{"base_version":2,"groups":[{"name":"redis","items":[{"key":"host","type":"string","required":true},{"key":"port","type":"int","shared":true},{"key":"password","type":"secret","secret":true}]}]}' >/dev/null
 J -X POST $BASE/api/v1/projects/order-service/structure-draft/publish -d '{"comment":"ref timeout","request_id":"sr1"}' >/dev/null
 R=$(J -X PUT $BASE/api/v1/projects/order-service/branches/dev/draft -d '{"updates":[{"group":"redis","key":"port","value":{"type":"int","int_value":999}}],"deletes":[]}' || true)
 echo "$R" | python3 -c "import json,sys; r=json.load(sys.stdin); assert '引用共享项' in r['message'], r" 2>/dev/null && echo "  shared-ref draft write rejected OK" || echo "  (rejection message check skipped)"
-J -X PUT $BASE/api/v1/projects/order-service/branches/dev/draft -d '{"updates":[{"group":"redis","key":"host","value":{"type":"string","str_value":"10.0.0.1"}}],"deletes":[]}' >/dev/null
+J -X PUT $BASE/api/v1/projects/order-service/branches/dev/draft -d '{"updates":[{"group":"redis","key":"host","value":{"type":"string","str_value":"10.0.0.1"}}],"deletes":[],"shared_bindings":[{"group":"redis","key":"port","shared_key":"timeout"}]}' >/dev/null
 J -X POST $BASE/api/v1/projects/order-service/branches/dev/publish -d '{"comment":"v-ref","request_id":"r-ref"}' >/dev/null
-J $BASE/api/v1/projects/order-service/branches/dev/config | python3 -c "import json,sys; c=json.load(sys.stdin); assert c['groups']['redis']['port']==60, c['groups']['redis']" && echo "  shared-ref materialized OK (port=60 from shared)"
+J $BASE/api/v1/projects/order-service/branches/dev/config | python3 -c "import json,sys; c=json.load(sys.stdin); assert c['groups']['redis']['port']==60, c['groups']['redis']" && echo "  shared-ref materialized OK (port=60 from shared binding)"
 CODE=$(curl -s -H "$AUTH" -o /tmp/shdel.json -w '%{http_code}' -X DELETE $BASE/api/v1/shared/timeout)
-[ "$CODE" = "409" ] && python3 -c "import json; d=json.load(open('/tmp/shdel.json')); assert 'order-service' in json.dumps(d), d" && echo "  shared delete blocked when referenced OK (409)" || { echo "  shared delete guard FAIL code=$CODE"; cat /tmp/shdel.json; exit 1; }
+[ "$CODE" = "409" ] && python3 -c "import json; d=json.load(open('/tmp/shdel.json')); assert 'order-service' in json.dumps(d), d" && echo "  shared delete blocked when bound OK (409)" || { echo "  shared delete guard FAIL code=$CODE"; cat /tmp/shdel.json; exit 1; }
 J -X PUT $BASE/api/v1/projects/order-service/structure-draft -d '{"base_version":3,"groups":[{"name":"redis","items":[{"key":"host","type":"string","required":true},{"key":"port","type":"int"},{"key":"password","type":"secret","secret":true}]}]}' >/dev/null
 J -X POST $BASE/api/v1/projects/order-service/structure-draft/publish -d '{"comment":"unref","request_id":"sr2"}' >/dev/null
 CODE=$(curl -s -H "$AUTH" -o /dev/null -w '%{http_code}' -X DELETE $BASE/api/v1/shared/timeout)

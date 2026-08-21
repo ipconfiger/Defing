@@ -1,6 +1,10 @@
 # 设计文档：共享配置引用关系重构（shared-ref rework）
 
-状态: v1 待审核
+> ⚠️ **已被取代（2026-08-21）**：本文档的引用语义部分（§2.1「结构编辑器 item 行内共享引用下拉、全分支生效」、§3.1 `ItemDef.shared_ref`、§4 引用内嵌结构）已被
+> [shared-ref-branch-scope.md](shared-ref-branch-scope.md) 取代：结构仅声明 `ItemDef.shared` 标记，引用选择下沉到分支
+> `BranchState.shared_bindings`。描述字段（P3）、共享库扁平化（P4）、删除端点（§5.3）、结构级校验等仍有效。
+
+状态: v1 待审核（引用语义部分已取代）
 日期: 2026-08-20
 范围: dsh-core / dsh-api / admin UI / openapi / storage schema / 测试脚本
 关联文档: dev_docs/design-v2.md §4.6-4.7、dev_docs/design-modules/01-core.md、dev_docs/design/storage-redb-migration.md（数据迁移惯例）
